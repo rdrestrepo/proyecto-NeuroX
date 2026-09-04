@@ -1,0 +1,9 @@
+venv/
+dist/
+build/
+cache/
+CACHE/
+*.dat
+*.npy
+*.exe
+__pycache__/
