@@ -2463,7 +2463,7 @@ class AppEEG:
         # desactivar botones dependientes del archivo procesado
         self.btn_pdf.config(state="disabled")
         self.btn_proc.config(state="disabled")
-        self.btn_tab_analisis.config(bg="gray", fg="white")
+        self.btn_tab_analisis.config(style="Secondary.TButton")
         self.btn_tab_grafica.config(style="Accent.TButton")
     
         # limpiar panel derecho (visor)
@@ -3751,7 +3751,7 @@ class AppEEG:
         if w < 20 or h < 20:
             return
     
-        
+        # debounce simple para evitar redibujos seguidos
         if hasattr(self, "_after_mapa_regional") and self._after_mapa_regional is not None:
             try:
                 self.raiz.after_cancel(self._after_mapa_regional)
@@ -3828,7 +3828,12 @@ class AppEEG:
         self.raiz.after_idle(self._actualizar_colores_lista)
 
     def quitar_archivos_cargados(self):
-       
+        """
+        Vacía la lista de archivos .dat cargados y limpia el visor/estado activo,
+        para poder cargar otra carpeta con datos nuevos sin arrastrar nada de la
+        anterior. NO borra nada del disco: el caché ya procesado sigue intacto
+        y vuelve a aparecer si más adelante seleccionas la misma carpeta.
+        """
         if not getattr(self, "archivos_dat", None) and not self.carpeta_dcl:
             messagebox.showinfo("Quitar archivos", "No hay archivos cargados todavía.")
             return
@@ -3841,18 +3846,37 @@ class AppEEG:
         ):
             return
 
-       
-        
-        self.limpiar_datos()
-        
+        # 1) Lo esencial primero (y protegido), para que SIEMPRE quede vacía
+        #    la lista aunque algo falle más abajo al reiniciar el visor.
+        try:
+            self.lista.delete(*self.lista.get_children())
+        except Exception as e:
+            self.log(f"[Aviso] No pude limpiar visualmente la lista: {e}")
 
         self.carpeta_dcl = ""
         self.archivos_dat = []
-        self.lista.delete(*self.lista.get_children())
-        self.var_resumen_lista.set("Sin archivos cargados.")
-        self.lbl_carpeta.config(text="Carpeta actual:\n(no seleccionada)")
-        self.btn_proc.config(state="disabled")
-        self.btn_pdf.config(state="disabled")
+
+        try:
+            self.var_resumen_lista.set("Sin archivos cargados.")
+        except Exception:
+            pass
+        try:
+            self.lbl_carpeta.config(text="Carpeta actual:\n(no seleccionada)")
+        except Exception:
+            pass
+        try:
+            self.btn_proc.config(state="disabled")
+            self.btn_pdf.config(state="disabled")
+        except Exception:
+            pass
+
+        # 2) Reinicio del resto del visor/análisis (archivo activo, gráficas, etc.).
+        #    Si algo aquí falla, la lista ya quedó vacía igual; solo se avisa en el log.
+        try:
+            self.limpiar_datos()
+        except Exception as e:
+            self.log(f"[Aviso] Lista vaciada, pero hubo un problema reiniciando el visor: {e}")
+
         self._set_barra("Lista de archivos vaciada. Selecciona una carpeta para continuar.")
         self.log("[OK] Lista de archivos .dat vaciada por el usuario.")
 
@@ -3860,7 +3884,7 @@ class AppEEG:
         idxs = self.lista.selection()
         if not idxs:
             return
-        nombre = idxs[0]  
+        nombre = idxs[0]  # iid == nombre de archivo
         self.var_resumen_lista.set(f"Seleccionado: {nombre}")
         carpeta_cache = self._ruta_cache_de_archivo(nombre)
         if self._cache_valido(carpeta_cache):
@@ -9030,4 +9054,3 @@ if __name__ == "__main__":
     aplicar_escala_tk(raiz)
     app = AppEEG(raiz)
     raiz.mainloop()
-
