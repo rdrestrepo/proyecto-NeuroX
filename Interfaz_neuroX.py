@@ -3871,7 +3871,7 @@ class AppEEG:
             pass
 
         # 2) Reinicio del resto del visor/análisis (archivo activo, gráficas, etc.).
-        #    Si algo aquí falla, la lista ya quedó vacía igual; solo se avisa en el log.
+    
         try:
             self.limpiar_datos()
         except Exception as e:
