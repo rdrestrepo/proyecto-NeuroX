@@ -27,11 +27,20 @@ from scipy.signal import butter, sosfiltfilt, iirnotch, filtfilt, welch, spectro
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
 from fpdf import FPDF
+# NOTA: 'pywt' (usado solo en wavelet_denoise_1d) y 'sklearn.decomposition.FastICA'
+# (usado solo en aplicar_ica_por_ventanas) se importan de forma diferida, dentro de
+# esas funciones, para no pagar su costo de carga al simplemente importar este módulo.
 
 from matplotlib.patches import Patch
 
 
 def _trapz(y, x=None, axis=-1):
+    """
+    Integral por regla del trapecio, compatible con cualquier versión de NumPy.
+    NumPy >= 2.0 renombró 'trapz' a 'trapezoid' (misma implementación,
+    misma matemática); NumPy < 2.0 solo tiene 'trapz'. Esta envoltura evita
+    que el resultado dependa de qué versión de NumPy esté instalada.
+    """
     fn = getattr(np, "trapezoid", None) or np.trapz
     return fn(y, x=x, axis=axis)
 
@@ -2591,6 +2600,46 @@ def _registro_para_informe(nombre_archivo):
     return os.path.splitext(base)[0]
 
 
+def _normalizar_imagen_para_pdf(ruta_imagen, carpeta_tmp):
+    """
+    Devuelve una ruta a un PNG confiable para insertar en el PDF con fpdf.
+
+    fpdf es estricto: si el archivo no es exactamente un PNG bien formado
+    (por ejemplo, es un JPEG/WEBP guardado con extensión .png, quedó dañado
+    por un merge de Git, usa un perfil de color/paleta poco común, etc.),
+    lanza "Not a PNG file" y aborta el informe completo.
+
+    Para evitar eso: se abre el archivo con PIL (mucho más tolerante) y,
+    si no es ya un PNG limpio, se reconvierte a un PNG estándar en una
+    carpeta temporal antes de dárselo a fpdf. Si ni PIL logra abrirlo
+    (archivo realmente corrupto/vacío), se devuelve None para que el
+    llamador continúe generando el informe sin logo, en vez de romperse.
+    """
+    if not ruta_imagen or not os.path.exists(ruta_imagen):
+        return None
+
+    try:
+        with Image.open(ruta_imagen) as img:
+            if img.format == "PNG":
+                img.load()
+                return ruta_imagen
+    except Exception:
+        pass
+
+    try:
+        os.makedirs(carpeta_tmp, exist_ok=True)
+        ruta_normalizada = os.path.join(carpeta_tmp, "logo_normalizado.png")
+        with Image.open(ruta_imagen) as img:
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                img = img.convert("RGBA")
+            else:
+                img = img.convert("RGB")
+            img.save(ruta_normalizada, format="PNG")
+        return ruta_normalizada
+    except Exception:
+        return None
+
+
 def buscar_logo_neurox():
     # Implementación única y compartida (antes duplicada en Interfaz_neuroX.py
     # con un orden de búsqueda ligeramente distinto). Consciente de PyInstaller:
@@ -3302,24 +3351,49 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     pdf.set_margins(15, 15, 15)
     pdf.add_page()
 
-    logo_path = buscar_logo_neurox()
+    logo_path_bruto = buscar_logo_neurox()
+    logo_path = _normalizar_imagen_para_pdf(logo_path_bruto, carpeta_graficos) if logo_path_bruto else None
+    if logo_path_bruto and not logo_path:
+        log(f"[Aviso] El logo en '{logo_path_bruto}' no se pudo abrir ni siquiera con PIL (archivo corrupto o vacío); se genera informe sin logo.")
     if logo_path is None:
-        log("Logo NeuroX no encontrado; se genera informe sin logo.")
+        if not logo_path_bruto:
+            try:
+                base_dir_dbg = sys._MEIPASS
+                origen_dbg = "sys._MEIPASS (modo .exe / PyInstaller)"
+            except Exception:
+                base_dir_dbg = os.path.dirname(os.path.abspath(__file__))
+                origen_dbg = "carpeta del script (modo desarrollo)"
+            log(
+                "Logo NeuroX no encontrado; se genera informe sin logo.\n"
+                f"  Carpeta donde se buscó ({origen_dbg}):\n  {base_dir_dbg}\n"
+                "  Se esperaba alguno de estos archivos:\n"
+                f"  {os.path.join(base_dir_dbg, 'assets', 'logo_neurox_horizontal.png')}\n"
+                f"  {os.path.join(base_dir_dbg, 'assets', 'nombre_neurox.png')}\n"
+                f"  {os.path.join(base_dir_dbg, 'assets', 'icono_neurox.png')}"
+            )
     else:
-        nombre_logo = os.path.basename(logo_path).lower()
+        if logo_path != logo_path_bruto:
+            log(f"[Aviso] El logo en '{logo_path_bruto}' no era un PNG estándar; se normalizó automáticamente antes de insertarlo.")
+        log(f"Logo NeuroX encontrado en: {logo_path_bruto}")
+        nombre_logo = os.path.basename(logo_path_bruto).lower()
         if "logo_neurox_horizontal" in nombre_logo:
             ancho_logo = 92
         elif "nombre_neurox" in nombre_logo:
             ancho_logo = 72
         else:
             ancho_logo = 30
-        pdf.add_centered_image(
-            logo_path,
-            width_mm=ancho_logo,
-            needed_height_mm=28,
-            gap_after_image=0.8,
-            gap_no_caption=0.8,
-        )
+        try:
+            insertado = pdf.add_centered_image(
+                logo_path,
+                width_mm=ancho_logo,
+                needed_height_mm=28,
+                gap_after_image=0.8,
+                gap_no_caption=0.8,
+            )
+            if not insertado:
+                log(f"[Aviso] El logo se encontró en '{logo_path_bruto}' pero add_centered_image no lo insertó (revisa que el archivo no esté vacío/corrupto).")
+        except Exception as e:
+            log(f"[Aviso] El logo se encontró en '{logo_path_bruto}' pero no se pudo insertar en el PDF: {e}")
 
     pdf.set_font("Helvetica", "B", 19)
     pdf.set_text_color(33, 63, 104)

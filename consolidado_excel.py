@@ -1,4 +1,31 @@
+# -*- coding: utf-8 -*-
+"""
+consolidado_excel.py
+=====================
+Genera el "Consolidado_reportes_neuroX.xlsx" a partir de los datos que el
+pipeline ya guarda en el CACHE de cada archivo procesado (resumen_calidad.json,
+pot_rel_promedios.json, ratios_promedios_principales.json, meta.txt).
 
+Reproduce las mismas hojas, tablas y fórmulas que la plantilla que enviaste:
+    - Resumen global por archivo   (Tabla1)   -> datos base, uno por archivo
+    - Potencia regional            (Tabla2)   -> 5 regiones x archivo
+    - Estado de calidad                       -> conteo por estado (fórmulas)
+    - Potencia regional bandas     (TablaBandasRegion) -> promedios por región (fórmulas)
+    - Biomarcadores                           -> promedios de ratios (fórmulas)
+    - Calidad Señal                           -> promedios de calidad (fórmulas)
+    - Banda dominante                         -> conteo por banda (fórmulas)
+    - Detalle1 / Detalle2 / Detalle3 (ocultas)-> igual que en tu plantilla:
+      copias filtradas por estado "Aceptable" / "Comprometida" / "Deficiente"
+      (tu plantilla tampoco trae una hoja de detalle para "Buena", así que
+      aquí se respeta lo mismo).
+
+No se usa ningún valor "quemado" en las hojas de resumen: todas se calculan
+con fórmulas de Excel (COUNTIF, AVERAGEIFS, AVERAGE, SUBTOTAL, SUM) que
+apuntan a la tabla "Resumen global por archivo", igual que en tu plantilla.
+Los ÚNICOS valores literales son los datos de entrada por archivo (igual que
+en tu plantilla original, donde cada fila de Detalle/Resumen es un dato leído,
+no una fórmula).
+"""
 
 import os
 import json
@@ -195,7 +222,7 @@ def generar_consolidado_excel(archivos_seleccionados, ruta_salida, logger=None):
 
     # Mismo orden de pestañas que la plantilla
     orden = [
-        
+        "Detalle1", "Detalle2", "Detalle3",
         "Resumen global por archivo", "Potencia regional", "Estado de calidad",
         "Potencia regional bandas", "Biomarcadores", "Calidad Señal", "Banda dominante",
     ]
