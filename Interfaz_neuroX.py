@@ -8668,7 +8668,34 @@ class AppEEG:
         # fft_amp_filtrado.npy ya viene normalizada por N en el pipeline.
         # La unidad se conserva si la señal original estaba en microvoltios.
         ax.plot(x, y, linewidth=1.0)
-        
+
+        # Auto-escala del eje Y: si hay un pico puntual muy por encima del
+        # resto (p. ej. residuo técnico), se recorta la vista a un rango
+        # legible y se anota el valor real del pico con una flecha, en vez
+        # de dejar que ese pico aplaste visualmente el resto del espectro.
+        PERCENTIL_ESCALA = 99
+        MARGEN_ESCALA = 1.3
+        if len(y) > 0:
+            techo = float(np.percentile(y, PERCENTIL_ESCALA)) * MARGEN_ESCALA
+            techo = max(techo, 1e-6)
+            pico_real = float(np.max(y))
+            ax.set_ylim(0, techo)
+            if pico_real > techo:
+                idx_pico = int(np.argmax(y))
+                texto_alerta = f"⚠ pico fuera de escala: {pico_real:.1f} {ylabel.strip()} a {x[idx_pico]:.1f} Hz"
+                ax.annotate(
+                    texto_alerta,
+                    xy=(x[idx_pico], techo),
+                    xytext=(0.5, 0.95),
+                    textcoords="axes fraction",
+                    ha="center",
+                    va="top",
+                    fontsize=8,
+                    color="firebrick",
+                    arrowprops={"arrowstyle": "->", "color": "firebrick", "lw": 1},
+                    bbox={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "firebrick", "lw": 0.8, "alpha": 0.9},
+                )
+
         # Leyenda de bandas visibles
 
         handles = []
