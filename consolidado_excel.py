@@ -14,7 +14,7 @@ BLANCO = "FFFFFF"
 
 REGIONES = ["Frontal", "Central", "Temporal", "Parietal", "Occipital"]
 BANDAS = ["Delta", "Theta", "Alfa", "Beta"]
-ESTADOS_DETALLE = ["Aceptable", "Comprometida", "Deficiente"] 
+ESTADOS_DETALLE = ["Aceptable", "Comprometida", "Deficiente"]  # igual que la plantilla (sin "Buena")
 
 ENCABEZADOS = [
     "Archivo procesado", "Estado calidad", "Duración (s)", "Fs (Hz)",
@@ -25,9 +25,9 @@ ENCABEZADOS = [
 ]
 
 
-
+# ---------------------------------------------------------------------------
 # 1. Lectura de los datos ya generados por el pipeline para cada archivo
-
+# ---------------------------------------------------------------------------
 
 def _leer_json_si_existe(ruta):
     if ruta and os.path.exists(ruta):
@@ -52,7 +52,11 @@ def _leer_meta_txt(carpeta_cache):
 
 
 def recolectar_datos_archivo(nombre_archivo, carpeta_cache):
-    
+    """
+    Lee del CACHE de un archivo ya procesado todo lo necesario para una fila
+    del consolidado. Devuelve None si falta información esencial (por
+    ejemplo si el archivo no se ha procesado todavía).
+    """
     resumen_calidad = _leer_json_si_existe(
         os.path.join(carpeta_cache, "calidad_senal", "resumen_calidad.json")
     )
@@ -118,9 +122,9 @@ def _fila_a_lista(fila):
     ]
 
 
-
+# ---------------------------------------------------------------------------
 # 2. Utilidades de estilo
-
+# ---------------------------------------------------------------------------
 
 def _estilo_encabezado(ws, celda):
     ws[celda].font = Font(name="Calibri", bold=True, color=BLANCO)
@@ -140,8 +144,9 @@ def _tabla_estilo():
     )
 
 
+# ---------------------------------------------------------------------------
 # 3. Construcción del libro
-
+# ---------------------------------------------------------------------------
 
 def generar_consolidado_excel(archivos_seleccionados, ruta_salida, logger=None):
     """
@@ -188,9 +193,9 @@ def generar_consolidado_excel(archivos_seleccionados, ruta_salida, logger=None):
     _hoja_calidad_senal(wb)
     _hoja_banda_dominante(wb)
 
-    # 4 Orden de las hojas
+    # Mismo orden de pestañas que la plantilla
     orden = [
-        "Detalle1", "Detalle2", "Detalle3",
+        
         "Resumen global por archivo", "Potencia regional", "Estado de calidad",
         "Potencia regional bandas", "Biomarcadores", "Calidad Señal", "Banda dominante",
     ]
@@ -298,7 +303,7 @@ def _hojas_detalle(wb, filas):
             tabla.tableStyleInfo = _tabla_estilo()
             ws.add_table(tabla)
 
-        ws.sheet_state = "hidden"  
+        ws.sheet_state = "hidden"  # igual que en la plantilla original
         _autoancho(ws, {
             "A": 18, "B": 14, "C": 12, "D": 10, "E": 10, "F": 10, "G": 10, "H": 10,
             "I": 14, "J": 10, "K": 10, "L": 10, "M": 12, "N": 10, "O": 12, "P": 14,
@@ -325,7 +330,9 @@ def _hoja_estado_calidad(wb, total_filas):
     ws["C8"].font = Font(bold=True)
 
     _autoancho(ws, {"B": 20, "C": 10})
-   
+    # Nota: a propósito NO se agrega ningún gráfico aquí. Los datos (esta hoja,
+    # "Potencia regional bandas", "Biomarcadores", etc.) quedan listos para que
+    # el usuario arme sus propios gráficos manualmente en Excel si lo desea.
     return ws
 
 
@@ -333,7 +340,7 @@ def _hoja_potencia_regional_bandas(wb):
     ws = wb.create_sheet("Potencia regional bandas")
     encabezados = ["Región", "Delta (%)", "Theta (%)", "Alfa (%)", "Beta (%)"]
     for idx, encabezado in enumerate(encabezados, start=1):
-        celda = f"{get_column_letter(idx + 1)}3"  
+        celda = f"{get_column_letter(idx + 1)}3"  # arranca en B3
         ws[celda] = encabezado
         _estilo_encabezado(ws, celda)
 
@@ -369,7 +376,7 @@ def _hoja_biomarcadores(wb):
     encabezados = ["Theta/Alfa", "Delta/Alfa", "Theta/Beta", "Lentificación"]
     columnas_tabla1 = ["Theta/Alfa", "Delta/Alfa", "Theta/Beta", "Lentificación"]
     for idx, encabezado in enumerate(encabezados):
-        col = get_column_letter(idx + 2)  
+        col = get_column_letter(idx + 2)  # B..E
         celda = f"{col}4"
         ws[celda] = encabezado
         _estilo_encabezado(ws, celda)
@@ -386,7 +393,7 @@ def _hoja_calidad_senal(wb):
 
     encabezados = ["Atípicos (%)", "Sospechosos (%)", "Índice técnico (%)", "SNR (dB)"]
     for idx, encabezado in enumerate(encabezados):
-        col = get_column_letter(idx + 2)  
+        col = get_column_letter(idx + 2)  # B..E
         celda = f"{col}4"
         ws[celda] = encabezado
         _estilo_encabezado(ws, celda)

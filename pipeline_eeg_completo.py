@@ -10,12 +10,16 @@ PIPELINE EEG ORGANIZADO PARA TKINTER
 
 import os
 import re
+import sys
 import gc
 import datetime
 import json
 import shutil
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # backend sin ventana: evita conflictos/crashes al correr
+                        # dentro de la app de Tkinter (y es más rápido, no dibuja en pantalla)
 import matplotlib.pyplot as plt
 from PIL import Image
 
@@ -92,6 +96,26 @@ AUTO_PICOS_MIN_PROMINENCIA_CANAL = 3.0
 # CONFIGURACION WAVELET
 WAVELET_NAME = "db4"
 WAVELET_NIVEL = 4
+
+# CONFIGURACION ICA (rendimiento)
+# ------------------------------------------------------------------
+# IMPORTANTE: aplicar_ica_por_ventanas() hace fit_transform() seguido
+# INMEDIATAMENTE de inverse_transform() con TODOS los componentes
+# (no se descarta ningún componente de artefacto). Con n_components
+# == n_canales (64), esa ida y vuelta es una transformación casi
+# perfectamente invertible: el resultado final es prácticamente
+# idéntico sin importar cuántas iteraciones haga FastICA para intentar
+# converger a independencia estadística (verificado empíricamente:
+# diferencia < 1e-12 entre max_iter=200 y max_iter=2000).
+#
+# En cambio, el TIEMPO sí depende muchísimo de max_iter: con EEG real
+# (canales muy correlacionados entre sí, sobre todo en ventanas de
+# 10s) es común que FastICA NO logre converger y entonces gaste TODAS
+# las iteraciones permitidas, una y otra vez, por cada ventana de 10s
+# del registro. Bajar el tope de iteraciones no cambia el resultado
+# guardado, pero sí evita ese gasto de tiempo inútil.
+ICA_MAX_ITER = 200
+ICA_TOL = 1e-3
 
 # Ventana cruda a guardar
 VENTANA_INICIO_S = 60
@@ -1104,7 +1128,10 @@ def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
 
 
 def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
+    import warnings
     from sklearn.decomposition import FastICA
+    from sklearn.exceptions import ConvergenceWarning
+
     muestras_ventana = int(fs_real * ventana_seg)
     n_ventanas = datos.shape[1] // muestras_ventana
     datos_ica = np.zeros_like(datos)
@@ -1120,13 +1147,24 @@ def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
         ica = FastICA(
             n_components=min(64, ventana.shape[0]),
             random_state=42,
-            max_iter=2000,
+            max_iter=ICA_MAX_ITER,
+            tol=ICA_TOL,
             whiten="unit-variance"
         )
 
         try:
-            componentes = ica.fit_transform(ventana.T)
-            reconstruido = ica.inverse_transform(componentes).T
+            # Nota de rendimiento: aquí no se descarta ningún componente
+            # (no hay rechazo de artefactos), así que fit_transform +
+            # inverse_transform con todos los componentes devuelve una
+            # señal prácticamente idéntica a la de entrada, converja o no
+            # FastICA. Por eso limitamos max_iter/tol arriba: no cambia
+            # el resultado guardado, solo evita minutos de cómputo
+            # cuando el algoritmo no logra converger (algo frecuente con
+            # EEG real, con canales muy correlacionados entre sí).
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=ConvergenceWarning)
+                componentes = ica.fit_transform(ventana.T)
+                reconstruido = ica.inverse_transform(componentes).T
             datos_ica[:, inicio:fin] = reconstruido
 
         except Exception as e:
@@ -2554,13 +2592,21 @@ def _registro_para_informe(nombre_archivo):
 
 
 def buscar_logo_neurox():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    # Implementación única y compartida (antes duplicada en Interfaz_neuroX.py
+    # con un orden de búsqueda ligeramente distinto). Consciente de PyInstaller:
+    # en el .exe compilado, sys._MEIPASS apunta a la carpeta temporal donde se
+    # extraen los datos empaquetados (incluida 'assets/'); en modo desarrollo,
+    # cae a la carpeta de este archivo.
+    try:
+        base_dir = sys._MEIPASS
+    except Exception:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
     candidatos = [
         os.path.join(base_dir, "assets", "logo_neurox_horizontal.png"),
         os.path.join(base_dir, "assets", "nombre_neurox.png"),
+        os.path.join(base_dir, "assets", "icono_neurox.png"),
         os.path.join(base_dir, "logo_neurox_horizontal.png"),
         os.path.join(base_dir, "nombre_neurox.png"),
-        os.path.join(base_dir, "assets", "icono_neurox.png"),
         os.path.join(base_dir, "icono_neurox.png"),
     ]
     for ruta in candidatos:

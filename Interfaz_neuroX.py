@@ -42,6 +42,7 @@ from pipeline_eeg_completo import (
     leer_dap,
     limpiar_nombre_canal,
     obtener_nombres_canales_64,
+    buscar_logo_neurox,
 )
 
 ## Generadores de consolidados (nuevo)
@@ -123,22 +124,6 @@ def obtener_ruta_config():
     carpeta_usuario = os.path.join(os.path.expanduser("~"), "NeuroX")
     os.makedirs(carpeta_usuario, exist_ok=True)
     return os.path.join(carpeta_usuario, "config_neurox.json")
-
-
-def buscar_logo_neurox():
-    candidatos = [
-        "assets/logo_neurox_horizontal.png",
-        "assets/nombre_neurox.png",
-        "assets/icono_neurox.png",
-        "logo_neurox_horizontal.png",
-        "nombre_neurox.png",
-        "icono_neurox.png",
-    ]
-    for relativo in candidatos:
-        ruta = resource_path(relativo)
-        if os.path.exists(ruta):
-            return ruta
-    return None
 
 
 class _TabBar(tk.Frame):
@@ -641,15 +626,9 @@ class AppEEG:
             command=self.seleccionar_carpeta,
             style="Secondary.TButton",
         )
-        self.btn_quitar_archivos = ttk.Button(
-            self.panel_izq_fijo_sup,
-            text="Quitar archivos cargados",
-            command=self.quitar_archivos_cargados,
-            style="Danger.TButton",
-        )
         self.btn_proc = ttk.Button(
             self.panel_izq_fijo_sup,
-            text="Procesar",
+            text="Procesar seleccionados",
             command=self._reprocesar_forzado,
             style="Accent.TButton",
             state="disabled",
@@ -687,7 +666,6 @@ class AppEEG:
 
         ## Botón seleccionar carpeta (columna izquierda)
         self.btn_sel.pack(fill=tk.X, pady=(0, 4))
-        self.btn_quitar_archivos.pack(fill=tk.X, pady=(0, 4))
 
         ## Estado + progreso
         self.marco_estado_trabajo = ttk.Frame(
@@ -758,7 +736,7 @@ class AppEEG:
         ## Lista de archivos .dat
         self.marco_lista = ttk.LabelFrame(
             self.panel_izq_fijo_sup,
-            text="Archivos .dat",
+            text="Archivos .dat  (Ctrl/Shift + clic para elegir varios)",
             padding=10,
             style="Card.TLabelframe"
         )
@@ -814,7 +792,7 @@ class AppEEG:
             self.frame_lista_body,
             show="tree",
             height=10,
-            selectmode="browse",
+            selectmode="extended",
             style="Lista.Treeview",
         )
         self.lista.column("#0", stretch=True, anchor="w")
@@ -3827,59 +3805,6 @@ class AppEEG:
             self.log(f"Encontré {len(archivos)} archivo(s) .dat")
         self.raiz.after_idle(self._actualizar_colores_lista)
 
-    def quitar_archivos_cargados(self):
-        """
-        Vacía la lista de archivos .dat cargados y limpia el visor/estado activo,
-        para poder cargar otra carpeta con datos nuevos sin arrastrar nada de la
-        anterior. NO borra nada del disco: el caché ya procesado sigue intacto
-        y vuelve a aparecer si más adelante seleccionas la misma carpeta.
-        """
-        if not getattr(self, "archivos_dat", None) and not self.carpeta_dcl:
-            messagebox.showinfo("Quitar archivos", "No hay archivos cargados todavía.")
-            return
-
-        if not messagebox.askyesno(
-            "Quitar archivos",
-            "¿Quitar los archivos .dat cargados de la lista?\n\n"
-            "Esto no borra nada del disco ni el caché ya procesado; "
-            "solo limpia lo que ves aquí para poder cargar otra carpeta."
-        ):
-            return
-
-        # 1) Lo esencial primero (y protegido), para que SIEMPRE quede vacía
-        #    la lista aunque algo falle más abajo al reiniciar el visor.
-        try:
-            self.lista.delete(*self.lista.get_children())
-        except Exception as e:
-            self.log(f"[Aviso] No pude limpiar visualmente la lista: {e}")
-
-        self.carpeta_dcl = ""
-        self.archivos_dat = []
-
-        try:
-            self.var_resumen_lista.set("Sin archivos cargados.")
-        except Exception:
-            pass
-        try:
-            self.lbl_carpeta.config(text="Carpeta actual:\n(no seleccionada)")
-        except Exception:
-            pass
-        try:
-            self.btn_proc.config(state="disabled")
-            self.btn_pdf.config(state="disabled")
-        except Exception:
-            pass
-
-        # 2) Reinicio del resto del visor/análisis (archivo activo, gráficas, etc.).
-    
-        try:
-            self.limpiar_datos()
-        except Exception as e:
-            self.log(f"[Aviso] Lista vaciada, pero hubo un problema reiniciando el visor: {e}")
-
-        self._set_barra("Lista de archivos vaciada. Selecciona una carpeta para continuar.")
-        self.log("[OK] Lista de archivos .dat vaciada por el usuario.")
-
     def on_select_dat(self, _evt=None):
         idxs = self.lista.selection()
         if not idxs:
@@ -4749,31 +4674,206 @@ class AppEEG:
         if not self.carpeta_dcl or not os.path.isdir(self.carpeta_dcl):
             messagebox.showwarning("Falta carpeta", "Selecciona primero una carpeta con archivos .dat.")
             return
-        idxs = self.lista.selection()
+
+        idxs = list(self.lista.selection())
         if not idxs:
-            messagebox.showwarning("Sin selección", "Selecciona un archivo .dat de la lista.")
-            return
-        nombre_archivo = idxs[0]  # iid == nombre de archivo
-        ruta_archivo = os.path.join(self.carpeta_dcl, nombre_archivo)
-        if not os.path.exists(ruta_archivo):
-            messagebox.showerror("No existe", f"No encuentro el archivo:\n{ruta_archivo}")
-            return
-        carpeta_cache = self._ruta_cache_de_archivo(nombre_archivo)
-        if self._cache_valido(carpeta_cache):
-            resp = messagebox.askyesno(
-                "Archivo ya procesado",
-                f"'{nombre_archivo}' ya tiene datos procesados.\n\n¿Desea reprocesarlo nuevamente?",
+            messagebox.showwarning(
+                "Sin selección",
+                "Selecciona uno o más archivos .dat de la lista.\n\n"
+                "Tip: usa Ctrl+clic o Shift+clic para elegir varios."
             )
-            if not resp:
+            return
+
+        # Validar que existan en disco y separar los que ya tienen caché
+        nombres_validos = []
+        for nombre_archivo in idxs:
+            ruta_archivo = os.path.join(self.carpeta_dcl, nombre_archivo)
+            if not os.path.exists(ruta_archivo):
+                messagebox.showerror("No existe", f"No encuentro el archivo:\n{ruta_archivo}")
                 return
+            nombres_validos.append(nombre_archivo)
+
+        ya_procesados = [
+            n for n in nombres_validos if self._cache_valido(self._ruta_cache_de_archivo(n))
+        ]
+
+        cola = list(nombres_validos)
+        if ya_procesados:
+            if len(nombres_validos) == 1:
+                resp = messagebox.askyesno(
+                    "Archivo ya procesado",
+                    f"'{nombres_validos[0]}' ya tiene datos procesados.\n\n¿Desea reprocesarlo nuevamente?",
+                )
+                if not resp:
+                    return
+            else:
+                resp = messagebox.askyesnocancel(
+                    "Archivos ya procesados",
+                    f"{len(ya_procesados)} de los {len(nombres_validos)} archivos seleccionados "
+                    "ya tienen datos procesados.\n\n"
+                    "Sí = reprocesar todos los seleccionados (incluidos esos)\n"
+                    "No = procesar solo los que faltan, dejando los demás como están\n"
+                    "Cancelar = no hacer nada"
+                )
+                if resp is None:
+                    return
+                if resp is False:
+                    cola = [n for n in nombres_validos if n not in ya_procesados]
+                    if not cola:
+                        messagebox.showinfo(
+                            "Nada que procesar",
+                            "Todos los archivos seleccionados ya estaban procesados."
+                        )
+                        return
+
         self._liberar_cache_visual()
         self.limpiar_log()
         self.log("====================================")
-        self.log(f"Reprocesando: {nombre_archivo}")
-        self._set_barra(f"Procesando: {nombre_archivo} ...")
+        if len(cola) == 1:
+            self.log(f"Procesando: {cola[0]}")
+        else:
+            self.log(f"Procesando {len(cola)} archivos en lote:")
+            for n in cola:
+                self.log(f"  - {n}")
+
+        self._set_barra(f"Procesando 1 de {len(cola)}: {cola[0]} ...")
         self._iniciar_trabajo("Preparando procesamiento...")
-        th = threading.Thread(target=self._hilo_procesar, args=(nombre_archivo,), daemon=True)
+
+        th = threading.Thread(target=self._hilo_procesar_lote, args=(cola,), daemon=True)
         th.start()
+
+    def _hilo_procesar_lote(self, nombres_archivo):
+        """
+        Procesa varios archivos .dat en secuencia dentro de un solo hilo
+        (uno por uno; el pipeline internamente ya usa varios núcleos para
+        acelerar cada archivo individual — ver optimizaciones de rendimiento).
+        Al terminar, la interfaz queda mostrando el último archivo procesado
+        con éxito, y se muestra un resumen de todo el lote.
+        """
+        total = len(nombres_archivo)
+        resultados = []  # (nombre, ok, error_o_None)
+        ultimo_ok = None  # (nombre, carpeta_cache, ruta_pdf)
+
+        def logger(msg):
+            if self._cerrando:
+                return
+            try:
+                self.raiz.after(0, lambda: self.log(str(msg)))
+            except Exception:
+                pass
+
+        for i, nombre_archivo in enumerate(nombres_archivo):
+            if self._cerrando:
+                break
+
+            def progress_cb(valor, mensaje=None, _i=i, _nombre=nombre_archivo):
+                if self._cerrando:
+                    return
+                global_pct = ((_i + (float(valor) / 100.0)) / total) * 100.0
+                texto = f"[{_i + 1}/{total}] {_nombre}"
+                if mensaje:
+                    texto += f" — {mensaje}"
+                try:
+                    self.raiz.after(0, lambda: self.set_progreso(global_pct, texto))
+                except Exception:
+                    pass
+
+            try:
+                self.raiz.after(
+                    0,
+                    lambda n=nombre_archivo, i=i: self._set_barra(f"Procesando {i + 1} de {total}: {n} ...")
+                )
+                if i > 0:
+                    self.raiz.after(0, lambda n=nombre_archivo: self.log(f"------------------------------------\nProcesando: {n}"))
+
+                carpeta_cache = procesar_archivo(
+                    nombre_archivo,
+                    carpeta_base=self.carpeta_dcl,
+                    logger=logger,
+                    progress_callback=progress_cb
+                )
+                if not carpeta_cache:
+                    raise RuntimeError("El pipeline no devolvió la ruta de cache.")
+
+                self.raiz.after(0, lambda: self.log("[OK] Datos procesados y guardados en cache."))
+                self.raiz.after(0, lambda: self.log("[Proceso] Generando informe PDF..."))
+                ruta_pdf = generar_informe_desde_cache(carpeta_cache, logger=logger)
+
+                ultimo_ok = (nombre_archivo, carpeta_cache, ruta_pdf)
+                resultados.append((nombre_archivo, True, None))
+
+            except Exception as e:
+                resultados.append((nombre_archivo, False, e))
+                self.raiz.after(
+                    0,
+                    lambda n=nombre_archivo, err=e: self.log(f"[Error] No se pudo procesar '{n}': {err}")
+                )
+
+        def terminar_lote():
+            if self._cerrando:
+                return
+
+            exitosos = [n for n, ok, _ in resultados if ok]
+            fallidos = [(n, err) for n, ok, err in resultados if not ok]
+
+            # Deja la interfaz mostrando el último archivo procesado con éxito
+            if ultimo_ok:
+                nombre_archivo, carpeta_cache, ruta_pdf = ultimo_ok
+                self.cache_ultimo = carpeta_cache
+                self.nombre_ultimo = nombre_archivo
+
+                if ruta_pdf and os.path.exists(ruta_pdf):
+                    self.ruta_pdf_ultimo = os.path.abspath(ruta_pdf)
+                    self.btn_pdf.config(state="normal")
+                else:
+                    self.ruta_pdf_ultimo = self._buscar_pdf_preferido(nombre_archivo, carpeta_cache)
+                    self.btn_pdf.config(
+                        state="normal" if self.ruta_pdf_ultimo and os.path.exists(self.ruta_pdf_ultimo) else "disabled"
+                    )
+
+                self._liberar_cache_visual()
+                self._er_filtrado = None
+                self._limpiar_estado_welch()
+                self._reset_panel_analisis()
+                self._actualizar_canales_alerta()
+                self._actualizar_bloques_resumen_calidad()
+                self._activar_grafica_inicial()
+                self.raiz.after_idle(self._actualizar_colores_lista)
+
+            self.finalizar_progreso(
+                f"Lote terminado: {len(exitosos)}/{total} procesado(s) con éxito.",
+                valor=100.0,
+                delay_ms=1800
+            )
+
+            if fallidos:
+                detalle = "\n".join(f"• {n}: {err}" for n, err in fallidos[:10])
+                if len(fallidos) > 10:
+                    detalle += f"\n... y {len(fallidos) - 10} más."
+                self._set_barra(f"Lote terminado con errores: {len(exitosos)} OK, {len(fallidos)} con error.")
+                self.log(f"[Aviso] Lote terminado: {len(exitosos)} OK, {len(fallidos)} con error.")
+                messagebox.showwarning(
+                    "Procesamiento finalizado con errores",
+                    f"Se procesaron {len(exitosos)} de {total} archivo(s) correctamente.\n\n"
+                    f"Con errores ({len(fallidos)}):\n{detalle}\n\n"
+                    f"Usa 'Vista previa' para ver el último informe generado con éxito."
+                )
+            else:
+                self._set_barra(f"Lote terminado: {len(exitosos)}/{total} procesado(s) con éxito.")
+                self.log(f"[OK] Lote terminado: {len(exitosos)}/{total} procesado(s) con éxito.")
+                if total == 1:
+                    mensaje = "El archivo se procesó correctamente y el informe está listo."
+                else:
+                    mensaje = f"Se procesaron correctamente los {len(exitosos)} archivos seleccionados."
+                messagebox.showinfo(
+                    "Procesado con éxito",
+                    f"{mensaje}\n\nUsa 'Vista previa' para ver el último informe generado."
+                )
+
+        try:
+            self.raiz.after(0, terminar_lote)
+        except Exception:
+            pass
 
     def ir_a_analisis(self):
         self._activar_tab_global("analisis")
