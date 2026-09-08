@@ -42,11 +42,8 @@ from pipeline_eeg_completo import (
     leer_dap,
     limpiar_nombre_canal,
     obtener_nombres_canales_64,
+    buscar_logo_neurox,
 )
-
-## Generadores de consolidados (nuevo)
-from consolidado_excel import generar_consolidado_excel
-from consolidado_pdf import combinar_informes_pdf
 # -*- coding: utf-8 -*-
 
 AZUL_NEUROX = "#061A5B"
@@ -123,22 +120,6 @@ def obtener_ruta_config():
     carpeta_usuario = os.path.join(os.path.expanduser("~"), "NeuroX")
     os.makedirs(carpeta_usuario, exist_ok=True)
     return os.path.join(carpeta_usuario, "config_neurox.json")
-
-
-def buscar_logo_neurox():
-    candidatos = [
-        "assets/logo_neurox_horizontal.png",
-        "assets/nombre_neurox.png",
-        "assets/icono_neurox.png",
-        "logo_neurox_horizontal.png",
-        "nombre_neurox.png",
-        "icono_neurox.png",
-    ]
-    for relativo in candidatos:
-        ruta = resource_path(relativo)
-        if os.path.exists(ruta):
-            return ruta
-    return None
 
 
 class _TabBar(tk.Frame):
@@ -641,12 +622,6 @@ class AppEEG:
             command=self.seleccionar_carpeta,
             style="Secondary.TButton",
         )
-        self.btn_quitar_archivos = ttk.Button(
-            self.panel_izq_fijo_sup,
-            text="Quitar archivos cargados",
-            command=self.quitar_archivos_cargados,
-            style="Danger.TButton",
-        )
         self.btn_proc = ttk.Button(
             self.panel_izq_fijo_sup,
             text="Procesar",
@@ -656,22 +631,10 @@ class AppEEG:
         )
         self.btn_pdf = ttk.Button(
             self.panel_izq_fijo_sup,
-            text="Vista previa",
+            text="Abrir informe",
             command=self.abrir_informe,
             state="disabled",
             style="Primary.TButton",
-        )
-        self.btn_consolidado = ttk.Button(
-            self.panel_izq_fijo_sup,
-            text="Descargar consolidado Excel",
-            command=self.abrir_ventana_consolidado,
-            style="Secondary.TButton",
-        )
-        self.btn_consolidado_pdf = ttk.Button(
-            self.panel_izq_fijo_sup,
-            text="Descargar consolidado PDF",
-            command=self.abrir_ventana_consolidado_pdf,
-            style="Secondary.TButton",
         )
         self.btn_limpiar = ttk.Button(
             self.panel_izq_fijo_inf,
@@ -687,7 +650,6 @@ class AppEEG:
 
         ## Botón seleccionar carpeta (columna izquierda)
         self.btn_sel.pack(fill=tk.X, pady=(0, 4))
-        self.btn_quitar_archivos.pack(fill=tk.X, pady=(0, 4))
 
         ## Estado + progreso
         self.marco_estado_trabajo = ttk.Frame(
@@ -852,8 +814,6 @@ class AppEEG:
         ## Botones de archivo debajo de la lista
         self.btn_proc.pack(fill=tk.X, pady=(8, 2))
         self.btn_pdf.pack(fill=tk.X, pady=(2, 0))
-        self.btn_consolidado.pack(fill=tk.X, pady=(2, 0))
-        self.btn_consolidado_pdf.pack(fill=tk.X, pady=(2, 0))
 
         ## Controles del visor
         self.lbl_atipicos_grafica = ttk.Label(
@@ -2463,7 +2423,7 @@ class AppEEG:
         # desactivar botones dependientes del archivo procesado
         self.btn_pdf.config(state="disabled")
         self.btn_proc.config(state="disabled")
-        self.btn_tab_analisis.config(bg="gray", fg="white")
+        self.btn_tab_analisis.config(style="Secondary.TButton")
         self.btn_tab_grafica.config(style="Accent.TButton")
     
         # limpiar panel derecho (visor)
@@ -3751,7 +3711,7 @@ class AppEEG:
         if w < 20 or h < 20:
             return
     
-        
+        # debounce simple para evitar redibujos seguidos
         if hasattr(self, "_after_mapa_regional") and self._after_mapa_regional is not None:
             try:
                 self.raiz.after_cancel(self._after_mapa_regional)
@@ -3827,40 +3787,11 @@ class AppEEG:
             self.log(f"Encontré {len(archivos)} archivo(s) .dat")
         self.raiz.after_idle(self._actualizar_colores_lista)
 
-    def quitar_archivos_cargados(self):
-       
-        if not getattr(self, "archivos_dat", None) and not self.carpeta_dcl:
-            messagebox.showinfo("Quitar archivos", "No hay archivos cargados todavía.")
-            return
-
-        if not messagebox.askyesno(
-            "Quitar archivos",
-            "¿Quitar los archivos .dat cargados de la lista?\n\n"
-            "Esto no borra nada del disco ni el caché ya procesado; "
-            "solo limpia lo que ves aquí para poder cargar otra carpeta."
-        ):
-            return
-
-       
-        
-        self.limpiar_datos()
-        
-
-        self.carpeta_dcl = ""
-        self.archivos_dat = []
-        self.lista.delete(*self.lista.get_children())
-        self.var_resumen_lista.set("Sin archivos cargados.")
-        self.lbl_carpeta.config(text="Carpeta actual:\n(no seleccionada)")
-        self.btn_proc.config(state="disabled")
-        self.btn_pdf.config(state="disabled")
-        self._set_barra("Lista de archivos vaciada. Selecciona una carpeta para continuar.")
-        self.log("[OK] Lista de archivos .dat vaciada por el usuario.")
-
     def on_select_dat(self, _evt=None):
         idxs = self.lista.selection()
         if not idxs:
             return
-        nombre = idxs[0]  
+        nombre = idxs[0]  # iid == nombre de archivo
         self.var_resumen_lista.set(f"Seleccionado: {nombre}")
         carpeta_cache = self._ruta_cache_de_archivo(nombre)
         if self._cache_valido(carpeta_cache):
@@ -4224,13 +4155,12 @@ class AppEEG:
                 self.log("[OK] Informe PDF generado correctamente.")
                 self.log("[OK] Resultados actualizados en la interfaz.")
 
-                # Ya NO se abre el PDF automáticamente. Solo se avisa que
-                # terminó bien; para verlo, el usuario usa "Vista previa".
-                messagebox.showinfo(
-                    "Procesado con éxito",
-                    f"El archivo se procesó correctamente y el informe está listo.\n\n"
-                    f"Usa 'Vista previa' para verlo cuando quieras."
-                )
+                try:
+                    abrir_pdf_en_windows(ruta_pdf)
+                    self.log("[OK] Informe abierto en el visor de Windows.")
+                except Exception as e:
+                    self.log(f"[Aviso] PDF generado, pero no se pudo abrir automáticamente: {e}")
+                    messagebox.showwarning("PDF", f"PDF generado, pero no pude abrirlo automáticamente.\n\nRuta:\n{ruta_pdf}")
             else:
                 self.ruta_pdf_ultimo = self._buscar_pdf_preferido(self.nombre_ultimo, self.cache_ultimo)
                 self.btn_pdf.config(state="normal" if self.ruta_pdf_ultimo and os.path.exists(self.ruta_pdf_ultimo) else "disabled")
@@ -4267,345 +4197,6 @@ class AppEEG:
             self.log("[OK] Informe abierto en el visor de Windows.")
         except Exception as e:
             messagebox.showerror("PDF", f"No pude abrir el PDF:\n{e}")
-
-    ## =========================================================
-    ## Consolidado Excel (varios informes en un solo .xlsx)
-    ## =========================================================
-    def abrir_ventana_consolidado(self):
-        """
-        Ventana NO modal (sin grab_set) para elegir qué informes consolidar.
-        El usuario puede cerrarla en cualquier momento con 'Cerrar' o con la (X)
-        y seguir viendo/gráficando otros archivos en la ventana principal mientras
-        tanto, incluso si dejó una generación corriendo en segundo plano.
-        """
-        if not self.carpeta_dcl or not getattr(self, "archivos_dat", None):
-            messagebox.showinfo("Consolidado", "Primero selecciona una carpeta con archivos .dat.")
-            return
-
-        disponibles = []
-        for nombre in self.archivos_dat:
-            carpeta_cache = self._ruta_cache_de_archivo(nombre)
-            if self._cache_valido(carpeta_cache):
-                disponibles.append((nombre, carpeta_cache))
-
-        if not disponibles:
-            messagebox.showinfo(
-                "Consolidado",
-                "Todavía no hay archivos procesados.\nProcesa al menos un archivo antes de generar el consolidado."
-            )
-            return
-
-        win = tk.Toplevel(self.raiz)
-        win.title("Descargar consolidado Excel")
-        win.geometry("440x520")
-        win.configure(bg=FONDO_APP)
-        win.transient(self.raiz)   # queda asociada a la ventana principal...
-        win.attributes("-topmost", False)
-        # ... pero SIN grab_set(): no es modal, así que el usuario puede seguir
-        # usando/viendo otros informes en la ventana principal mientras esta sigue abierta.
-
-        ttk.Label(
-            win,
-            text="Selecciona los informes que quieres incluir en el consolidado:",
-            style="Sidebar.TLabel",
-            wraplength=400,
-            justify="left",
-        ).pack(fill=tk.X, padx=12, pady=(12, 6))
-
-        marco_lista = ttk.Frame(win, style="Sidebar.TFrame")
-        marco_lista.pack(fill=tk.BOTH, expand=True, padx=12)
-
-        canvas_sel = tk.Canvas(marco_lista, bg=FONDO_APP, highlightthickness=0)
-        scroll_sel = ttk.Scrollbar(
-            marco_lista, orient="vertical", command=canvas_sel.yview, style="NeuroX.Vertical.TScrollbar"
-        )
-        frame_check = ttk.Frame(canvas_sel, style="Sidebar.TFrame")
-        frame_check.bind(
-            "<Configure>", lambda e: canvas_sel.configure(scrollregion=canvas_sel.bbox("all"))
-        )
-        canvas_sel.create_window((0, 0), window=frame_check, anchor="nw")
-        canvas_sel.configure(yscrollcommand=scroll_sel.set)
-        canvas_sel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll_sel.pack(side=tk.RIGHT, fill=tk.Y)
-
-        variables = {}
-        for nombre, carpeta_cache in disponibles:
-            var = tk.BooleanVar(value=True)
-            variables[nombre] = (var, carpeta_cache)
-            ttk.Checkbutton(frame_check, text=nombre, variable=var).pack(anchor="w", pady=2, padx=2)
-
-        frame_todos = ttk.Frame(win, style="Sidebar.TFrame")
-        frame_todos.pack(fill=tk.X, padx=12, pady=(6, 0))
-
-        def _marcar_todos(valor):
-            for var, _ in variables.values():
-                var.set(valor)
-
-        ttk.Button(
-            frame_todos, text="Marcar todos", style="Secondary.TButton",
-            command=lambda: _marcar_todos(True)
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            frame_todos, text="Desmarcar todos", style="Secondary.TButton",
-            command=lambda: _marcar_todos(False)
-        ).pack(side=tk.LEFT)
-
-        var_estado_consolidado = tk.StringVar(value="")
-        ttk.Label(
-            win, textvariable=var_estado_consolidado, style="Sidebar.TLabel",
-            wraplength=400, justify="left"
-        ).pack(fill=tk.X, padx=12, pady=(8, 0))
-
-        frame_final = ttk.Frame(win, style="Sidebar.TFrame")
-        frame_final.pack(fill=tk.X, padx=12, pady=12)
-
-        btn_generar = ttk.Button(frame_final, text="Generar Excel", style="Accent.TButton")
-        btn_generar.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
-
-        # Botón 'Cerrar': cierra SOLO esta ventana; la ventana principal sigue
-        # activa y el usuario puede seguir viendo/abriendo otros informes.
-        ttk.Button(
-            frame_final, text="Cerrar", style="Secondary.TButton", command=win.destroy
-        ).pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(6, 0))
-
-        def _generar():
-            seleccionados = [
-                (nombre, carpeta_cache)
-                for nombre, (var, carpeta_cache) in variables.items()
-                if var.get()
-            ]
-            if not seleccionados:
-                messagebox.showwarning("Consolidado", "Selecciona al menos un archivo.", parent=win)
-                return
-
-            ruta_salida = filedialog.asksaveasfilename(
-                parent=win,
-                title="Guardar consolidado como",
-                defaultextension=".xlsx",
-                filetypes=[("Libro de Excel", "*.xlsx")],
-                initialfile="Consolidado_reportes_neuroX.xlsx",
-            )
-            if not ruta_salida:
-                return
-
-            btn_generar.config(state="disabled")
-            var_estado_consolidado.set(f"Generando consolidado con {len(seleccionados)} informe(s)...")
-
-            def _hilo_consolidado():
-                err = None
-                incluidos, omitidos = [], []
-                try:
-                    _, incluidos, omitidos = generar_consolidado_excel(
-                        seleccionados,
-                        ruta_salida,
-                        logger=lambda m: self.raiz.after(0, lambda: self.log(str(m))),
-                    )
-                except Exception as e:
-                    err = e
-
-                def _terminar():
-                    if not win.winfo_exists():
-                        # El usuario cerró la ventana de selección mientras se generaba:
-                        # igual avisamos por el log/barra de estado de la ventana principal.
-                        if err:
-                            self.log(f"[Error] No se pudo generar el consolidado: {err}")
-                            self._set_barra("Error generando el consolidado.")
-                        else:
-                            self.log(f"[OK] Consolidado generado en: {ruta_salida}")
-                            self._set_barra("Consolidado Excel generado.")
-                        return
-
-                    btn_generar.config(state="normal")
-                    if err:
-                        var_estado_consolidado.set(f"Error: {err}")
-                        messagebox.showerror(
-                            "Consolidado", f"No se pudo generar el consolidado.\n\n{err}", parent=win
-                        )
-                        return
-
-                    mensaje = f"Consolidado generado: {os.path.basename(ruta_salida)}"
-                    if omitidos:
-                        mensaje += f"\nOmitidos (sin datos procesados completos): {', '.join(omitidos)}"
-                    var_estado_consolidado.set(mensaje)
-                    self.log(f"[OK] Consolidado Excel generado en: {ruta_salida}")
-                    self._set_barra("Consolidado Excel generado.")
-
-                try:
-                    self.raiz.after(0, _terminar)
-                except Exception:
-                    pass
-
-            threading.Thread(target=_hilo_consolidado, daemon=True).start()
-
-        btn_generar.config(command=_generar)
-
-    ## =========================================================
-    ## Consolidado PDF (varios informes PDF combinados en uno solo)
-    ## =========================================================
-    def abrir_ventana_consolidado_pdf(self):
-        """
-        Igual que la ventana del consolidado Excel: NO modal (sin grab_set),
-        con botón 'Cerrar' independiente, para poder seguir viendo otros
-        informes en la ventana principal mientras esta sigue abierta.
-        """
-        if not self.carpeta_dcl or not getattr(self, "archivos_dat", None):
-            messagebox.showinfo("Consolidado PDF", "Primero selecciona una carpeta con archivos .dat.")
-            return
-
-        disponibles = []
-        for nombre in self.archivos_dat:
-            carpeta_cache = self._ruta_cache_de_archivo(nombre)
-            if not self._cache_valido(carpeta_cache):
-                continue
-            ruta_pdf = self._buscar_pdf_preferido(nombre, carpeta_cache)
-            if ruta_pdf and os.path.exists(ruta_pdf):
-                disponibles.append((nombre, ruta_pdf))
-
-        if not disponibles:
-            messagebox.showinfo(
-                "Consolidado PDF",
-                "Todavía no hay informes PDF generados.\nProcesa al menos un archivo antes de generar el consolidado."
-            )
-            return
-
-        win = tk.Toplevel(self.raiz)
-        win.title("Descargar consolidado PDF")
-        win.geometry("440x520")
-        win.configure(bg=FONDO_APP)
-        win.transient(self.raiz)  # asociada a la ventana principal, pero NO modal (sin grab_set)
-
-        ttk.Label(
-            win,
-            text="Selecciona los informes PDF que quieres combinar en un solo archivo:",
-            style="Sidebar.TLabel",
-            wraplength=400,
-            justify="left",
-        ).pack(fill=tk.X, padx=12, pady=(12, 6))
-
-        marco_lista = ttk.Frame(win, style="Sidebar.TFrame")
-        marco_lista.pack(fill=tk.BOTH, expand=True, padx=12)
-
-        canvas_sel = tk.Canvas(marco_lista, bg=FONDO_APP, highlightthickness=0)
-        scroll_sel = ttk.Scrollbar(
-            marco_lista, orient="vertical", command=canvas_sel.yview, style="NeuroX.Vertical.TScrollbar"
-        )
-        frame_check = ttk.Frame(canvas_sel, style="Sidebar.TFrame")
-        frame_check.bind(
-            "<Configure>", lambda e: canvas_sel.configure(scrollregion=canvas_sel.bbox("all"))
-        )
-        canvas_sel.create_window((0, 0), window=frame_check, anchor="nw")
-        canvas_sel.configure(yscrollcommand=scroll_sel.set)
-        canvas_sel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll_sel.pack(side=tk.RIGHT, fill=tk.Y)
-
-        variables = {}
-        for nombre, ruta_pdf in disponibles:
-            var = tk.BooleanVar(value=True)
-            variables[nombre] = (var, ruta_pdf)
-            ttk.Checkbutton(frame_check, text=nombre, variable=var).pack(anchor="w", pady=2, padx=2)
-
-        frame_todos = ttk.Frame(win, style="Sidebar.TFrame")
-        frame_todos.pack(fill=tk.X, padx=12, pady=(6, 0))
-
-        def _marcar_todos(valor):
-            for var, _ in variables.values():
-                var.set(valor)
-
-        ttk.Button(
-            frame_todos, text="Marcar todos", style="Secondary.TButton",
-            command=lambda: _marcar_todos(True)
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(
-            frame_todos, text="Desmarcar todos", style="Secondary.TButton",
-            command=lambda: _marcar_todos(False)
-        ).pack(side=tk.LEFT)
-
-        var_estado_pdf = tk.StringVar(value="")
-        ttk.Label(
-            win, textvariable=var_estado_pdf, style="Sidebar.TLabel",
-            wraplength=400, justify="left"
-        ).pack(fill=tk.X, padx=12, pady=(8, 0))
-
-        frame_final = ttk.Frame(win, style="Sidebar.TFrame")
-        frame_final.pack(fill=tk.X, padx=12, pady=12)
-
-        btn_generar = ttk.Button(frame_final, text="Generar PDF", style="Accent.TButton")
-        btn_generar.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
-
-        # 'Cerrar' solo cierra esta ventana; la principal sigue disponible.
-        ttk.Button(
-            frame_final, text="Cerrar", style="Secondary.TButton", command=win.destroy
-        ).pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(6, 0))
-
-        def _generar():
-            seleccionados = [
-                (nombre, ruta_pdf)
-                for nombre, (var, ruta_pdf) in variables.items()
-                if var.get()
-            ]
-            if not seleccionados:
-                messagebox.showwarning("Consolidado PDF", "Selecciona al menos un informe.", parent=win)
-                return
-
-            ruta_salida = filedialog.asksaveasfilename(
-                parent=win,
-                title="Guardar consolidado PDF como",
-                defaultextension=".pdf",
-                filetypes=[("PDF", "*.pdf")],
-                initialfile="Consolidado_informes_neuroX.pdf",
-            )
-            if not ruta_salida:
-                return
-
-            btn_generar.config(state="disabled")
-            var_estado_pdf.set(f"Combinando {len(seleccionados)} informe(s)...")
-
-            def _hilo_pdf():
-                err = None
-                incluidos, omitidos = [], []
-                try:
-                    rutas_pdf = [ruta for _, ruta in seleccionados]
-                    _, incluidos, omitidos = combinar_informes_pdf(
-                        rutas_pdf,
-                        ruta_salida,
-                        logger=lambda m: self.raiz.after(0, lambda: self.log(str(m))),
-                    )
-                except Exception as e:
-                    err = e
-
-                def _terminar():
-                    if not win.winfo_exists():
-                        if err:
-                            self.log(f"[Error] No se pudo generar el consolidado PDF: {err}")
-                            self._set_barra("Error generando el consolidado PDF.")
-                        else:
-                            self.log(f"[OK] Consolidado PDF generado en: {ruta_salida}")
-                            self._set_barra("Consolidado PDF generado.")
-                        return
-
-                    btn_generar.config(state="normal")
-                    if err:
-                        var_estado_pdf.set(f"Error: {err}")
-                        messagebox.showerror(
-                            "Consolidado PDF", f"No se pudo generar el consolidado.\n\n{err}", parent=win
-                        )
-                        return
-
-                    mensaje = f"Consolidado PDF generado: {os.path.basename(ruta_salida)}"
-                    if omitidos:
-                        mensaje += f"\nOmitidos (no se pudo leer el PDF): {len(omitidos)}"
-                    var_estado_pdf.set(mensaje)
-                    self.log(f"[OK] Consolidado PDF generado en: {ruta_salida}")
-                    self._set_barra("Consolidado PDF generado.")
-
-                try:
-                    self.raiz.after(0, _terminar)
-                except Exception:
-                    pass
-
-            threading.Thread(target=_hilo_pdf, daemon=True).start()
-
-        btn_generar.config(command=_generar)
 
     ## =========================================================
     ## Navegación entre visor y análisis
@@ -6219,7 +5810,6 @@ class AppEEG:
         self._resumen_welch = None
 
         if not self.cache_ultimo:
-            print("\n[DIAGNÓSTICO CACHÉ]: self.cache_ultimo no está definido.")
             return False
 
         carpeta = os.path.join(self.cache_ultimo, "analisis_welch")
@@ -6227,9 +5817,6 @@ class AppEEG:
         ruta_json = os.path.join(carpeta, "pot_rel_promedios.json")
 
         if not os.path.exists(ruta_npz):
-            # ESTA ES LA LÍNEA QUE SE ACTIVA: El archivo .npz no existe en el disco
-            print(f"\n[DIAGNÓSTICO CACHÉ]: No se encontró el archivo {ruta_npz}.")
-            print("El pipeline no guardó pot_rel_welch.npz al procesar la señal.")
             return False
 
         try:
@@ -6237,7 +5824,6 @@ class AppEEG:
             with np.load(ruta_npz, allow_pickle=False) as z:
                 for b in ["Delta", "Theta", "Alfa", "Beta"]:
                     if b not in z:
-                        print(f"\n[DIAGNÓSTICO CACHÉ]: Falta la banda '{b}' en el archivo .npz.")
                         return False
                     datos[b] = np.asarray(z[b], dtype=np.float64)
 
@@ -6250,9 +5836,6 @@ class AppEEG:
             self._resumen_welch = resumen
             return True
         except Exception as e:
-            import traceback
-            print(f"\n[ERROR CRÍTICO AL LEER .NPZ]: {e}")
-            traceback.print_exc()
             self.log(f"No pude cargar potencia relativa Welch: {e}")
             self._pot_rel_welch = None
             self._resumen_welch = None
@@ -8480,11 +8063,6 @@ class AppEEG:
 
         try:
             freqs = np.load(ruta_f, mmap_mode="r")
-        except Exception as e:
-            messagebox.showerror("Error", f"No pude cargar la FFT filtrada:\n{e}")
-            return
-
-        try:
             amps = np.load(ruta_a, mmap_mode="r")
         except Exception as e:
             messagebox.showerror("Error", f"No pude cargar la FFT filtrada:\n{e}")
@@ -8500,27 +8078,73 @@ class AppEEG:
             fmax = float(self.var_fmax.get())
         except Exception:
             fmax = 40.0
-        mask = freqs <= fmax
 
+        mask = freqs <= fmax
         x = np.asarray(freqs[mask], dtype=np.float64)
         y = np.asarray(amps[idx, mask], dtype=np.float64)
+
         unidad_fft = self._leer_unidad_fft_desde_cache()
         if unidad_fft == "µV":
             ylabel = " (µV)"
         elif unidad_fft:
             ylabel = f" ({unidad_fft})"
         else:
-            ylabel = "(u.a.)"
+            ylabel = " (u.a.)"
 
         self.fig.clear()
         ax = self.fig.add_subplot(111)
+
         bandas_fft = [
-            ("Delta", 1, 3,  "#7EC8E3"),
-            ("Theta", 3, 8,  "#8BC34A"),
-            ("Alfa",  8, 12, "#FFD54F"),
+            ("Delta", 1, 3, "#7EC8E3"),
+            ("Theta", 3, 8, "#8BC34A"),
+            ("Alfa", 8, 12, "#FFD54F"),
             ("Beta", 12, 30, "#FF8A65")
-            
         ]
+        for nombre_banda, f_min, f_max, color in bandas_fft:
+            ax.axvspan(f_min, f_max, color=color, alpha=0.2, label=nombre_banda)
+
+        ax.plot(x, y, color="#1f77b4", linewidth=1.0, label="FFT Filtrada")
+
+        PERCENTIL_ESCALA = 99
+        MARGEN_ESCALA = 1.3
+
+        if len(y) > 0:
+            techo = float(np.percentile(y, PERCENTIL_ESCALA)) * MARGEN_ESCALA
+            techo = max(techo, 1e-6)
+            pico_real = float(np.max(y))
+
+            if pico_real > techo:
+                idx_pico = int(np.argmax(y))
+                ax.set_ylim(0, techo)
+
+                texto_alerta = f"⚠ pico fuera de escala: {pico_real:.1f}{ylabel} a {x[idx_pico]:.1f} Hz"
+                estilo_flecha = {"arrowstyle": "->", "color": "firebrick", "lw": 1}
+                estilo_caja = {"boxstyle": "round,pad=0.3", "fc": "white", "ec": "firebrick", "lw": 0.8, "alpha": 0.9}
+
+                ax.annotate(
+                    texto_alerta,
+                    xy=(x[idx_pico], techo),
+                    xytext=(0.5, 0.95),
+                    textcoords="axes fraction",
+                    ha="center",
+                    va="top",
+                    fontsize=8,
+                    color="firebrick",
+                    arrowprops=estilo_flecha,
+                    bbox=estilo_caja
+                )
+            else:
+                ax.set_ylim(0, techo)
+
+        ax.set_xlim(0, fmax)
+        ax.set_xlabel("Frecuencia (Hz)")
+        ax.set_ylabel(f"Amplitud{ylabel}")
+        ax.set_title(f"Espectro FFT Filtrado - Canal: {nombre_canal}")
+        ax.grid(True, linestyle="--", alpha=0.5)
+        ax.legend(loc="upper right", fontsize=8)
+
+        self.fig.tight_layout()
+        self.canvas.draw()
 
         # fondos por bandas
         bandas_color = [
@@ -9030,4 +8654,3 @@ if __name__ == "__main__":
     aplicar_escala_tk(raiz)
     app = AppEEG(raiz)
     raiz.mainloop()
-

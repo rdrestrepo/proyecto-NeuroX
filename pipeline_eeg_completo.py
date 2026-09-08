@@ -9,6 +9,7 @@ PIPELINE EEG ORGANIZADO PARA TKINTER
 """
 
 import os
+import sys
 import re
 import gc
 import datetime
@@ -17,17 +18,28 @@ import shutil
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
 from PIL import Image
 
 from scipy.signal import butter, sosfiltfilt, iirnotch, filtfilt, welch, spectrogram, find_peaks
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
 from fpdf import FPDF
+# NOTA: 'pywt' (usado solo en wavelet_denoise_1d) y 'sklearn.decomposition.FastICA'
+# (usado solo en aplicar_ica_por_ventanas) se importan de forma diferida, dentro de
+# esas funciones, para no pagar su costo de carga al simplemente importar este módulo.
 
 from matplotlib.patches import Patch
 
 
 def _trapz(y, x=None, axis=-1):
+    """
+    Integral por regla del trapecio, compatible con cualquier versión de NumPy.
+    NumPy >= 2.0 renombró 'trapz' a 'trapezoid' (misma implementación,
+    misma matemática); NumPy < 2.0 solo tiene 'trapz'. Esta envoltura evita
+    que el resultado dependa de qué versión de NumPy esté instalada.
+    """
     fn = getattr(np, "trapezoid", None) or np.trapz
     return fn(y, x=x, axis=axis)
 
@@ -1120,7 +1132,8 @@ def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
         ica = FastICA(
             n_components=min(64, ventana.shape[0]),
             random_state=42,
-            max_iter=2000,
+            max_iter=1000,
+            tol=1e-2,
             whiten="unit-variance"
         )
 
@@ -2554,13 +2567,21 @@ def _registro_para_informe(nombre_archivo):
 
 
 def buscar_logo_neurox():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    # Implementación única y compartida (antes duplicada en Interfaz_neuroX.py
+    # con lógica ligeramente distinta). Consciente de PyInstaller: en el .exe
+    # compilado, sys._MEIPASS apunta a la carpeta temporal donde se extraen
+    # los datos empaquetados (incluida 'assets/'); en modo desarrollo, cae a
+    # la carpeta de este archivo.
+    try:
+        base_dir = sys._MEIPASS
+    except Exception:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
     candidatos = [
         os.path.join(base_dir, "assets", "logo_neurox_horizontal.png"),
         os.path.join(base_dir, "assets", "nombre_neurox.png"),
+        os.path.join(base_dir, "assets", "icono_neurox.png"),
         os.path.join(base_dir, "logo_neurox_horizontal.png"),
         os.path.join(base_dir, "nombre_neurox.png"),
-        os.path.join(base_dir, "assets", "icono_neurox.png"),
         os.path.join(base_dir, "icono_neurox.png"),
     ]
     for ruta in candidatos:

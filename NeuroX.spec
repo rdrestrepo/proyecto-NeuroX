@@ -1,3 +1,5 @@
+import os
+
 block_cipher = None 
 
 excludes_list = [
@@ -25,16 +27,18 @@ excludes_list = [
     'pytest',
 ]
 
-a= Analysis(
- ['Interfaz_neuroX.py'],
- pathex=[],
- binaries=[],
-    datas=[],
+a = Analysis(
+    ['Interfaz_neuroX.py'],
+    pathex=[],
+    binaries=[],
+    datas=[
+        ('assets/logo_neurox.ico', 'assets'), 
+    ],
     hiddenimports=[
         'scipy.signal',
         'scipy.ndimage',
         'scipy.interpolate',
-        'spicy.integrate',
+        'scipy.integrate',  
         'sklearn.decomposition',
         'pywt',
         'fpdf',
@@ -50,7 +54,7 @@ a= Analysis(
     noarchive=False,
 )
 
-pyz= PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
     pyz,
@@ -68,7 +72,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon='assets/logo_neurox.ico',  
 )
 
 coll = COLLECT(
