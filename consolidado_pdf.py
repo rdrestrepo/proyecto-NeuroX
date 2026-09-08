@@ -1,11 +1,25 @@
-
+# -*- coding: utf-8 -*-
+"""
+consolidado_pdf.py
+====================
+Combina en un solo archivo PDF varios informes individuales que el pipeline
+ya generó (uno por archivo .dat procesado). No vuelve a generar nada: solo
+une los PDF que ya existen en el CACHE / carpeta de informes.
+"""
 
 import os
 from pypdf import PdfReader, PdfWriter
 
 
 def combinar_informes_pdf(rutas_pdf, ruta_salida, logger=None):
-    
+    """
+    rutas_pdf: lista de rutas a archivos .pdf ya generados (en el orden en
+        que deben quedar dentro del PDF combinado).
+    ruta_salida: ruta completa del .pdf combinado a crear.
+
+    Devuelve (ruta_salida, incluidos, omitidos), donde 'incluidos' y
+    'omitidos' son listas de rutas según se hayan podido leer o no.
+    """
     def log(msg):
         if logger:
             try:
