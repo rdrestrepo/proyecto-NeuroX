@@ -6343,7 +6343,7 @@ class AppEEG:
         self._resumen_welch = None
 
         if not self.cache_ultimo:
-            print("\n[DIAGNÓSTICO CACHÉ]: self.cache_ultimo no está definido.")
+            self.log("[DIAGNÓSTICO CACHÉ] self.cache_ultimo no está definido.")
             return False
 
         carpeta = os.path.join(self.cache_ultimo, "analisis_welch")
@@ -6352,8 +6352,8 @@ class AppEEG:
 
         if not os.path.exists(ruta_npz):
             # ESTA ES LA LÍNEA QUE SE ACTIVA: El archivo .npz no existe en el disco
-            print(f"\n[DIAGNÓSTICO CACHÉ]: No se encontró el archivo {ruta_npz}.")
-            print("El pipeline no guardó pot_rel_welch.npz al procesar la señal.")
+            self.log(f"[DIAGNÓSTICO CACHÉ] No se encontró el archivo {ruta_npz}.")
+            self.log("[DIAGNÓSTICO CACHÉ] El pipeline no guardó pot_rel_welch.npz al procesar la señal.")
             return False
 
         try:
@@ -6361,7 +6361,7 @@ class AppEEG:
             with np.load(ruta_npz, allow_pickle=False) as z:
                 for b in ["Delta", "Theta", "Alfa", "Beta"]:
                     if b not in z:
-                        print(f"\n[DIAGNÓSTICO CACHÉ]: Falta la banda '{b}' en el archivo .npz.")
+                        self.log(f"[DIAGNÓSTICO CACHÉ] Falta la banda '{b}' en el archivo .npz.")
                         return False
                     datos[b] = np.asarray(z[b], dtype=np.float64)
 
@@ -6375,8 +6375,8 @@ class AppEEG:
             return True
         except Exception as e:
             import traceback
-            print(f"\n[ERROR CRÍTICO AL LEER .NPZ]: {e}")
-            traceback.print_exc()
+            self.log(f"[ERROR CRÍTICO AL LEER .NPZ] {e}")
+            self.log(traceback.format_exc())
             self.log(f"No pude cargar potencia relativa Welch: {e}")
             self._pot_rel_welch = None
             self._resumen_welch = None

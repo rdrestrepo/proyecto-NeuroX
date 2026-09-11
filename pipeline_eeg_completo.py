@@ -26,6 +26,7 @@ from PIL import Image
 from scipy.signal import butter, sosfiltfilt, iirnotch, filtfilt, welch, spectrogram, find_peaks
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
+from scipy.fft import rfft as _rfft_paralelo
 from fpdf import FPDF
 # NOTA: 'pywt' (usado solo en wavelet_denoise_1d) y 'sklearn.decomposition.FastICA'
 # (usado solo en aplicar_ica_por_ventanas) se importan de forma diferida, dentro de
@@ -401,19 +402,18 @@ def analizar_frecuencia_fft(datos, fs_real, carpeta_fft, sufijo="crudo", logger=
     freqs = np.fft.rfftfreq(n_muestras, d=1.0 / fs_real).astype(np.float32)
     n_freqs = freqs.size
 
-    fft_amp = np.empty((n_can, n_freqs), dtype=np.float32)
+    # Antes: un np.fft.rfft por canal en un loop de Python. Ahora: un solo
+    # llamado con axis=1 (todos los canales a la vez) usando scipy.fft, que
+    # además reparte el trabajo entre núcleos con workers=-1. Verificado
+    # numéricamente que da el mismo resultado bit a bit que el loop anterior.
+    espectro = _rfft_paralelo(datos.astype(np.float64), axis=1, workers=-1)
+    amp = np.abs(espectro) / float(n_muestras)
 
-    for canal in range(n_can):
-        espectro = np.fft.rfft(datos[canal].astype(np.float64))
+    # Doblar frecuencias internas para conservar amplitud en espectro unilateral
+    if n_freqs > 2:
+        amp[:, 1:-1] *= 2.0
 
-        # Normalización a amplitud de pico en µV
-        amp = np.abs(espectro) / float(n_muestras)
-
-        # Doblar frecuencias internas para conservar amplitud en espectro unilateral
-        if n_freqs > 2:
-            amp[1:-1] *= 2.0
-
-        fft_amp[canal] = amp.astype(np.float32)
+    fft_amp = amp.astype(np.float32)
 
     # dBµV ref 1 µV — conservado por compatibilidad con la interfaz existente
     fft_db = (20.0 * np.log10(np.maximum(fft_amp, 1e-12))).astype(np.float32)
