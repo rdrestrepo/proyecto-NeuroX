@@ -108,23 +108,8 @@ WAVELET_NAME = "db4"
 WAVELET_NIVEL = 4
 
 # CONFIGURACION ICA (rendimiento)
-# ------------------------------------------------------------------
-# IMPORTANTE: aplicar_ica_por_ventanas() hace fit_transform() seguido
-# INMEDIATAMENTE de inverse_transform() con TODOS los componentes
-# (no se descarta ningún componente de artefacto). Con n_components
-# == n_canales (64), esa ida y vuelta es una transformación casi
-# perfectamente invertible: el resultado final es prácticamente
-# idéntico sin importar cuántas iteraciones haga FastICA para intentar
-# converger a independencia estadística (verificado empíricamente:
-# diferencia < 1e-12 entre max_iter=200 y max_iter=2000).
-#
-# En cambio, el TIEMPO sí depende muchísimo de max_iter: con EEG real
-# (canales muy correlacionados entre sí, sobre todo en ventanas de
-# 10s) es común que FastICA NO logre converger y entonces gaste TODAS
-# las iteraciones permitidas, una y otra vez, por cada ventana de 10s
-# del registro. Bajar el tope de iteraciones no cambia el resultado
-# guardado, pero sí evita ese gasto de tiempo inútil.
-ICA_MAX_ITER = 200
+
+ICA_MAX_ITER = 100
 ICA_TOL = 1e-3
 
 # Ventana cruda a guardar

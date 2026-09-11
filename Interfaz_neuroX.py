@@ -476,8 +476,8 @@ class AppEEG:
         
         
         ## Iconos PNG para botones
-        self._ico_copy   = self._cargar_icono_btn("assets/icon_copy.png",   18)
-        self._ico_folder = self._cargar_icono_btn("assets/icon_folder.png",  18)
+        #self._ico_copy   = self._cargar_icono_btn("assets/icon_copy.png",   18)
+        #self._ico_folder = self._cargar_icono_btn("assets/icon_folder.png",  18)
 
         ## Layout raíz: columna izquierda + columna derecha (sin barra global superior)
         frame_body = ttk.Frame(raiz, padding=(10, 10, 10, 10), style="NeuroX.TFrame")
@@ -711,27 +711,7 @@ class AppEEG:
         frame_carpeta_btns = ttk.Frame(frame_carpeta, style="Sidebar.TFrame")
         frame_carpeta_btns.pack(side=tk.RIGHT, anchor="n", padx=(4, 0))
 
-        self.btn_copiar_carpeta = ttk.Button(
-            frame_carpeta_btns,
-            image=self._ico_copy,
-            text="" if self._ico_copy else "⎘",
-            compound="center",
-            command=self._copiar_ruta_carpeta,
-            style="Secondary.TButton",
-            width=3,
-        )
-        self.btn_copiar_carpeta.pack(side=tk.LEFT, padx=(0, 2))
-
-        self.btn_abrir_carpeta = ttk.Button(
-            frame_carpeta_btns,
-            image=self._ico_folder,
-            text="" if self._ico_folder else "📁",
-            compound="center",
-            command=self._abrir_carpeta_en_explorador,
-            style="Secondary.TButton",
-            width=3,
-        )
-        self.btn_abrir_carpeta.pack(side=tk.LEFT)
+        
 
         ## Lista de archivos .dat
         self.marco_lista = ttk.LabelFrame(
