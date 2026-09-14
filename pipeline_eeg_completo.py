@@ -1121,50 +1121,48 @@ def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
     return resultado
 
 
-def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
+def _procesar_ventana_ica(ventana):
+    """Procesa una única ventana de ICA (función auxiliar para paralelismo)"""
     import warnings
     from sklearn.decomposition import FastICA
     from sklearn.exceptions import ConvergenceWarning
+
+    ica = FastICA(
+        n_components=min(64, ventana.shape[0]),
+        random_state=42,
+        max_iter=ICA_MAX_ITER,
+        tol=ICA_TOL,
+        whiten="unit-variance"
+    )
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=ConvergenceWarning)
+            componentes = ica.fit_transform(ventana.T)
+            return ica.inverse_transform(componentes).T
+    except Exception as e:
+        print(f"Error en ventana ICA: {e}")
+        return ventana
+
+def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
+    from concurrent.futures import ThreadPoolExecutor
 
     muestras_ventana = int(fs_real * ventana_seg)
     n_ventanas = datos.shape[1] // muestras_ventana
     datos_ica = np.zeros_like(datos)
 
-    for i in range(n_ventanas):
+    # 1. Preparamos las vistas de memoria (sin copiar datos) para cada ventana
+    ventanas = [datos[:, i * muestras_ventana:(i + 1) * muestras_ventana] for i in range(n_ventanas)]
+
+    # 2. Procesamos en paralelo (NumPy libera el GIL internamente)
+    with ThreadPoolExecutor() as executor:
+        resultados = list(executor.map(_procesar_ventana_ica, ventanas))
+
+    # 3. Ensamblamos los resultados manteniendo el orden cronológico
+    for i, reconstruido in enumerate(resultados):
         inicio = i * muestras_ventana
-        fin = inicio + muestras_ventana
-        ventana = datos[:, inicio:fin]
+        datos_ica[:, inicio:inicio + muestras_ventana] = reconstruido
 
-        if ventana.shape[1] < muestras_ventana:
-            break
-
-        ica = FastICA(
-            n_components=min(64, ventana.shape[0]),
-            random_state=42,
-            max_iter=ICA_MAX_ITER,
-            tol=ICA_TOL,
-            whiten="unit-variance"
-        )
-
-        try:
-            # Nota de rendimiento: aquí no se descarta ningún componente
-            # (no hay rechazo de artefactos), así que fit_transform +
-            # inverse_transform con todos los componentes devuelve una
-            # señal prácticamente idéntica a la de entrada, converja o no
-            # FastICA. Por eso limitamos max_iter/tol arriba: no cambia
-            # el resultado guardado, solo evita minutos de cómputo
-            # cuando el algoritmo no logra converger (algo frecuente con
-            # EEG real, con canales muy correlacionados entre sí).
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=ConvergenceWarning)
-                componentes = ica.fit_transform(ventana.T)
-                reconstruido = ica.inverse_transform(componentes).T
-            datos_ica[:, inicio:fin] = reconstruido
-
-        except Exception as e:
-            print(f"Error en ventana {i}: {e}")
-            datos_ica[:, inicio:fin] = ventana
-
+    # Copiamos el residuo temporal si la señal no es múltiplo exacto de 10s
     fin_procesado = n_ventanas * muestras_ventana
     if fin_procesado < datos.shape[1]:
         datos_ica[:, fin_procesado:] = datos[:, fin_procesado:]
@@ -1193,17 +1191,23 @@ def wavelet_denoise_1d(signal_1d, wavelet=WAVELET_NAME, nivel=WAVELET_NIVEL):
 
 def aplicar_wavelet_por_canales(datos, logger=None):
     log = _mklogger(logger)
+    from concurrent.futures import ThreadPoolExecutor
 
     datos = np.asarray(datos, dtype=np.float32)
     n_canales, n_muestras = datos.shape
     salida = np.empty((n_canales, n_muestras), dtype=np.float32)
 
-    log("Aplicando wavelet canal por canal...")
-    for canal in range(n_canales):
-        salida[canal] = wavelet_denoise_1d(datos[canal])
-        if (canal + 1) % 8 == 0 or canal == n_canales - 1:
-            log(f"Wavelet: canal {canal + 1}/{n_canales}")
+    log("Aplicando wavelet en paralelo...")
+    
+    # Mapeamos la función wavelet a todos los canales simultáneamente
+    with ThreadPoolExecutor() as executor:
+        resultados = list(executor.map(wavelet_denoise_1d, datos))
+        
+    # Guardamos los resultados (garantizado que mantienen el orden del canal 0 al 63)
+    for canal, rec in enumerate(resultados):
+        salida[canal] = rec
 
+    log(f"Wavelet completado para los {n_canales} canales.")
     return salida
 
 
