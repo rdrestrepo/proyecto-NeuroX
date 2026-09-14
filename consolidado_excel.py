@@ -1,5 +1,3 @@
-
-
 import os
 import json
 
@@ -329,9 +327,7 @@ def _hoja_estado_calidad(wb, total_filas):
     ws["C8"].font = Font(bold=True)
 
     _autoancho(ws, {"B": 20, "C": 10})
-    # Nota: a propósito NO se agrega ningún gráfico aquí. Los datos (esta hoja,
-    # "Potencia regional bandas", "Biomarcadores", etc.) quedan listos para que
-    # el usuario arme sus propios gráficos manualmente en Excel si lo desea.
+    
     return ws
 
 

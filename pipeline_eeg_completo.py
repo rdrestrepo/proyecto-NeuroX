@@ -1,14 +1,26 @@
 # -*- coding: utf-8 -*-
-"""
-PIPELINE EEG ORGANIZADO PARA TKINTER
-- No ejecuta procesamiento al importar
-- Mantiene filtros, constantes y cálculos del código original
-- La interfaz puede llamar:
-    carpeta_cache = procesar_archivo(nombre_archivo, carpeta_base=..., logger=...)
-    ruta_pdf = generar_informe_desde_cache(carpeta_cache, logger=...)
-"""
 
 import os
+
+# ------------------------------------------------------------------
+# LÍMITE DE HILOS INTERNOS DE NUMPY/SCIPY (OpenBLAS/MKL) -- CRÍTICO
+# ------------------------------------------------------------------
+"""Este pipeline paraleliza manualmente con ThreadPoolExecutor en varios
+puntos (ICA por ventana, wavelet por canal, FFT con workers=-1). El
+problema: numpy/scipy YA usan una librería BLAS (OpenBLAS o MKL) que
+internamente también reparte cada operación matricial entre TODOS los
+núcleos del equipo, sin saber que ya estamos dentro de un hilo nuestro.
+
+La solución estándar es decirle a BLAS "usa 1 solo hilo para tu
+álgebra interna" y dejar que SOLO nuestro ThreadPoolExecutor controle
+el paralelismo. Estas variables de entorno deben fijarse ANTES de
+importar numpy/scipy por primera vez; por eso van aquí arriba de todo."""
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import re
 import sys
 import gc
@@ -28,9 +40,7 @@ from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
 from scipy.fft import rfft as _rfft_paralelo
 from fpdf import FPDF
-# NOTA: 'pywt' (usado solo en wavelet_denoise_1d) y 'sklearn.decomposition.FastICA'
-# (usado solo en aplicar_ica_por_ventanas) se importan de forma diferida, dentro de
-# esas funciones, para no pagar su costo de carga al simplemente importar este módulo.
+
 
 from matplotlib.patches import Patch
 
@@ -1153,8 +1163,13 @@ def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
     # 1. Preparamos las vistas de memoria (sin copiar datos) para cada ventana
     ventanas = [datos[:, i * muestras_ventana:(i + 1) * muestras_ventana] for i in range(n_ventanas)]
 
-    # 2. Procesamos en paralelo (NumPy libera el GIL internamente)
-    with ThreadPoolExecutor() as executor:
+    # 2. Procesamos en paralelo (NumPy libera el GIL internamente).
+    # max_workers acotado a los núcleos reales: sin este límite, el executor
+    # por defecto puede llegar a min(32, cpu_count+4) hilos, muchos más que
+    # núcleos físicos disponibles, lo que genera cambios de contexto
+    # excesivos en vez de acelerar (ver nota de BLAS al inicio del archivo).
+    max_hilos_ica = max(1, min(len(ventanas), os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=max_hilos_ica) as executor:
         resultados = list(executor.map(_procesar_ventana_ica, ventanas))
 
     # 3. Ensamblamos los resultados manteniendo el orden cronológico
@@ -1199,8 +1214,10 @@ def aplicar_wavelet_por_canales(datos, logger=None):
 
     log("Aplicando wavelet en paralelo...")
     
-    # Mapeamos la función wavelet a todos los canales simultáneamente
-    with ThreadPoolExecutor() as executor:
+    # Mapeamos la función wavelet a todos los canales simultáneamente.
+    # max_workers acotado a los núcleos reales (ver nota de BLAS arriba).
+    max_hilos_wavelet = max(1, min(n_canales, os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=max_hilos_wavelet) as executor:
         resultados = list(executor.map(wavelet_denoise_1d, datos))
         
     # Guardamos los resultados (garantizado que mantienen el orden del canal 0 al 63)
