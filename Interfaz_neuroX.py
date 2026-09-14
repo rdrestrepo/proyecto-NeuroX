@@ -1571,6 +1571,19 @@ class AppEEG:
         try:
             self.txt_log.config(state="normal")
             self.txt_log.insert(tk.END, str(msg) + "\n")
+            # Evita que el widget de log crezca sin límite durante lotes
+            # grandes (procesar 100+ archivos seguidos). Un Text de Tkinter
+            # con miles de líneas hace cada .insert()/.see() progresivamente
+            # más lento, lo que contribuye a que el procesamiento se sienta
+            # cada vez más lento a medida que avanza el lote.
+            try:
+                total_lineas = int(self.txt_log.index("end-1c").split(".")[0])
+            except Exception:
+                total_lineas = 0
+            MAX_LINEAS_LOG = 1500
+            if total_lineas > MAX_LINEAS_LOG:
+                exceso = total_lineas - MAX_LINEAS_LOG
+                self.txt_log.delete("1.0", f"{exceso + 1}.0")
             self.txt_log.see(tk.END)
             self.txt_log.config(state="disabled")
         except Exception:
