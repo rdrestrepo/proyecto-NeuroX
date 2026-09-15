@@ -27,6 +27,7 @@ import gc
 import datetime
 import json
 import shutil
+import functools
 
 import numpy as np
 import matplotlib
@@ -40,7 +41,7 @@ from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
 from scipy.fft import rfft as _rfft_paralelo
 from fpdf import FPDF
-
+from scipy.signal import butter, sosfiltfilt
 
 from matplotlib.patches import Patch
 
@@ -236,11 +237,17 @@ def crear_carpetas_trabajo(rutas):
 # =========================
 # FILTROS / LECTURA
 # =========================
-def filtrar_banda(datos, fs, lowcut, highcut, order):
+@functools.lru_cache(maxsize=16)
+def _get_butter_sos(fs, lowcut, highcut, order):
+    """Genera y cachea los coeficientes del filtro para no recalcularlos."""
     nyquist = 0.5 * fs
     low = lowcut / nyquist
     high = highcut / nyquist
-    sos = butter(order, [low, high], btype="bandpass", output="sos")
+    return butter(order, [low, high], btype="bandpass", output="sos")
+
+def filtrar_banda(datos, fs, lowcut, highcut, order):
+    """Aplica el filtro usando coeficientes cacheados."""
+    sos = _get_butter_sos(fs, lowcut, highcut, order)
     return sosfiltfilt(sos, datos, axis=1)
 
 
@@ -313,20 +320,16 @@ def cargar_datos_eeg(ruta_dat, fs_fijo=None, n_canales_eeg=64, logger=None):
     unidad = meta_dap["data_unit"]
     samp_order = meta_dap["samp_order"]
 
-    datos = np.fromfile(ruta_dat, dtype=dtype)
-
     esperados = n_canales_total * n_muestras
-    if datos.size != esperados:
-        raise ValueError(
-            f"Tamaño inesperado del .dat. "
-            f"Esperado={esperados}, encontrado={datos.size}. "
-            f"dtype={dtype}, canales={n_canales_total}, muestras={n_muestras}"
-        )
+    
+    # 1. OPTIMIZACIÓN: np.memmap mapea el archivo en lugar de cargarlo todo en RAM
+    datos_memmap = np.memmap(ruta_dat, dtype=dtype, mode='r', shape=(esperados,))
 
+    # 2. Reshape genera solo una "vista" virtual, no consume memoria adicional
     if samp_order == "SAMP":
-        datos = datos.reshape(n_muestras, n_canales_total).T
+        datos_vista = datos_memmap.reshape((n_muestras, n_canales_total)).T
     else:
-        datos = datos.reshape(n_canales_total, n_muestras)
+        datos_vista = datos_memmap.reshape((n_canales_total, n_muestras))
 
     if n_canales_eeg > n_canales_total:
         raise ValueError(
@@ -334,7 +337,10 @@ def cargar_datos_eeg(ruta_dat, fs_fijo=None, n_canales_eeg=64, logger=None):
             f"pero el archivo solo tiene {n_canales_total}"
         )
 
-    datos_eeg = datos[:n_canales_eeg].astype(np.float32, copy=False)
+    # 3. Al hacer el recorte y pasarlo a np.asarray con float32,
+    # AQUÍ es cuando realmente pasa a la RAM, pero SOLO los canales útiles.
+    datos_recortados = datos_vista[:n_canales_eeg]
+    datos_eeg = np.asarray(datos_recortados, dtype=np.float32)
 
     fs_real = float(fs_fijo) if fs_fijo is not None else float(meta_dap["fs"])
     tiempo = np.arange(datos_eeg.shape[1], dtype=np.float32) / np.float32(fs_real)
@@ -350,7 +356,7 @@ def cargar_datos_eeg(ruta_dat, fs_fijo=None, n_canales_eeg=64, logger=None):
     log(f"Frecuencia de muestreo usada: {fs_real:.1f} Hz")
     log(f"Duración total: {duracion:.2f} s")
     log(f"Unidad reportada por .dap: {unidad}")
-    log(f"Formato final: {datos_eeg.shape}")
+    log(f"Formato final: {datos_eeg.shape} (float32)")
 
     return datos_eeg, tiempo, fs_real, meta_dap
 
@@ -422,11 +428,8 @@ def analizar_frecuencia_fft(datos, fs_real, carpeta_fft, sufijo="crudo", logger=
 
 def calcular_espectrograma_resumen(datos, fs_real, carpeta_salida, sufijo="filtrado", logger=None):
     """
-    Calcula un resumen tiempo-frecuencia por canal usando PSD/STFT.
-
-    La PSD lineal conserva unidades de potencia espectral; si la señal de
-    entrada está en µV, la PSD lineal estaría en µV²/Hz. Para visualización
-    se transforma a dB, lo cual no es equivalente a la magnitud FFT en µV.
+    Calcula un resumen tiempo-frecuencia usando PSD/STFT (Vectorizado).
+    Procesa todos los canales simultáneamente para máximo rendimiento.
     """
     log = _mklogger(logger)
     x = np.asarray(datos, dtype=np.float64)
@@ -448,37 +451,32 @@ def calcular_espectrograma_resumen(datos, fs_real, carpeta_salida, sufijo="filtr
     if noverlap >= nperseg:
         noverlap = max(0, nperseg - 1)
 
+    # 1. Llamada vectorizada: Procesamos TODOS los canales a la vez en C indicando axis=1
+    # sxx tendrá forma (n_canales, n_frecuencias, n_tiempos)
+    freqs, times, sxx = spectrogram(
+        x,
+        fs=fs_real,
+        window="hann",
+        nperseg=nperseg,
+        noverlap=noverlap,
+        scaling="density",
+        mode="psd",
+        axis=1 
+    )
 
-    freqs_guardar = None
-    times_guardar = None
+    # Aislar frecuencias de interés (1 a 40 Hz)
+    mask_f = (freqs >= 1.0) & (freqs <= 40.0)
+    freqs_sel = freqs[mask_f]
+    sxx_sel = sxx[:, mask_f, :]
+
+    freqs_guardar = freqs_sel.astype(np.float32, copy=False)
+    times_guardar = times.astype(np.float32, copy=False)
+
     resumen_por_canal = {}
 
-    def _media_banda_db(freqs_eje, sxx_db, fmin, fmax):
-        mask = (freqs_eje >= float(fmin)) & (freqs_eje < float(fmax))
-        if not np.any(mask):
-            return float("nan")
-        return float(np.nanmean(sxx_db[mask, :]))
-
-    for canal in range(n_canales):
-        freqs, times, sxx = spectrogram(
-            x[canal],
-            fs=fs_real,
-            window="hann",
-            nperseg=nperseg,
-            noverlap=noverlap,
-            scaling="density",
-            mode="psd",
-        )
-
-        mask_f = (freqs >= 1.0) & (freqs <= 40.0)
-        freqs_sel = freqs[mask_f]
-        sxx_sel = sxx[mask_f, :]
-
-        if freqs_guardar is None:
-            freqs_guardar = freqs_sel.astype(np.float32, copy=False)
-            times_guardar = times.astype(np.float32, copy=False)
-
-        if freqs_sel.size == 0 or sxx_sel.size == 0:
+    if freqs_sel.size == 0 or sxx_sel.size == 0:
+        # Fallback si no hay datos válidos
+        for canal in range(n_canales):
             resumen_por_canal[f"canal_{canal + 1}"] = {
                 "potencia_media_delta_db": float("nan"),
                 "potencia_media_theta_db": float("nan"),
@@ -487,25 +485,47 @@ def calcular_espectrograma_resumen(datos, fs_real, carpeta_salida, sufijo="filtr
                 "frecuencia_dominante_promedio_hz": float("nan"),
                 "potencia_media_global_db": float("nan"),
             }
-            continue
-
-        # Se usa dB para mejorar el contraste visual del mapa tiempo-frecuencia.
+    else:
+        # 2. Transformación a dB vectorizada para toda la matriz tridimensional
         sxx_db = 10.0 * np.log10(sxx_sel + 1e-12)
 
-        idx_dom = np.argmax(sxx_db, axis=0)
-        frec_dom = float(np.nanmean(freqs_sel[idx_dom])) if idx_dom.size else float("nan")
+        # Crear máscaras por banda
+        m_delta = (freqs_sel >= bandas["Delta"][0]) & (freqs_sel < bandas["Delta"][1])
+        m_theta = (freqs_sel >= bandas["Theta"][0]) & (freqs_sel < bandas["Theta"][1])
+        m_alfa  = (freqs_sel >= bandas["Alfa"][0])  & (freqs_sel < bandas["Alfa"][1])
+        m_beta  = (freqs_sel >= bandas["Beta"][0])  & (freqs_sel < bandas["Beta"][1])
 
-        resumen_por_canal[f"canal_{canal + 1}"] = {
-            "potencia_media_delta_db": _media_banda_db(freqs_sel, sxx_db, *bandas["Delta"]),
-            "potencia_media_theta_db": _media_banda_db(freqs_sel, sxx_db, *bandas["Theta"]),
-            "potencia_media_alfa_db": _media_banda_db(freqs_sel, sxx_db, *bandas["Alfa"]),
-            "potencia_media_beta_db": _media_banda_db(freqs_sel, sxx_db, *bandas["Beta"]),
-            "frecuencia_dominante_promedio_hz": frec_dom,
-            "potencia_media_global_db": float(np.nanmean(sxx_db)),
-        }
+        # Promediar en los ejes de Frecuencia (axis=1) y Tiempo (axis=2) a la vez
+        def media_banda(mask):
+            if not np.any(mask):
+                return np.full(n_canales, float("nan"))
+            return np.nanmean(sxx_db[:, mask, :], axis=(1, 2))
+
+        # Arrays 1D con los promedios listos (tamaño = n_canales)
+        mean_delta = media_banda(m_delta)
+        mean_theta = media_banda(m_theta)
+        mean_alfa  = media_banda(m_alfa)
+        mean_beta  = media_banda(m_beta)
+        mean_global = np.nanmean(sxx_db, axis=(1, 2))
+
+        # Frecuencia dominante: Buscamos el índice max en frecuencias (axis=1)
+        idx_dom = np.argmax(sxx_db, axis=1) # Forma (n_canales, n_times)
+        # Mapeamos a la frecuencia real y promediamos sobre el tiempo (axis=1 del nuevo array)
+        frec_dom = np.nanmean(freqs_sel[idx_dom], axis=1)
+
+        # Asignar resultados
+        for canal in range(n_canales):
+            resumen_por_canal[f"canal_{canal + 1}"] = {
+                "potencia_media_delta_db": float(mean_delta[canal]),
+                "potencia_media_theta_db": float(mean_theta[canal]),
+                "potencia_media_alfa_db": float(mean_alfa[canal]),
+                "potencia_media_beta_db": float(mean_beta[canal]),
+                "frecuencia_dominante_promedio_hz": float(frec_dom[canal]),
+                "potencia_media_global_db": float(mean_global[canal]),
+            }
 
     resumen = {
-        "metodo": "STFT/spectrogram",
+        "metodo": "STFT/spectrogram (Vectorizado)",
         "escala": "dB",
         "unidad_color": "Potencia espectral (dB)",
         "nperseg": int(nperseg),
@@ -534,11 +554,11 @@ def calcular_espectrograma_resumen(datos, fs_real, carpeta_salida, sufijo="filtr
 # DETECTOR DE CANALES
 # =========================
 def _robust_z(x):
-    x = np.asarray(x, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float32)
     med = np.median(x)
     mad = np.median(np.abs(x - med))
     if mad < 1e-12:
-        return np.zeros_like(x, dtype=np.float64)
+        return np.zeros_like(x, dtype=np.float32)
     return 0.6745 * (x - med) / mad
 
 
@@ -551,7 +571,7 @@ def detectar_canales_atipicos(datos, fs):
       - alfa dominante exagerada
       - espectro distinto al resto
     """
-    x = np.asarray(datos, dtype=np.float64)
+    x = np.asarray(datos, dtype=np.float32)
     n_canales, n_muestras = x.shape
 
     # =========================
@@ -1364,7 +1384,7 @@ def calcular_psd_welch_por_canal(datos, fs_real, logger=None):
     Calcula PSD por canal con Welch sobre una señal limpia (canales x muestras).
     """
     log = _mklogger(logger)
-    x = np.asarray(datos, dtype=np.float64)
+    x = np.asarray(datos, dtype=np.float32)
 
     if x.ndim != 2:
         raise ValueError("datos debe tener forma (canales, muestras)")
@@ -1398,8 +1418,8 @@ def calcular_psd_welch_por_canal(datos, fs_real, logger=None):
 
 
 def _integrar_psd_por_banda(freqs, psd, fmin, fmax):
-    freqs = np.asarray(freqs, dtype=np.float64)
-    psd = np.asarray(psd, dtype=np.float64)
+    freqs = np.asarray(freqs, dtype=np.float32)
+    psd = np.asarray(psd, dtype=np.float32)
     mask = (freqs >= float(fmin)) & (freqs < float(fmax))
 
     if np.count_nonzero(mask) >= 2:
@@ -1408,7 +1428,7 @@ def _integrar_psd_por_banda(freqs, psd, fmin, fmax):
     if np.count_nonzero(mask) == 1:
         return psd[:, mask][:, 0] * max(float(fmax) - float(fmin), 0.0)
 
-    return np.zeros(psd.shape[0], dtype=np.float64)
+    return np.zeros(psd.shape[0], dtype=np.float32)
 
 
 def calcular_potencia_relativa_welch(

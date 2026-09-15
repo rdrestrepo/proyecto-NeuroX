@@ -8104,7 +8104,7 @@ class AppEEG:
             if modo != self.var_modo.get():
                 self.var_modo.set(modo)
 
-            if modo in ("FFT filtrada", "Espectrograma"):
+            if modo in ("FFT filtrada",):
                 return
 
             if event.inaxes is None:
@@ -8757,14 +8757,22 @@ class AppEEG:
             return
 
         fs = self._leer_fs_desde_meta_cache(fs_defecto=500.0)
-        x = np.asarray(datos[idx], dtype=np.float64)
+        
+        x = np.asarray(datos[idx], dtype=np.float32)
         if x.size < 2:
             messagebox.showwarning("Espectrograma", "No hay muestras suficientes para calcular el espectrograma.")
             return
 
-        ventana_seg = 2.0
-        solapamiento = 0.50
-        solapamiento_pct = 50.0
+        try:
+            ventana_seg = float(self.var_ventana_espectrograma.get())
+        except Exception:
+            ventana_seg = 2.0
+            
+        try:
+            solapamiento_pct = float(self.var_solapamiento_espectrograma.get())
+            solapamiento = solapamiento_pct / 100.0
+        except Exception:
+            solapamiento = 0.50
 
         try:
             fmax = float(self.var_fmax.get())
@@ -8782,7 +8790,7 @@ class AppEEG:
         if noverlap >= nperseg:
             noverlap = max(0, nperseg - 1)
 
-        self.log(f"Espectrograma por canal: {nombre_canal} | ventana=2 s | solapamiento=50 % | escala=dB")
+        self.log(f"Espectrograma por canal: {nombre_canal} | ventana={ventana_seg} s | solapamiento={solapamiento_pct} % | escala=dB")
 
         f, t, sxx = spectrogram(
             x,
@@ -8795,8 +8803,8 @@ class AppEEG:
         )
 
         mask = (f >= 1.0) & (f <= fmax)
-        f = np.asarray(f[mask], dtype=np.float64)
-        sxx = np.asarray(sxx[mask, :], dtype=np.float64)
+        f = np.asarray(f[mask], dtype=np.float32)
+        sxx = np.asarray(sxx[mask, :], dtype=np.float32)
 
         if f.size == 0 or sxx.size == 0:
             messagebox.showwarning("Espectrograma", "No hay contenido espectral en el rango seleccionado.")
@@ -8816,10 +8824,7 @@ class AppEEG:
         )
         ax = self.fig.add_subplot(gs[0, 0])
 
-        # No usar sharey=ax, porque al ocultar ticks en ax_bandas
-        # también se pueden ocultar los ticks del eje principal.
         ax_bandas = self.fig.add_subplot(gs[0, 1])
-
         cax = self.fig.add_subplot(gs[0, 2])
 
         mesh = ax.pcolormesh(t, f, sxx_db, shading="auto", cmap="viridis")
@@ -8832,7 +8837,7 @@ class AppEEG:
         colorbar.set_label("Potencia espectral (dB)")
         colorbar.outline.set_linewidth(0.6)
 
-        ax.set_title(f"Espectrograma EEG - Canal {nombre_canal}")
+        ax.set_title(f"Espectrograma EEG - Canal {nombre_canal} (Señal Completa)")
         ax.set_xlabel("Tiempo (s)")
         ax.set_ylabel("Frecuencia (Hz)")
         ax.set_ylim(1.0, fmax)
