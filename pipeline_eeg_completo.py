@@ -114,6 +114,18 @@ AUTO_PICOS_FACTOR_LOCAL_CANAL = 3.0
 AUTO_PICOS_FACTOR_DELTA_CANAL = 1.0
 AUTO_PICOS_MIN_PROMINENCIA_CANAL = 3.0
 
+# --- Armónicos de picos técnicos (Fase 2: revisión de filtros armónicos) ---
+# Un pico técnico angosto (p. ej. un artefacto de electrodo o interferencia
+# puntual) casi nunca aparece solo: suele repetirse en múltiplos exactos de
+# su frecuencia (2x, 3x...). Antes solo se corregía la frecuencia fundamental
+# detectada; si su 2do o 3er armónico también caía dentro del rango de
+# interés (4-35 Hz) y contaminaba una banda EEG real (p. ej. un artefacto a
+# 9 Hz con 2do armónico en 18 Hz, dentro de Beta), quedaba sin corregir.
+AUTO_PICOS_DETECTAR_ARMONICOS = True
+AUTO_PICOS_ORDEN_ARMONICOS_MAX = 3       # revisa 2x y 3x la frecuencia fundamental
+AUTO_PICOS_FACTOR_LOCAL_ARMONICO = 1.8   # umbral mas permisivo que el de la fundamental
+                                          # (los armonicos suelen tener menor amplitud)
+
 # CONFIGURACION WAVELET
 WAVELET_NAME = "db4"
 WAVELET_NIVEL = 4
@@ -320,8 +332,36 @@ def cargar_datos_eeg(ruta_dat, fs_fijo=None, n_canales_eeg=64, logger=None):
     unidad = meta_dap["data_unit"]
     samp_order = meta_dap["samp_order"]
 
+    # --- Validaciones tempranas, ANTES de tocar el archivo con memmap ---
+    # np.memmap() falla con un mensaje críptico de bajo nivel ("memory
+    # mapped length must be positive") si los metadatos del .dap están
+    # corruptos/incompletos, o con errores de forma confusos si el .dat
+    # está truncado. Se valida aquí primero para dar un mensaje claro.
+    if n_canales_total <= 0 or n_muestras <= 0:
+        raise ValueError(
+            f"Metadatos inválidos en '{os.path.basename(ruta_dap)}': "
+            f"NumChannels={n_canales_total}, NumSamples={n_muestras}. "
+            "El archivo .dap parece estar corrupto o incompleto."
+        )
+
+    if n_canales_eeg > n_canales_total:
+        raise ValueError(
+            f"Se pidieron {n_canales_eeg} canales EEG, "
+            f"pero el archivo solo tiene {n_canales_total}"
+        )
+
     esperados = n_canales_total * n_muestras
-    
+    tam_esperado_bytes = int(esperados * np.dtype(dtype).itemsize)
+    tam_real_bytes = os.path.getsize(ruta_dat) if os.path.exists(ruta_dat) else 0
+
+    if tam_real_bytes < tam_esperado_bytes:
+        raise ValueError(
+            f"El archivo '{os.path.basename(ruta_dat)}' está incompleto o corrupto: "
+            f"según '{os.path.basename(ruta_dap)}' debería pesar {tam_esperado_bytes} bytes "
+            f"({n_canales_total} canales x {n_muestras} muestras), "
+            f"pero en disco solo tiene {tam_real_bytes} bytes."
+        )
+
     # 1. OPTIMIZACIÓN: np.memmap mapea el archivo en lugar de cargarlo todo en RAM
     datos_memmap = np.memmap(ruta_dat, dtype=dtype, mode='r', shape=(esperados,))
 
@@ -330,12 +370,6 @@ def cargar_datos_eeg(ruta_dat, fs_fijo=None, n_canales_eeg=64, logger=None):
         datos_vista = datos_memmap.reshape((n_muestras, n_canales_total)).T
     else:
         datos_vista = datos_memmap.reshape((n_canales_total, n_muestras))
-
-    if n_canales_eeg > n_canales_total:
-        raise ValueError(
-            f"Se pidieron {n_canales_eeg} canales EEG, "
-            f"pero el archivo solo tiene {n_canales_total}"
-        )
 
     # 3. Al hacer el recorte y pasarlo a np.asarray con float32,
     # AQUÍ es cuando realmente pasa a la RAM, pero SOLO los canales útiles.
@@ -1146,6 +1180,57 @@ def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
             "criterio_usado": str(detalle["criterio_usado"]),
         })
 
+    # --- Búsqueda de armónicos (2x, 3x) de cada pico fundamental detectado ---
+    if AUTO_PICOS_DETECTAR_ARMONICOS and detalles_finales:
+        frecuencias_ya_incluidas = {round(d["frecuencia_hz"], 2) for d in detalles_finales}
+        limite_busqueda_hz = min(float(AUTO_PICOS_RANGO_BUSQUEDA[1]), float(fs_real) / 2.0)
+        armonicos_detectados = []
+
+        for base in list(detalles_finales):
+            f0 = float(base["frecuencia_hz"])
+            if f0 <= 0:
+                continue
+            for orden in range(2, int(AUTO_PICOS_ORDEN_ARMONICOS_MAX) + 1):
+                fh = f0 * orden
+                if fh > limite_busqueda_hz:
+                    break
+                if round(fh, 2) in frecuencias_ya_incluidas:
+                    continue
+                if _frecuencia_cercana(fh, AUTO_PICOS_EXCLUIR_FRECUENCIAS, tolerancia_hz=AUTO_PICOS_EXCLUSION_CENTRAL_HZ):
+                    continue
+
+                idx_fh = int(np.argmin(np.abs(freqs - fh)))
+                mask_local_h = _mask_entorno_local(freqs, float(freqs[idx_fh]))
+                if not np.any(mask_local_h):
+                    continue
+
+                mediana_local_h = max(float(np.nanmedian(amp_global[mask_local_h])), 1e-12)
+                if amp_global[idx_fh] <= (float(AUTO_PICOS_FACTOR_LOCAL_ARMONICO) * mediana_local_h):
+                    continue
+
+                freq_armonico = float(freqs[idx_fh])
+                mask_canal_h = amp[:, idx_fh] > (float(AUTO_PICOS_FACTOR_LOCAL_ARMONICO) * np.maximum(
+                    np.nanmedian(amp[:, mask_local_h], axis=1), 1e-12
+                ))
+                pct_canales_h = float(np.mean(mask_canal_h)) * 100.0 if n_canales else 0.0
+
+                armonicos_detectados.append({
+                    "frecuencia_hz": freq_armonico,
+                    "proporcion_canales_local": pct_canales_h / 100.0,
+                    "porcentaje_canales_local": pct_canales_h,
+                    "proporcion_canales_delta": 0.0,
+                    "porcentaje_canales_delta": 0.0,
+                    "criterio_usado": f"armonico_{orden}x_de_{f0:.2f}Hz",
+                })
+                frecuencias_ya_incluidas.add(round(freq_armonico, 2))
+                log(
+                    f"[OK] Armónico técnico detectado: {freq_armonico:.2f} Hz "
+                    f"({orden}x de {f0:.2f} Hz) | canales afectados: {pct_canales_h:.1f} %."
+                )
+
+        if armonicos_detectados:
+            detalles_finales.extend(armonicos_detectados)
+
     resultado["frecuencias_aplicar"] = [float(item["frecuencia_hz"]) for item in detalles_finales]
     resultado["detalles"] = detalles_finales
     return resultado
@@ -1153,9 +1238,7 @@ def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
 
 def _procesar_ventana_ica(ventana):
     """Procesa una única ventana de ICA (función auxiliar para paralelismo)"""
-    import warnings
     from sklearn.decomposition import FastICA
-    from sklearn.exceptions import ConvergenceWarning
 
     ica = FastICA(
         n_components=min(64, ventana.shape[0]),
@@ -1165,16 +1248,23 @@ def _procesar_ventana_ica(ventana):
         whiten="unit-variance"
     )
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=ConvergenceWarning)
-            componentes = ica.fit_transform(ventana.T)
-            return ica.inverse_transform(componentes).T
+        # OJO: el filtro de ConvergenceWarning se activa UNA sola vez, en el
+        # hilo principal, antes de lanzar el ThreadPoolExecutor (ver
+        # aplicar_ica_por_ventanas). warnings.catch_warnings() no es seguro
+        # entre hilos -- si cada tarea paralela abre/cierra su propio
+        # contexto, se pisan entre sí y el filtro deja de aplicar de forma
+        # confiable (por eso el aviso seguía apareciendo en consola pese a
+        # estar "silenciado" aquí adentro).
+        componentes = ica.fit_transform(ventana.T)
+        return ica.inverse_transform(componentes).T
     except Exception as e:
         print(f"Error en ventana ICA: {e}")
         return ventana
 
 def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
+    import warnings
     from concurrent.futures import ThreadPoolExecutor
+    from sklearn.exceptions import ConvergenceWarning
 
     muestras_ventana = int(fs_real * ventana_seg)
     n_ventanas = datos.shape[1] // muestras_ventana
@@ -1188,9 +1278,14 @@ def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
     # por defecto puede llegar a min(32, cpu_count+4) hilos, muchos más que
     # núcleos físicos disponibles, lo que genera cambios de contexto
     # excesivos en vez de acelerar (ver nota de BLAS al inicio del archivo).
+    #
+    # El filtro de ConvergenceWarning se activa aquí, UNA sola vez para todo
+    # el lote de ventanas paralelas (ver nota de thread-safety arriba).
     max_hilos_ica = max(1, min(len(ventanas), os.cpu_count() or 4))
-    with ThreadPoolExecutor(max_workers=max_hilos_ica) as executor:
-        resultados = list(executor.map(_procesar_ventana_ica, ventanas))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=ConvergenceWarning)
+        with ThreadPoolExecutor(max_workers=max_hilos_ica) as executor:
+            resultados = list(executor.map(_procesar_ventana_ica, ventanas))
 
     # 3. Ensamblamos los resultados manteniendo el orden cronológico
     for i, reconstruido in enumerate(resultados):
@@ -2465,6 +2560,96 @@ def _valores_canales_para_topomap(valores, nombres_canales):
     }
 
 
+def crear_espectrograma_promedio_informe(datos, fs_real, ruta_salida, bandas_def=None):
+    """
+    Genera un espectrograma promedio (tiempo x frecuencia, dB) para el
+    informe PDF. Antes, calcular_espectrograma_resumen() ya calculaba toda
+    esta información (potencia por banda/canal a lo largo del tiempo) pero
+    solo se guardaba como resumen numérico en JSON; nunca se visualizaba en
+    el informe. Ahora se promedia el espectrograma a través de los canales
+    y se dibuja como un mapa de calor, para que se puedan detectar de un
+    vistazo transiciones o artefactos localizados en el tiempo (movimiento,
+    somnolencia, ruido muscular puntual) que un resumen numérico global no
+    muestra.
+
+    Devuelve True si logró generar la imagen, False si no hubo datos
+    suficientes.
+    """
+    if bandas_def is None:
+        bandas_def = bandas
+
+    x = np.asarray(datos, dtype=np.float64)
+    if x.ndim != 2 or x.shape[0] == 0 or x.shape[1] < 4:
+        return False
+
+    fs_real = float(fs_real)
+    if fs_real <= 0:
+        return False
+
+    n_canales, n_muestras = x.shape
+    nperseg = int(max(2, round(2 * fs_real)))
+    noverlap = int(max(0, round(1 * fs_real)))
+    if nperseg > n_muestras:
+        nperseg = n_muestras
+    if noverlap >= nperseg:
+        noverlap = max(0, nperseg - 1)
+
+    # Llamada vectorizada: todos los canales a la vez (mismo enfoque que
+    # calcular_espectrograma_resumen). sxx queda con forma
+    # (n_canales, n_frecuencias, n_tiempos).
+    freqs, times, sxx = spectrogram(
+        x,
+        fs=fs_real,
+        window="hann",
+        nperseg=nperseg,
+        noverlap=noverlap,
+        scaling="density",
+        mode="psd",
+        axis=1,
+    )
+
+    mask_f = (freqs >= 1.0) & (freqs <= 40.0)
+    freqs_sel = freqs[mask_f]
+    if freqs_sel.size == 0:
+        return False
+
+    sxx_db = 10.0 * np.log10(sxx[:, mask_f, :] + 1e-12)
+    promedio_db = np.nanmean(sxx_db, axis=0)  # promedio entre canales -> (n_frecuencias, n_tiempos)
+
+    fig, ax = plt.subplots(figsize=(9.6, 4.2), dpi=190)
+    try:
+        malla = ax.pcolormesh(times, freqs_sel, promedio_db, shading="gouraud", cmap="turbo")
+        ax.set_xlabel("Tiempo (s)")
+        ax.set_ylabel("Frecuencia (Hz)")
+        ax.set_title("Espectrograma promedio (todos los canales)")
+
+        for nombre_banda, (low, high) in bandas_def.items():
+            ax.axhline(low, color="white", linewidth=0.5, alpha=0.35, linestyle="--")
+            ax.annotate(
+                nombre_banda,
+                xy=(1.0, (low + high) / 2.0),
+                xycoords=("axes fraction", "data"),
+                xytext=(4, 0),
+                textcoords="offset points",
+                fontsize=7.5,
+                color="#1F2937",
+                va="center",
+                ha="left",
+                annotation_clip=False,
+            )
+        ax.axhline(list(bandas_def.values())[-1][1], color="white", linewidth=0.5, alpha=0.35, linestyle="--")
+
+        cbar = fig.colorbar(malla, ax=ax, pad=0.14)
+        cbar.set_label("Potencia (dB)", fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+
+        fig.tight_layout()
+        fig.savefig(ruta_salida, dpi=190, bbox_inches="tight", pad_inches=0.05)
+        return True
+    finally:
+        plt.close(fig)
+
+
 def crear_mapa_calidad_1010(resumen_calidad, nombres_canales, ruta_salida):
     if not isinstance(resumen_calidad, dict):
         return False
@@ -3345,6 +3530,31 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
         except Exception:
             pass
 
+    # --- Espectrograma promedio (Fase 2: mejora de espectrograma) ---
+    # Se recarga la señal final (post-wavelet) de forma independiente del
+    # bloque de energía relativa de más arriba, para que este gráfico no
+    # dependa de que ese otro paso haya tenido éxito.
+    ruta_espectrograma_informe = os.path.join(carpeta_graficos, "espectrograma_promedio.png")
+    ok_espectrograma = False
+    try:
+        ruta_wavelet_final = os.path.join(carpeta_archivo_cache, "wavelet", "eeg_wavelet.npy")
+        if os.path.exists(ruta_wavelet_final):
+            datos_para_espectrograma = np.load(ruta_wavelet_final, mmap_mode="r")
+            ok_espectrograma = crear_espectrograma_promedio_informe(
+                datos_para_espectrograma,
+                fs_meta,
+                ruta_espectrograma_informe,
+                bandas_def=bandas,
+            )
+            del datos_para_espectrograma
+    except Exception as e:
+        log(f"No pude generar espectrograma_promedio.png: {e}")
+    if (not ok_espectrograma) and os.path.exists(ruta_espectrograma_informe):
+        try:
+            os.remove(ruta_espectrograma_informe)
+        except Exception:
+            pass
+
     ruta_topomaps_ratios = os.path.join(carpeta_graficos, "topomaps_ratios_welch.png")
     ok_topomaps_ratios = False
     if ratios_welch:
@@ -3540,6 +3750,27 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
 
     pdf.add_section_title("Descripción individual de las bandas")
     pdf.add_wrapped_text(_descripcion_individual_bandas_informe(resumen_welch), font_size=10.2)
+
+    pdf.add_section_title("Espectrograma (evolución temporal)")
+    pdf.add_wrapped_text(
+        "El espectrograma muestra cómo se distribuye la potencia espectral a lo largo del tiempo "
+        "(no solo su promedio global), permitiendo identificar visualmente cambios o eventos puntuales "
+        "durante el registro. El siguiente mapa se calcula sobre la señal final ya limpia, promediando "
+        "todos los canales, con las bandas de referencia marcadas en el eje de frecuencia.",
+        font_size=10.2,
+    )
+    if ok_espectrograma and os.path.exists(ruta_espectrograma_informe):
+        pdf.add_centered_image(
+            ruta_espectrograma_informe,
+            width_mm=165,
+            caption="Figura. Espectrograma promedio (todos los canales), 1-40 Hz.",
+            needed_height_mm=95,
+        )
+    else:
+        pdf.add_wrapped_text(
+            "No se encontró información suficiente para generar el espectrograma de este registro.",
+            font_size=10.0,
+        )
 
     pdf.add_section_title("Proporciones de bandas e índice de lentificación")
     pdf.add_wrapped_text(
