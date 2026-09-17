@@ -587,6 +587,90 @@ def calcular_espectrograma_resumen(datos, fs_real, carpeta_salida, sufijo="filtr
 # =========================
 # DETECTOR DE CANALES
 # =========================
+def interpolar_canales_malos(datos, idx_malos, nombres_canales):
+    """
+    Reconstruye canales ruidosos interpolando espacialmente sus vecinos sanos
+    usando Ponderación por Distancia Inversa (IDW).
+    """
+    idx_malos = set(idx_malos)
+    idx_buenos = [i for i in range(len(nombres_canales)) if i not in idx_malos]
+
+    # Si no hay canales malos, todos son malos, no hacemos nada
+    if not idx_malos or not idx_buenos:
+        return datos
+
+    # Trabajamos sobre una copia para no alterar la señal original por accidente
+    datos_int = datos.copy()
+    
+    # Obtenemos las coordenadas 2D que ya se usan para los mapas topográficos
+    xs, ys, _, indices = _posiciones_topograficas_por_canal(nombres_canales)
+    coords = {idx: (x, y) for x, y, idx in zip(xs, ys, indices)}
+
+    for mal_idx in idx_malos:
+        # Si el canal no tiene coordenadas (ej. ECG o periféricos), usamos la mediana
+        if mal_idx not in coords:
+            datos_int[mal_idx, :] = np.median(datos[idx_buenos, :], axis=0)
+            continue
+
+        x_m, y_m = coords[mal_idx]
+        pesos = []
+        buenos_con_coords = []
+
+        for buen_idx in idx_buenos:
+            if buen_idx in coords:
+                x_b, y_b = coords[buen_idx]
+                # Calculamos la distancia euclidiana
+                dist = np.sqrt((x_m - x_b)**2 + (y_m - y_b)**2)
+                # Ponderación por distancia inversa al cuadrado (mayor peso si está más cerca)
+                peso = 1.0 / (max(dist, 1e-6) ** 2) 
+                pesos.append(peso)
+                buenos_con_coords.append(buen_idx)
+
+        if not buenos_con_coords:
+            continue
+
+        # Normalizamos los pesos para que sumen 1 (así no alteramos la escala µV)
+        pesos = np.array(pesos)
+        pesos /= np.sum(pesos)
+
+        # Reconstrucción: sumamos las señales de los vecinos multiplicadas por sus pesos
+        datos_int[mal_idx, :] = np.dot(pesos, datos[buenos_con_coords, :])
+
+    return datos_int
+
+def aplicar_car_robusto(datos, idx_malos, nombres_canales):
+    """
+    Aplica Referencia Promedio Común (CAR).
+    Solo usa canales sanos y del cuero cabelludo para calcular el ruido común,
+    evitando envenenar la referencia global con artefactos o señales no-EEG.
+    """
+    import re
+    # 1. Definir qué canales no deben influir en el promedio global
+    excluir_nombres = {"M1", "M2", "CB1", "CB2"} # Mastoides y cerebelosos bajos
+    idx_malos_set = set(idx_malos)
+    
+    idx_validos_para_promedio = []
+    
+    for i, nombre in enumerate(nombres_canales):
+        # Limpieza básica para asegurar que coincida con el diccionario (ej: M1-avg -> M1)
+        nombre_limpio = re.sub(r"([._-]?AVG)$", "", str(nombre).strip().upper())
+        
+        # Si NO es un canal roto y NO es mastoide/cerebelo, sirve para el promedio
+        if i not in idx_malos_set and nombre_limpio not in excluir_nombres:
+            idx_validos_para_promedio.append(i)
+            
+    # Fallback de seguridad extrema: si la malla está destruida, usamos todos
+    if len(idx_validos_para_promedio) < 10:
+        idx_validos_para_promedio = list(range(datos.shape[0]))
+        
+    # 2. Calcular el ruido ambiente (la estática) SOLO con los sanos
+    ruido_comun = np.mean(datos[idx_validos_para_promedio, :], axis=0)
+    
+    # 3. Restar ese ruido a TODOS los canales de la matriz (limpia toda la señal)
+    datos_car = datos - ruido_comun
+    
+    return datos_car
+
 def _robust_z(x):
     x = np.asarray(x, dtype=np.float32)
     med = np.median(x)
@@ -969,76 +1053,6 @@ def _detectar_candidatos_fft_1d(amp_1d, freqs, mask_busqueda, prominence_min):
     prominencias = np.asarray(props.get("prominences", np.zeros(peaks_rel.size)), dtype=np.float64)
     return idx_busqueda[peaks_rel], prominencias
 
-
-def atenuar_senoidal_exacta_canales(
-    datos,
-    fs_real,
-    freq,
-    canales_idx=None,
-    factor=AUTO_PICOS_FACTOR_ATENUACION,
-    logger=None
-):
-    log = _mklogger(logger)
-    salida = np.asarray(datos, dtype=np.float64).copy()
-
-    factor = max(0.0, min(1.0, float(factor)))
-    if factor <= 0.0:
-        return salida
-
-    try:
-        freq = float(freq)
-    except Exception:
-        return salida
-
-    if freq <= 0.0 or freq >= (float(fs_real) / 2.0):
-        log(f"[Aviso] Atenuacion omitida: {freq:.1f} Hz fuera del rango valido.")
-        return salida
-
-    if salida.ndim != 2 or salida.shape[0] == 0 or salida.shape[1] < 2:
-        return salida
-
-    if canales_idx is None:
-        idx_validos = np.arange(salida.shape[0], dtype=int)
-    else:
-        idx_validos = sorted({
-            int(i)
-            for i in canales_idx
-            if isinstance(i, (int, np.integer)) and 0 <= int(i) < salida.shape[0]
-        })
-        idx_validos = np.asarray(idx_validos, dtype=int)
-
-    if idx_validos.size == 0:
-        return salida
-
-    n_muestras = salida.shape[1]
-    t = np.arange(n_muestras, dtype=np.float64) / float(fs_real)
-    B = np.column_stack([
-        np.sin(2.0 * np.pi * float(freq) * t),
-        np.cos(2.0 * np.pi * float(freq) * t),
-    ])
-
-    try:
-        coef, *_ = np.linalg.lstsq(B, salida[idx_validos].T, rcond=None)
-    except Exception:
-        return salida
-
-    componente = (B @ coef).T
-    salida[idx_validos] = salida[idx_validos] - factor * componente
-    log(f"[OK] Atenuacion sinusoidal exacta aplicada: {freq:.2f} Hz | factor={factor:.2f}.")
-    return salida.astype(np.float64, copy=False)
-
-
-def atenuar_senoidal_exacta(datos, fs_real, freq, factor=AUTO_PICOS_FACTOR_ATENUACION, logger=None):
-    return atenuar_senoidal_exacta_canales(
-        datos,
-        fs_real,
-        freq,
-        canales_idx=None,
-        factor=factor,
-        logger=logger
-    )
-
-
 def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
     log = _mklogger(logger)
     resultado = {
@@ -1237,26 +1251,36 @@ def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
 
 
 def _procesar_ventana_ica(ventana):
-    """Procesa una única ventana de ICA (función auxiliar para paralelismo)"""
+    """Procesa una única ventana de ICA con protección contra colapso de rango."""
+    import warnings
     from sklearn.decomposition import FastICA
-
+    
+    # SOLUCIÓN: Calcular el rango real de la matriz en lugar de forzar 64.
+    # Esto evita que el algoritmo colapse la señal a 1e-12.
+    rango_real = np.linalg.matrix_rank(ventana)
+    n_comp = min(rango_real, ventana.shape[0])
+    
     ica = FastICA(
-        n_components=min(64, ventana.shape[0]),
+        n_components=n_comp,
         random_state=42,
         max_iter=ICA_MAX_ITER,
         tol=ICA_TOL,
-        whiten="unit-variance"
+        whiten="arbitrary-variance" # Esencial cuando el rango disminuye
     )
+    
     try:
-        # OJO: el filtro de ConvergenceWarning se activa UNA sola vez, en el
-        # hilo principal, antes de lanzar el ThreadPoolExecutor (ver
-        # aplicar_ica_por_ventanas). warnings.catch_warnings() no es seguro
-        # entre hilos -- si cada tarea paralela abre/cierra su propio
-        # contexto, se pisan entre sí y el filtro deja de aplicar de forma
-        # confiable (por eso el aviso seguía apareciendo en consola pese a
-        # estar "silenciado" aquí adentro).
-        componentes = ica.fit_transform(ventana.T)
-        return ica.inverse_transform(componentes).T
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            componentes = ica.fit_transform(ventana.T)
+                
+        reconstruido = ica.inverse_transform(componentes).T
+        
+        # Filtro de seguridad: si ICA falla, devolvemos la señal intacta en lugar de ceros
+        if np.any(np.isnan(reconstruido)):
+            return ventana
+            
+        return reconstruido
+        
     except Exception as e:
         print(f"Error en ventana ICA: {e}")
         return ventana
@@ -1302,20 +1326,37 @@ def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
 
 def wavelet_denoise_1d(signal_1d, wavelet=WAVELET_NAME, nivel=WAVELET_NIVEL):
     import pywt
-    signal_1d = np.array(signal_1d, dtype=np.float32, copy=True)
-
-    coef = pywt.wavedec(signal_1d, wavelet, level=nivel)
-
-    umbral = 0.5 * np.std(coef[-1]) if len(coef[-1]) > 0 else 0.0
-    coef[1:] = [pywt.threshold(c, umbral, mode="soft") for c in coef[1:]]
-
-    rec = pywt.waverec(coef, wavelet)
-
-    if rec.size > signal_1d.size:
-        rec = rec[:signal_1d.size]
-    elif rec.size < signal_1d.size:
-        rec = np.pad(rec, (0, signal_1d.size - rec.size), mode="edge")
-
+    # Subimos a float64 temporalmente para mayor precisión en la mediana
+    s = np.array(signal_1d, dtype=np.float64, copy=True)
+    
+    # Protección: si el ICA llegara a fallar, devolvemos 0 en lugar de crashear el Wavelet
+    if np.any(np.isnan(s)) or np.all(s == 0):
+        return np.zeros_like(s, dtype=np.float32)
+        
+    coef = pywt.wavedec(s, wavelet, level=nivel)
+    
+    # Tomamos solo el último nivel (D1, el ruido peludo de más alta frecuencia)
+    d1 = coef[-1]
+    med = np.median(d1)
+    mad = np.median(np.abs(d1 - med))
+    
+    if mad > 1e-12:
+        sigma = mad / 0.6745
+        umbral = sigma * np.sqrt(2 * np.log(len(s)))
+        
+        # APLICACIÓN QUIRÚRGICA: Suavizamos los detalles, pero dejamos la 
+        # aproximación basal (coef[0]) INTACTA para no destruir las ondas Delta y Theta.
+        coef_limpios = [coef[0]] + [pywt.threshold(c, umbral, mode="soft") for c in coef[1:]]
+    else:
+        coef_limpios = coef
+        
+    rec = pywt.waverec(coef_limpios, wavelet)
+    
+    if rec.size > s.size:
+        rec = rec[:s.size]
+    elif rec.size < s.size:
+        rec = np.pad(rec, (0, s.size - rec.size), mode="edge")
+        
     return rec.astype(np.float32, copy=False)
 
 
@@ -3929,23 +3970,24 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     )
     log("[OK] Filtro pasa banda aplicado.")
 
+    # Se mantiene en float64 temporalmente para garantizar estabilidad numérica en los filtros IIR
     datos_fn = np.asarray(datos_pb, dtype=np.float64)
     if 60.0 < (float(fs_real) / 2.0):
         datos_fn = filtro_notch(datos_fn, fs_real, 60, Q=30)
-        log("[OK] Filtro notch aplicado: 60 Hz.")
+        log("[OK] Filtro notch de línea aplicado: 60 Hz.")
     else:
-        log("[Aviso] No se aplico notch 60 Hz por frecuencia de muestreo insuficiente.")
+        log("[Aviso] No se aplicó notch 60 Hz por frecuencia de muestreo insuficiente.")
 
     resultado_picos = {
         "frecuencias_aplicar": [],
         "frecuencias_candidatas": [],
         "detalles": [],
         "rango_busqueda_hz": [float(AUTO_PICOS_RANGO_BUSQUEDA[0]), float(AUTO_PICOS_RANGO_BUSQUEDA[1])],
-        "factor_atenuacion": float(AUTO_PICOS_FACTOR_ATENUACION),
         "criterio": "pico estrecho en proporcion suficiente de canales",
         "max_frecuencias": int(AUTO_PICOS_MAX_FRECUENCIAS),
     }
     frecuencias_globales = []
+    
     if AUTO_DETECTAR_PICOS_TECNICOS:
         resultado_picos = detectar_picos_tecnicos_estrechos(
             datos_fn,
@@ -3959,32 +4001,23 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         ]
         if frecuencias_globales:
             for f0 in frecuencias_globales:
-                datos_fn = atenuar_senoidal_exacta(
-                    datos_fn,
-                    fs_real,
-                    freq=float(f0),
-                    factor=AUTO_PICOS_FACTOR_ATENUACION,
-                    logger=silent_logger
-                )
-                log(
-                    f"[OK] Atenuacion sinusoidal exacta global aplicada: "
-                    f"{float(f0):.2f} Hz | factor={AUTO_PICOS_FACTOR_ATENUACION:.2f}."
-                )
+                #Filtros Notch en cascada de fase cero (Q=30)
+                datos_fn = filtro_notch(datos_fn, fs_real, freq=float(f0), Q=30)
+                log(f"[OK] Filtro Notch aplicado para pico técnico: {float(f0):.2f} Hz (Q=30).")
         else:
-            log("[Aviso] No se detectaron picos tecnicos estrechos para atenuacion automatica.")
+            log("[Aviso] No se detectaron picos técnicos estrechos para atenuación automática.")
 
     config_filtrado = {
         "pasa_banda_hz": [float(lowcut), float(highcut)],
         "orden_pasabanda": int(order),
         "notch_base_hz": [60.0],
         "auto_detectar_picos_tecnicos": bool(AUTO_DETECTAR_PICOS_TECNICOS),
-        "tipo_correccion_picos_tecnicos": "atenuacion_sinusoidal_exacta_global",
+        "tipo_correccion_picos_tecnicos": "filtros_notch_cascada",
         "rango_busqueda_picos_hz": [float(AUTO_PICOS_RANGO_BUSQUEDA[0]), float(AUTO_PICOS_RANGO_BUSQUEDA[1])],
         "frecuencias_candidatas_hz": [float(v) for v in resultado_picos.get("frecuencias_candidatas", [])],
         "frecuencias_globales_atenuadas_hz": [float(v) for v in frecuencias_globales],
         "correccion_por_canal": False,
         "correcciones_por_canal": [],
-        "factor_atenuacion": float(AUTO_PICOS_FACTOR_ATENUACION),
         "max_frecuencias_atenuadas": int(AUTO_PICOS_MAX_FRECUENCIAS),
         "criterio_global": "pico estrecho en proporcion suficiente de canales",
         "criterio_local": f"pico_frecuencia > {AUTO_PICOS_FACTOR_LOCAL:.1f} * mediana_local",
@@ -4003,18 +4036,67 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
             for item in resultado_picos.get("detalles", [])
         ],
         "nota": (
-            "La correccion se aplica globalmente en frecuencias puntuales mediante atenuacion "
-            "sinusoidal exacta. No se usa notch ni correccion individual por canal."
+            "La correccion se aplica globalmente en frecuencias puntuales mediante "
+            "filtros Notch de fase cero (filtfilt) con Q=30. Esto evita artefactos de fase."
         ),
     }
     with open(os.path.join(rutas["filtrado"], "config_filtrado.json"), "w", encoding="utf-8") as f:
         json.dump(config_filtrado, f, ensure_ascii=False, indent=2)
 
+    # =========================
+    # 5) DETECTOR DE CANALES, INTERPOLACIÓN Y CAR
+    # =========================
+    idx_fuertes, idx_sospechosos, detalle_malos = detectar_canales_atipicos(datos_fn, fs_real)
+
+    guardar_reporte_canales_atipicos(
+        rutas["canales_atipicos"],
+        idx_fuertes,
+        idx_sospechosos,
+        detalle_malos,
+        nombre_archivo,
+        logger=silent_logger
+    )
+
+    canales_atipicos_nombres = []
+    if len(idx_fuertes) > 0:
+        canales_atipicos_nombres = [
+            nombres_canales_archivo[i]
+            for i in idx_fuertes
+            if 0 <= int(i) < len(nombres_canales_archivo)
+        ]
+        log(f"[Aviso] Canales atípicos fuertes detectados: {', '.join(canales_atipicos_nombres)}")
+        
+        # --- NUEVO: INTERPOLACIÓN ESPACIAL ---
+        log(f"[Proceso] Interpolando {len(idx_fuertes)} canal(es) atípico(s) desde vecinos sanos...")
+        datos_fn = interpolar_canales_malos(datos_fn, idx_fuertes, nombres_canales_archivo)
+        log("[OK] Canales atípicos reconstruidos espacialmente.")
+    else:
+        log("[OK] No se detectaron canales atípicos fuertes.")
+
+    canales_sospechosos_nombres = []
+    if len(idx_sospechosos) > 0:
+        canales_sospechosos_nombres = [
+            nombres_canales_archivo[i]
+            for i in idx_sospechosos
+            if 0 <= int(i) < len(nombres_canales_archivo)
+        ]
+        log(f"[Aviso] Canales sospechosos detectados: {', '.join(canales_sospechosos_nombres)}")
+    else:
+        log("[OK] No se detectaron canales sospechosos.")
+
+    # --- NUEVO: ESTABILIZACIÓN GLOBAL (CAR ROBUSTO) ---
+    log("[Proceso] Aplicando Referencia Promedio Común (CAR Robusto)...")
+    datos_fn = aplicar_car_robusto(datos_fn, idx_fuertes, nombres_canales_archivo)
+    log("[OK] Señal estabilizada por CAR.")
+
+    # =========================
+    # GUARDADO Y GRÁFICAS POST-CAR
+    # =========================
     np.save(
         os.path.join(rutas["filtrado"], "eeg_filtrado.npy"),
         np.asarray(datos_fn, dtype=np.float32)
     )
-    log("[OK] Señal final filtrada guardada.")
+    log("[OK] Señal final filtrada y referenciada guardada.")
 
     rutas_fft_filtrado = [
         os.path.join(rutas["fft"], "freqs_filtrado.npy"),
@@ -4040,17 +4122,14 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     config_fft = {
         "fft_calculada_desde": "filtrado/eeg_filtrado.npy",
         "senal_final_incluye_atenuacion_picos_tecnicos": bool(frecuencias_globales),
-        "tipo_correccion_picos_tecnicos": "atenuacion_sinusoidal_exacta_global",
+        "tipo_correccion_picos_tecnicos": "filtros_notch_cascada",
         "frecuencias_globales_atenuadas_hz": [float(v) for v in frecuencias_globales],
-        "correccion_por_canal": False,
-        "correcciones_por_canal": [],
-        "factor_atenuacion": float(AUTO_PICOS_FACTOR_ATENUACION),
+        "aplicado_car": True,
         "fecha_calculo": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     with open(os.path.join(rutas["fft"], "config_fft.json"), "w", encoding="utf-8") as f:
         json.dump(config_fft, f, ensure_ascii=False, indent=2)
-    log("[OK] FFT filtrada recalculada desde la señal final.")
-    log("[OK] FFT actualizada en cache.")
+    log("[OK] FFT filtrada calculada sobre la señal referenciada.")
 
     progress(45, "Calculando espectrograma...")
     calcular_espectrograma_resumen(
@@ -4069,51 +4148,6 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
             os.path.join(rutas["bandas_filtrado"], f"{nombre_banda}.npy"),
             datos_b_pre.astype(np.float32, copy=False)
         )
-
-    # =========================
-    # 5) DETECTOR DE CANALES ATÍPICOS
-    # =========================
-    idx_fuertes, idx_sospechosos, detalle_malos = detectar_canales_atipicos(datos_fn, fs_real)
-
-    guardar_reporte_canales_atipicos(
-        rutas["canales_atipicos"],
-        idx_fuertes,
-        idx_sospechosos,
-        detalle_malos,
-        nombre_archivo,
-        logger=silent_logger
-    )
-
-    if len(idx_fuertes) > 0:
-        canales_fuertes_txt = ", ".join(
-            nombres_canales_archivo[i]
-            for i in idx_fuertes
-            if 0 <= int(i) < len(nombres_canales_archivo)
-        )
-        log(f"[Aviso] Canales atipicos fuertes detectados: {canales_fuertes_txt}")
-    else:
-        log("[OK] No se detectaron canales atipicos fuertes.")
-
-    if len(idx_sospechosos) > 0:
-        canales_sosp_txt = ", ".join(
-            nombres_canales_archivo[i]
-            for i in idx_sospechosos
-            if 0 <= int(i) < len(nombres_canales_archivo)
-        )
-        log(f"[Aviso] Canales sospechosos detectados: {canales_sosp_txt}")
-    else:
-        log("[OK] No se detectaron canales sospechosos.")
-
-    canales_atipicos_nombres = [
-        nombres_canales_archivo[i]
-        for i in idx_fuertes
-        if 0 <= int(i) < len(nombres_canales_archivo)
-    ]
-    canales_sospechosos_nombres = [
-        nombres_canales_archivo[i]
-        for i in idx_sospechosos
-        if 0 <= int(i) < len(nombres_canales_archivo)
-    ]
 
     # =========================
     # 6) ICA
