@@ -868,7 +868,7 @@ class AppEEG:
         
         self.frame_fft = ttk.Frame(_visor_body, style="Sidebar.TFrame")
         
-        self.lbl_fmax = ttk.Label(self.frame_fft, text="FFT hasta (Hz):")
+        self.lbl_fmax = ttk.Label(self.frame_fft, text="Límite Espectro (Hz):")
         self.lbl_fmax.pack(anchor="w", pady=(6, 0))
         
         self.spin_fmax = ttk.Spinbox(
@@ -1133,7 +1133,8 @@ class AppEEG:
         self.modos_grafica_tabs = {
             "Multicanal": "Filtrado multicanal",
             "Canal Filtrado": "Canal filtrado",
-            "FFT": "FFT filtrada",
+            "FFT": "FFT final",  # <--- Pestaña restaurada: FFT post-ICA+wavelet (no confundir con "Espectro PSD")
+            "Espectro PSD": "FFT filtrada",  # <--- Clave nueva, valor interno original
             "Bandas": "Bandas",
             "Espectrograma": "Espectrograma",
         }
@@ -1621,6 +1622,10 @@ class AppEEG:
             self._set_barra(
                 f"FFT filtrada mostrada para {nombre}." if nombre else "FFT filtrada mostrada."
             )
+        elif modo == "FFT final":
+            self._set_barra(
+                f"FFT final (post-limpieza) mostrada para {nombre}." if nombre else "FFT final (post-limpieza) mostrada."
+            )
         elif modo == "Bandas":
             self._set_barra(
                 f"Bandas mostradas para {nombre}." if nombre else "Bandas mostradas."
@@ -1905,7 +1910,7 @@ class AppEEG:
             return
 
         modo = self._normalizar_modo_grafica(self.var_modo.get())
-        mostrar = bool(self.cache_ultimo) and modo in ("Canal filtrado", "FFT filtrada", "Bandas", "Espectrograma")
+        mostrar = bool(self.cache_ultimo) and modo in ("Canal filtrado", "FFT filtrada", "FFT final", "Bandas", "Espectrograma")
         self._mostrar_nav_canal(mostrar)
 
         if not mostrar:
@@ -2612,7 +2617,8 @@ class AppEEG:
             "Multicanal": "Filtrado multicanal",
             "multicanal": "Filtrado multicanal",
             "Canal Filtrado": "Canal filtrado",
-            "FFT": "FFT filtrada",
+            "FFT": "FFT filtrada",             # <--- Soporte legado
+            "Espectro PSD": "FFT filtrada",    # <--- La pestaña nueva ejecuta la función correcta
             "Espectrograma": "Espectrograma",
             "espectrograma": "Espectrograma",
         }
@@ -2687,7 +2693,7 @@ class AppEEG:
             return
 
         self.hay_grafico_activo = True
-        if modo not in ("FFT filtrada", "Espectrograma"):
+        if modo not in ("FFT filtrada", "FFT final", "Espectrograma"):
             if self._cid_press is None or self._cid_motion is None or self._cid_release is None:
                 self._activar_pan_tiempo()
         self._redibujar_modo_actual()
@@ -2706,7 +2712,7 @@ class AppEEG:
         self.frame_bandas.pack_forget()
         self.frame_mapa.pack_forget()
 
-        self.lbl_fmax.config(text="FFT hasta (Hz):")
+        self.lbl_fmax.config(text="Límite Espectro (Hz):")
         self.spin_fmax.configure(from_=20.0, to=100.0, increment=5.0)
         self.btn_graficar.config(text="Graficar")
     
@@ -2715,6 +2721,12 @@ class AppEEG:
             self.frame_ventana.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
     
         elif modo == "FFT filtrada":
+            self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
+            self.frame_fft.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
+            self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
+            self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
+
+        elif modo == "FFT final":
             self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
             self.frame_fft.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
             self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
@@ -2807,6 +2819,14 @@ class AppEEG:
                 canal = idx + 1
                 nombre = self.nombres_canales[idx]
                 self._graficar_fft_filtrada(idx, canal, nombre)
+
+            elif modo == "FFT final":
+                idx = self.combo_canal.current()
+                if idx < 0:
+                    idx = 0
+                canal = idx + 1
+                nombre = self.nombres_canales[idx]
+                self._graficar_fft_final(idx, canal, nombre)
     
             elif modo == "Bandas":
                 if self._vista_actual == "bandas" and self._lines_bandas:
@@ -8031,6 +8051,14 @@ class AppEEG:
             nombre = self.nombres_canales[idx]
             self._graficar_fft_filtrada(idx, canal, nombre)
 
+        elif modo == "FFT final":
+            idx = self.combo_canal.current()
+            if idx < 0:
+                idx = 0
+            canal = idx + 1
+            nombre = self.nombres_canales[idx]
+            self._graficar_fft_final(idx, canal, nombre)
+
         elif modo == "Bandas":
             if self._vista_actual == "bandas" and self._lines_bandas:
                 self._actualizar_bandas_multi()
@@ -8104,7 +8132,7 @@ class AppEEG:
             if modo != self.var_modo.get():
                 self.var_modo.set(modo)
 
-            if modo in ("FFT filtrada",):
+            if modo in ("FFT filtrada", "FFT final"):
                 return
 
             if event.inaxes is None:
@@ -8572,8 +8600,8 @@ class AppEEG:
         modo_actual = self._normalizar_modo_grafica(self.var_modo.get())
         self._mostrar_marco_visor_grafica(True)
         self._mostrar_tabs_grafica(True)
-        if modo_actual == "FFT filtrada":
-            self.var_modo.set("FFT filtrada")
+        if modo_actual in ("FFT filtrada", "FFT final"):
+            self.var_modo.set(modo_actual)
         else:
             self.var_modo.set("Filtrado multicanal")
         self._refrescar_ui_modo()
@@ -8589,117 +8617,111 @@ class AppEEG:
         self.raiz.after(80, self.graficar)
        
     def _graficar_fft_filtrada(self, idx, canal, nombre_canal):
+        from matplotlib.patches import Patch
+        
         if not self.cache_ultimo:
             return
 
-        ruta_f = os.path.join(self.cache_ultimo, "fft", "freqs_filtrado.npy")
-        ruta_a = os.path.join(self.cache_ultimo, "fft", "fft_amp_filtrado.npy")
+        ruta_f = os.path.join(self.cache_ultimo, "analisis_welch", "welch_freqs.npy")
+        ruta_a = os.path.join(self.cache_ultimo, "analisis_welch", "welch_psd.npy")
 
         try:
             freqs = np.load(ruta_f, mmap_mode="r")
         except Exception as e:
-            messagebox.showerror("Error", f"No pude cargar la FFT filtrada:\n{e}")
+            messagebox.showerror("Error", f"No pude cargar las frecuencias de Welch:\n{e}")
             return
 
         try:
             amps = np.load(ruta_a, mmap_mode="r")
         except Exception as e:
-            messagebox.showerror("Error", f"No pude cargar la FFT filtrada:\n{e}")
+            messagebox.showerror("Error", f"No pude cargar la PSD de Welch:\n{e}")
             return
 
-        self.log("[OK] FFT cargada desde cache actualizado.")
+        self.log("[OK] Densidad Espectral (Welch) cargada desde cache.")
 
         if idx < 0 or idx >= amps.shape[0]:
-            messagebox.showwarning("Canal", "Índice de canal inválido para FFT.")
+            messagebox.showwarning("Canal", "Índice de canal inválido para espectro.")
             return
 
         try:
             fmax = float(self.var_fmax.get())
         except Exception:
             fmax = 40.0
-        mask = freqs <= fmax
+            
+        # Nos enfocamos en la región clínica útil (0.5 Hz en adelante)
+        mask = (freqs >= 0.5) & (freqs <= fmax)
 
         x = np.asarray(freqs[mask], dtype=np.float64)
         y = np.asarray(amps[idx, mask], dtype=np.float64)
+        
+        # Unidades correctas para PSD (Potencia por Hz)
         unidad_fft = self._leer_unidad_fft_desde_cache()
         if unidad_fft == "µV":
-            ylabel = " (µV)"
+            ylabel = "Densidad Espectral (µV²/Hz)"
         elif unidad_fft:
-            ylabel = f" ({unidad_fft})"
+            ylabel = f"Densidad Espectral ({unidad_fft}²/Hz)"
         else:
-            ylabel = "(u.a.)"
+            ylabel = "Densidad Espectral (u.a.)"
 
         self.fig.clear()
         ax = self.fig.add_subplot(111)
-        bandas_fft = [
-            ("Delta", 1, 3,  "#7EC8E3"),
-            ("Theta", 3, 8,  "#8BC34A"),
-            ("Alfa",  8, 12, "#FFD54F"),
-            ("Beta", 12, 30, "#FF8A65")
-            
+
+        # Límites IFCN y colores clínicos
+        bandas_clinicas = [
+            ("Delta (0.5-4 Hz)", 0.5, 4.0, "#4682B4"),  # Azul acero
+            ("Theta (4-8 Hz)",   4.0, 8.0, "#3CB371"),  # Verde mar
+            ("Alfa (8-13 Hz)",   8.0, 13.0, "#FFD700"), # Dorado
+            ("Beta (13-30 Hz)",  13.0, 30.0, "#CD5C5C") # Coral
         ]
 
-        # fondos por bandas
-        bandas_color = [
-            ("Delta", 1, 3, "#dbeafe"),
-            ("Theta", 3, 8, "#dcfce7"),
-            ("Alfa", 8, 12, "#fef3c7"),
-            ("Beta", 12, 30, "#fee2e2"),
-        ]
+        # 1. Trazar la línea principal de la curva suave
+        ax.plot(x, y, color='#2c3e50', linewidth=1.2)
 
-        for _, f0, f1, col in bandas_color:
+        # 2. Rellenar el área bajo la curva (sombreado por bandas)
+        handles = []
+        for nombre, f0, f1, col in bandas_clinicas:
             if f0 < fmax:
-                ax.axvspan(f0, min(f1, fmax), alpha=0.35, color=col)
+                # Máscara estricta para sombrear solo el ancho de esta banda
+                mask_banda = (x >= f0) & (x < min(f1, fmax))
+                if np.any(mask_banda):
+                    ax.fill_between(x[mask_banda], 0, y[mask_banda], color=col, alpha=0.5)
+                    # Añadir parche de color para la leyenda
+                    handles.append(Patch(facecolor=col, edgecolor="gray", label=nombre, alpha=0.8))
 
-        #fmax = float(self.var_fmax.get())
-        
-        for nombre_banda, f0, f1, color in bandas_fft:
-            if f0 >= fmax:
-                continue
-            ax.axvspan(f0, min(f1, fmax), alpha=0.12, color=color)
-
-        # fft_amp_filtrado.npy ya viene normalizada por N en el pipeline.
-        ax.plot(x, y, linewidth=1.0)
-
-        # FIX VISUAL: Dejamos que el pico Alfa real (ej. 22 µV) defina 
-        # el techo natural de la gráfica, sin recortarla artificialmente.
+        # 3. Ajuste dinámico del techo Y basado en el pico real
+        # 3. Ajuste dinámico del techo Y (Ignorando ruido ocular sub-hertz)
         if len(y) > 0:
-            techo_real = float(np.max(y)) * 1.15
+            # Calculamos el techo Y ignorando las frecuencias < 1.0 Hz. 
+            # En canales frontales (FP1/FP2), el sudor y los movimientos oculares
+            # a 0.5Hz son gigantes y aplastan visualmente la gráfica.
+            mask_escala = (x >= 1.0) & (x <= fmax)
+            
+            if np.any(mask_escala):
+                techo_real = float(np.max(y[mask_escala])) * 1.15
+            else:
+                techo_real = float(np.max(y)) * 1.15
+                
             techo_real = max(techo_real, 1e-6)
             ax.set_ylim(0, techo_real)
 
-        # Leyenda de bandas visibles
-
-        handles = []
-        for nombre_banda, f0, f1, col in bandas_color:
-            if f0 < fmax:
-                etiqueta = f"{nombre_banda} ({f0}-{min(f1, fmax):g} Hz)"
-                handles.append(
-                    Patch(
-                        facecolor=col,
-                        edgecolor="gray",
-                        label=etiqueta,
-                        alpha=0.8
-                    )
-                )
-        
+        # 4. Configurar Leyenda, Ejes y Títulos
         if handles:
             ax.legend(
                 handles=handles,
                 loc="upper right",
-                title="Bandas",
+                title="Bandas Clínicas",
                 fontsize=8,
                 title_fontsize=9,
                 frameon=True
             )
 
-        ax.set_title(f"FFT filtrada - Canal {nombre_canal} (#{canal})")
+        ax.set_title(f"Densidad Espectral (Welch PSD) - Canal {nombre_canal} (#{canal})")
         ax.set_xlabel("Frecuencia (Hz)")
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
 
         if len(x) > 1:
-            ax.set_xlim(0, fmax)
+            ax.set_xlim(0.5, fmax)
         
         self._vista_actual = "fft"
         self._line_canal = None
@@ -8712,7 +8734,127 @@ class AppEEG:
         self.fig.tight_layout()
         self.canvas.draw_idle()
         self._desactivar_hover_multicanal()
-        self._actualizar_barra_modo_grafica("FFT filtrada", nombre_canal)
+        self._actualizar_barra_modo_grafica("Welch PSD", nombre_canal)
+
+    def _graficar_fft_final(self, idx, canal, nombre_canal):
+        """
+        FFT calculada sobre la señal FINAL (post-ICA + wavelet).
+        Muestra la amplitud FFT directa con suavizado visual y escala inteligente.
+        """
+        from matplotlib.patches import Patch
+        from scipy.ndimage import gaussian_filter1d
+
+        if not self.cache_ultimo:
+            return
+
+        ruta_f = os.path.join(self.cache_ultimo, "fft", "freqs_final.npy")
+        ruta_a = os.path.join(self.cache_ultimo, "fft", "fft_amp_final.npy")
+
+        if not os.path.exists(ruta_f) or not os.path.exists(ruta_a):
+            messagebox.showerror(
+                "FFT no disponible",
+                "No se encontró la FFT final en la cache de este archivo.\n"
+                "Vuelve a procesarlo con la versión actual del pipeline."
+            )
+            return
+
+        try:
+            freqs = np.load(ruta_f, mmap_mode="r")
+        except Exception as e:
+            messagebox.showerror("Error", f"No pude cargar las frecuencias de la FFT final:\n{e}")
+            return
+
+        try:
+            amps = np.load(ruta_a, mmap_mode="r")
+        except Exception as e:
+            messagebox.showerror("Error", f"No pude cargar la FFT final:\n{e}")
+            return
+
+        self.log("[OK] FFT final (post-limpieza) cargada desde cache.")
+
+        if idx < 0 or idx >= amps.shape[0]:
+            messagebox.showwarning("Canal", "Índice de canal inválido para FFT.")
+            return
+
+        try:
+            fmax = float(self.var_fmax.get())
+        except Exception:
+            fmax = 40.0
+        mask = freqs <= fmax
+
+        x = np.asarray(freqs[mask], dtype=np.float64)
+        y_cruda = np.asarray(amps[idx, mask], dtype=np.float64)
+
+        # 1. SUAVIZADO VISUAL: Filtro Gaussiano para eliminar la varianza extrema (código de barras)
+        # Mantiene la morfología exacta de los picos reales pero hace la curva legible.
+        y = gaussian_filter1d(y_cruda, sigma=1.8)
+
+        unidad_fft = self._leer_unidad_fft_desde_cache()
+        if unidad_fft == "µV":
+            ylabel = "Amplitud FFT (µV)"
+        elif unidad_fft:
+            ylabel = f"Amplitud FFT ({unidad_fft})"
+        else:
+            ylabel = "Amplitud FFT (u.a.)"
+
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+
+        # 2. LÍMITES IFCN ACTUALIZADOS
+        bandas_fft = [
+            ("Delta (1-4 Hz)", 1.0, 4.0, "#7EC8E3"),
+            ("Theta (4-8 Hz)", 4.0, 8.0, "#8BC34A"),
+            ("Alfa (8-13 Hz)", 8.0, 13.0, "#FFD54F"),
+            ("Beta (13-30 Hz)", 13.0, 30.0, "#FF8A65"),
+        ]
+
+        handles = []
+        for nombre_banda, f0, f1, col in bandas_fft:
+            if f0 >= fmax:
+                continue
+            ax.axvspan(f0, min(f1, fmax), alpha=0.12, color=col)
+            handles.append(Patch(facecolor=col, edgecolor="gray", label=nombre_banda, alpha=0.8))
+
+        # 3. ESCALA INTELIGENTE (Adiós a la caja roja de alerta)
+        # Calculamos el techo basándonos estrictamente en las frecuencias cognitivas (>1.0 Hz).
+        # Esto enmarca las ondas cerebrales a la perfección y permite que la deriva de 0.5Hz
+        # fluya fuera de la pantalla de forma natural.
+        if len(y) > 0:
+            mask_escala = (x >= 1.0) & (x <= fmax)
+            if np.any(mask_escala):
+                techo = float(np.max(y[mask_escala])) * 1.25
+            else:
+                techo = float(np.max(y)) * 1.25
+                
+            techo = max(techo, 1e-6)
+            ax.set_ylim(0, techo)
+
+        # Dibujo de la señal limpia y suavizada
+        ax.plot(x, y, color="#2c3e50", linewidth=1.1)
+
+        if handles:
+            ax.legend(handles=handles, loc="upper right", title="Bandas Clínicas",
+                       fontsize=8, title_fontsize=9, frameon=True)
+
+        ax.set_title(f"FFT final (post-limpieza) - Canal {nombre_canal} (#{canal})")
+        ax.set_xlabel("Frecuencia (Hz)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        if len(x) > 1:
+            ax.set_xlim(0, fmax)
+
+        self._vista_actual = "fft_final"
+        self._line_canal = None
+        self._lines_multicanal = []
+        self._axes_bandas = []
+        self._lines_bandas = []
+
+        self._limpiar_controles_tiempo()
+        self._desactivar_pan_tiempo()
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+        self._desactivar_hover_multicanal()
+        self._actualizar_barra_modo_grafica("FFT final", nombre_canal)
 
     def _graficar_espectrograma(self, idx, canal, nombre_canal):
         if not self.cache_ultimo:
@@ -8914,7 +9056,7 @@ class AppEEG:
             self._loading.show()
             self.raiz.update_idletasks()
 
-        if modo not in ("FFT filtrada", "Espectrograma"):
+        if modo not in ("FFT filtrada", "FFT final", "Espectrograma"):
             if self._cid_press is None or self._cid_motion is None or self._cid_release is None:
                 self._activar_pan_tiempo()
         if modo == "Filtrado multicanal":
@@ -8923,6 +9065,8 @@ class AppEEG:
             self._graficar_canal_filtrado(idx, canal, nombre)
         elif modo == "FFT filtrada":
             self._graficar_fft_filtrada(idx, canal, nombre)
+        elif modo == "FFT final":
+            self._graficar_fft_final(idx, canal, nombre)
         elif modo == "Bandas":
             self._graficar_bandas_multi(idx, canal, nombre)
         elif modo == "Espectrograma":

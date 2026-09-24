@@ -83,19 +83,19 @@ NOMBRES_CANALES_64 = [
 # Fallback solo para el informe si por alguna razón falta meta.txt.
 # En el flujo normal, fs se toma del .dap y luego del meta.txt.
 fs = 500
-
+#Cambios en las bandas de frecuencia para concordar con la literatura de ifcn
 bandas = {
-    "Delta": (1.0, 3.0),
-    "Theta": (3.0, 8.0),
-    "Alfa":  (8.0, 12.0),
-    "Beta":  (12.0, 30.0),
+    "Delta": (1.0, 4.0),
+    "Theta": (4.0, 8.0),
+    "Alfa":  (8.0, 13.0),
+    "Beta":  (13.0, 30.0),
 }
 
 # CONFIGURACION FILTRO
-lowcut = 1
+lowcut = 0.5 #Bajamos de 1.0 de Hz a 0.5 Hz para incluir mejor la banda Delta
 highcut = 40
 order = 4
-AUTO_DETECTAR_PICOS_TECNICOS = True
+AUTO_DETECTAR_PICOS_TECNICOS = False
 AUTO_PICOS_RANGO_BUSQUEDA = (4.0, 35.0)
 AUTO_PICOS_EXCLUIR_FRECUENCIAS = [60.0]
 AUTO_PICOS_FACTOR_ATENUACION = 0.60
@@ -141,7 +141,7 @@ VENTANA_DURACION_S = 5
 
 
 
-RANGO_TOTAL_WELCH = (1, 30)
+RANGO_TOTAL_WELCH = (1.0, 30)
 
 RATIOS_WELCH_PRINCIPALES = {
     "Theta_Alfa": {
@@ -1250,108 +1250,148 @@ def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
     return resultado
 
 
-def _procesar_ventana_ica(ventana):
-    """Procesa una única ventana de ICA con protección contra colapso de rango."""
+def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
+    """
+    Aplica ICA utilizando la libreria MNE y mne-icalabel.
+    Cumple con los requisitos estrictos de ICLabel (Filtro 1-100Hz, CAR, Infomax).
+    """
+    import mne
+    from mne.preprocessing import ICA
     import warnings
-    from sklearn.decomposition import FastICA
-    
-    # SOLUCIÓN: Calcular el rango real de la matriz en lugar de forzar 64.
-    # Esto evita que el algoritmo colapse la señal a 1e-12.
-    rango_real = np.linalg.matrix_rank(ventana)
-    n_comp = min(rango_real, ventana.shape[0])
-    
-    ica = FastICA(
-        n_components=n_comp,
-        random_state=42,
-        max_iter=ICA_MAX_ITER,
-        tol=ICA_TOL,
-        whiten="arbitrary-variance" # Esencial cuando el rango disminuye
-    )
-    
     try:
+        from mne_icalabel import label_components
+        has_icalabel = True
+    except ImportError:
+        has_icalabel = False
+
+    log = logger if logger else print
+
+    # Categorias de ICLabel que se consideran artefacto y umbral minimo
+    # de confianza para excluir un componente. Se excluye todo lo que no
+    # sea 'brain' ni 'other' (practica estandar en la literatura), con un
+    # umbral de 0.70. 
+    CATEGORIAS_ARTEFACTO = {
+        'eye blink', 'eye movement', 'muscle artifact',
+        'heart beat', 'line noise', 'channel noise',
+    }
+    UMBRAL_EXCLUSION = 0.70
+
+    log("[MNE] Inicializando entorno para ICA...")
+    datos_v = np.asarray(datos, dtype=np.float64) * 1e-6
+
+    nombres_mne = []
+    tipos_canales = []
+
+    for c in nombres_canales:
+        c_upper = c.upper()
+        if c_upper.startswith("FP"): c_upper = c_upper.replace("FP", "Fp")
+        if c_upper.endswith("Z"): c_upper = c_upper[:-1] + "z"
+        nombres_mne.append(c_upper)
+
+        if c_upper in ['M1', 'M2', 'CB1', 'CB2']:
+            tipos_canales.append('misc')
+        else:
+            tipos_canales.append('eeg')
+
+    info = mne.create_info(ch_names=nombres_mne, sfreq=fs_real, ch_types=tipos_canales)
+    raw = mne.io.RawArray(datos_v, info, verbose=False)
+
+    # El warning es informativo, no un error; se silencia aqui para no
+    # ensuciar el log en cada archivo procesado.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        montage = mne.channels.make_standard_montage('colin27_1020')
+        raw.set_montage(montage, on_missing='ignore')
+
+    # 1. PRINCIPIO DE WINKLER (Adaptado para ICLabel)
+    # ICLabel requiere un filtro de 1 a 100 Hz para clasificar bien.
+    log("[MNE] Acondicionando copia temporal (Filtro 1-100Hz y CAR) para ICLabel...")
+    raw_fit = raw.copy().filter(l_freq=1.0, h_freq=100.0, fir_design='firwin', verbose=False)
+
+    # ICLabel requiere que la señal tenga CAR. Se aplica SOLO a esta copia de entrenamiento 
+    raw_fit.set_eeg_reference('average', projection=False, verbose=False)
+
+    # 2. Ajuste del ICA
+    # ICLabel fue entrenado especificamente sobre infomax extendido.
+    log("[MNE] Extrayendo componentes independientes (Infomax Extendido)...")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ica = ICA(
+            n_components=0.99, method='infomax',
+            fit_params=dict(extended=True), rng=42, max_iter=500,
+        )
+        ica.fit(raw_fit, verbose=False)
+
+    # 3. Poda multivariada inteligente con ICLabel
+    if has_icalabel:
+        log("[MNE] Evaluando componentes con red neuronal (ICLabel)...")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            componentes = ica.fit_transform(ventana.T)
-                
-        reconstruido = ica.inverse_transform(componentes).T
-        
-        # Filtro de seguridad: si ICA falla, devolvemos la señal intacta en lugar de ceros
-        if np.any(np.isnan(reconstruido)):
-            return ventana
-            
-        return reconstruido
-        
-    except Exception as e:
-        print(f"Error en ventana ICA: {e}")
-        return ventana
+            labels_dict = label_components(raw_fit, ica, method='iclabel')
 
-def aplicar_ica_por_ventanas(datos, fs_real, ventana_seg=10):
-    import warnings
-    from concurrent.futures import ThreadPoolExecutor
-    from sklearn.exceptions import ConvergenceWarning
+        probs = labels_dict['y_pred_proba']
+        labels = labels_dict['labels']
 
-    muestras_ventana = int(fs_real * ventana_seg)
-    n_ventanas = datos.shape[1] // muestras_ventana
-    datos_ica = np.zeros_like(datos)
+        excluir = []
+        for idx, (label, prob) in enumerate(zip(labels, probs)):
+            marcar = label in CATEGORIAS_ARTEFACTO and prob >= UMBRAL_EXCLUSION
+            if marcar:
+                excluir.append(idx)
+            # Log de diagnostico por componente: fundamental para saber
+            # QUE esta decidiendo ICLabel en cada archivo real, en vez de
+            # adivinar por que la contaminacion persiste o desaparece.
+            estado = "EXCLUIDO" if marcar else "conservado"
+            log(f"[MNE][ICLabel] Comp {idx:02d}: {label:<16s} (p={prob:.2f}) -> {estado}")
 
-    # 1. Preparamos las vistas de memoria (sin copiar datos) para cada ventana
-    ventanas = [datos[:, i * muestras_ventana:(i + 1) * muestras_ventana] for i in range(n_ventanas)]
+        ica.exclude = excluir
+        log(f"[MNE] Se neutralizaron {len(excluir)} fuentes de ruido extracerebral "
+            f"de {len(labels)} componentes totales.")
+    else:
+        log("[MNE][ADVERTENCIA] mne-icalabel no esta instalado: no se excluyo "
+            "ningun componente, ICA no esta limpiando nada en este archivo.")
 
-    # 2. Procesamos en paralelo (NumPy libera el GIL internamente).
-    # max_workers acotado a los núcleos reales: sin este límite, el executor
-    # por defecto puede llegar a min(32, cpu_count+4) hilos, muchos más que
-    # núcleos físicos disponibles, lo que genera cambios de contexto
-    # excesivos en vez de acelerar (ver nota de BLAS al inicio del archivo).
-    #
-    # El filtro de ConvergenceWarning se activa aquí, UNA sola vez para todo
-    # el lote de ventanas paralelas (ver nota de thread-safety arriba).
-    max_hilos_ica = max(1, min(len(ventanas), os.cpu_count() or 4))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=ConvergenceWarning)
-        with ThreadPoolExecutor(max_workers=max_hilos_ica) as executor:
-            resultados = list(executor.map(_procesar_ventana_ica, ventanas))
+    # 4. Proyeccion de limpieza
+    # Se proyecta la matriz experta sobre la señal CRUDA original (sin el
+    # filtro 1-100 ni el CAR de entrenamiento) -- el mismo patron oficial
+    # de MNE.
+    log("[MNE] Reconstruyendo señal EEG limpia (proyeccion inversa)...")
+    raw_limpio = raw.copy()
+    ica.apply(raw_limpio, verbose=False)
 
-    # 3. Ensamblamos los resultados manteniendo el orden cronológico
-    for i, reconstruido in enumerate(resultados):
-        inicio = i * muestras_ventana
-        datos_ica[:, inicio:inicio + muestras_ventana] = reconstruido
-
-    # Copiamos el residuo temporal si la señal no es múltiplo exacto de 10s
-    fin_procesado = n_ventanas * muestras_ventana
-    if fin_procesado < datos.shape[1]:
-        datos_ica[:, fin_procesado:] = datos[:, fin_procesado:]
-
-    return datos_ica
+    datos_limpios = raw_limpio.get_data() * 1e6
+    return datos_limpios.astype(np.float32)
 
 
 def wavelet_denoise_1d(signal_1d, wavelet=WAVELET_NAME, nivel=WAVELET_NIVEL):
     import pywt
-    # Subimos a float64 temporalmente para mayor precisión en la mediana
+    # Subimos a float64 temporalmente para mayor precisión matemática
     s = np.array(signal_1d, dtype=np.float64, copy=True)
     
-    # Protección: si el ICA llegara a fallar, devolvemos 0 en lugar de crashear el Wavelet
+    # Protección: si el ICA llegara a fallar y devolver ceros, abortamos el Wavelet
     if np.any(np.isnan(s)) or np.all(s == 0):
         return np.zeros_like(s, dtype=np.float32)
         
     coef = pywt.wavedec(s, wavelet, level=nivel)
     
-    # Tomamos solo el último nivel (D1, el ruido peludo de más alta frecuencia)
+    # El nivel de detalle más fino (coef[-1]) contiene el ruido térmico puro
     d1 = coef[-1]
     med = np.median(d1)
     mad = np.median(np.abs(d1 - med))
     
     if mad > 1e-12:
         sigma = mad / 0.6745
-        umbral = sigma * np.sqrt(2 * np.log(len(s)))
+        m = 2.0  # Multiplicador de sensibilidad para proteger picos clínicos
+        umbral = m * sigma * np.sqrt(2 * np.log(len(s)))
         
-        # APLICACIÓN QUIRÚRGICA: Suavizamos los detalles, pero dejamos la 
-        # aproximación basal (coef[0]) INTACTA para no destruir las ondas Delta y Theta.
+        # Aplicamos soft-thresholding SOLO a los detalles (ruido). 
+        # La aproximación (coef[0], ondas lentas) queda intacta.
         coef_limpios = [coef[0]] + [pywt.threshold(c, umbral, mode="soft") for c in coef[1:]]
     else:
         coef_limpios = coef
         
     rec = pywt.waverec(coef_limpios, wavelet)
     
+    # Reajuste de tamaño por padding del Wavelet
     if rec.size > s.size:
         rec = rec[:s.size]
     elif rec.size < s.size:
@@ -1544,7 +1584,7 @@ def calcular_psd_welch_por_canal(datos, fs_real, logger=None):
         window="hann",
         nperseg=nperseg,
         noverlap=noverlap,
-        detrend="constant",
+        detrend="linear",
         scaling="density",
         axis=1
     )
@@ -3962,8 +4002,16 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # 4) FILTRADO
     # =========================
     progress(20, "Aplicando filtros...")
-    log("[Proceso] Aplicando filtros...")
-    datos_pb = filtrar_banda(datos_eeg, fs_real, lowcut, highcut, order)
+    
+    from scipy.signal import detrend
+    log("[Proceso] Eliminando deriva de línea base (Detrending Lineal)...")
+    # Restamos la recta de regresión a la señal cruda (axis=1 es el tiempo)
+    datos_eeg_detrend = detrend(datos_eeg, type='linear', axis=1)
+    log("[OK] Eje estabilizado en 0 µV.")
+
+    log("[Proceso] Aplicando filtros de frecuencia...")
+    # Ahora pasamos la señal ESTABILIZADA (datos_eeg_detrend) al filtro pasa-banda
+    datos_pb = filtrar_banda(datos_eeg_detrend, fs_real, lowcut, highcut, order)
     np.save(
         os.path.join(rutas["filtrado"], "eeg_pasabanda.npy"),
         datos_pb.astype(np.float32, copy=False)
@@ -4057,36 +4105,36 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         logger=silent_logger
     )
 
+    # UNIFICACIÓN VITAL: Agrupamos todos los canales defectuosos para aislarlos
+    idx_malos_totales = list(set(list(idx_fuertes) + list(idx_sospechosos)))
+
     canales_atipicos_nombres = []
     if len(idx_fuertes) > 0:
         canales_atipicos_nombres = [
-            nombres_canales_archivo[i]
-            for i in idx_fuertes
-            if 0 <= int(i) < len(nombres_canales_archivo)
+            nombres_canales_archivo[i] for i in idx_fuertes if 0 <= int(i) < len(nombres_canales_archivo)
         ]
         log(f"[Aviso] Canales atípicos fuertes detectados: {', '.join(canales_atipicos_nombres)}")
-        
-        # --- NUEVO: INTERPOLACIÓN ESPACIAL ---
-        log(f"[Proceso] Interpolando {len(idx_fuertes)} canal(es) atípico(s) desde vecinos sanos...")
-        datos_fn = interpolar_canales_malos(datos_fn, idx_fuertes, nombres_canales_archivo)
-        log("[OK] Canales atípicos reconstruidos espacialmente.")
-    else:
-        log("[OK] No se detectaron canales atípicos fuertes.")
 
     canales_sospechosos_nombres = []
     if len(idx_sospechosos) > 0:
         canales_sospechosos_nombres = [
-            nombres_canales_archivo[i]
-            for i in idx_sospechosos
-            if 0 <= int(i) < len(nombres_canales_archivo)
+            nombres_canales_archivo[i] for i in idx_sospechosos if 0 <= int(i) < len(nombres_canales_archivo)
         ]
         log(f"[Aviso] Canales sospechosos detectados: {', '.join(canales_sospechosos_nombres)}")
     else:
         log("[OK] No se detectaron canales sospechosos.")
 
-    # --- NUEVO: ESTABILIZACIÓN GLOBAL (CAR ROBUSTO) ---
+    # --- INTERPOLACIÓN ESPACIAL ESTRICTA ---
+    if len(idx_malos_totales) > 0:
+        log(f"[Proceso] Interpolando {len(idx_malos_totales)} canal(es) defectuoso(s) desde vecinos sanos...")
+        datos_fn = interpolar_canales_malos(datos_fn, idx_malos_totales, nombres_canales_archivo)
+        log("[OK] Canales defectuosos reconstruidos espacialmente.")
+    else:
+        log("[OK] No se detectaron canales atípicos fuertes ni sospechosos.")
+
+    # --- ESTABILIZACIÓN GLOBAL (CAR ROBUSTO) ---
     log("[Proceso] Aplicando Referencia Promedio Común (CAR Robusto)...")
-    datos_fn = aplicar_car_robusto(datos_fn, idx_fuertes, nombres_canales_archivo)
+    datos_fn = aplicar_car_robusto(datos_fn, idx_malos_totales, nombres_canales_archivo)
     log("[OK] Señal estabilizada por CAR.")
 
     # =========================
@@ -4150,10 +4198,10 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         )
 
     # =========================
-    # 6) ICA
+    # 6) ICA (MNE-ICLabel)
     # =========================
-    log("[Proceso] Ejecutando ICA y wavelet...")
-    datos_ica = aplicar_ica_por_ventanas(datos_fn, fs_real, ventana_seg=10)
+    log("[Proceso] Ejecutando ICA de grado médico con MNE...")
+    datos_ica = aplicar_ica_mne(datos_fn, fs_real, nombres_canales_archivo, logger=log)
     np.save(
         os.path.join(rutas["ica"], "eeg_ica.npy"),
         datos_ica.astype(np.float32, copy=False)
@@ -4167,6 +4215,39 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         os.path.join(rutas["wavelet"], "eeg_wavelet.npy"),
         datos_wavelet.astype(np.float32, copy=False)
     )
+
+    # =========================
+    # 7c) FFT FINAL (POST-ICA + WAVELET)
+    # =========================
+    # A diferencia de la FFT "filtrado" (calculada sobre datos_fn, ANTES de
+    # ICA/wavelet), esta se calcula sobre la señal ya limpia -- la misma que
+    # alimenta la potencia relativa Welch. Al depender de datos_wavelet (que
+    # a su vez viene de datos_ica, sin importar qué función de ICA lo genere),
+    # este bloque no necesita cambios cuando aplicar_ica_por_ventanas se
+    # reemplace por la versión con MNE: seguirá reflejando la señal limpia
+    # automáticamente, sin tocar este bloque de nuevo.
+    rutas_fft_final = [
+        os.path.join(rutas["fft"], "freqs_final.npy"),
+        os.path.join(rutas["fft"], "fft_amp_final.npy"),
+        os.path.join(rutas["fft"], "fft_db_final.npy"),
+        os.path.join(rutas["fft"], "fft_freqs_final.npy"),
+    ]
+    for ruta_fft in rutas_fft_final:
+        if os.path.exists(ruta_fft):
+            try:
+                os.remove(ruta_fft)
+            except Exception:
+                pass
+
+    progress(50, "Calculando FFT final (post-limpieza)...")
+    analizar_frecuencia_fft(
+        datos_wavelet,
+        fs_real,
+        rutas["fft"],
+        sufijo="final",
+        logger=silent_logger
+    )
+    log("[OK] FFT final calculada sobre la señal limpia (post-ICA + wavelet).")
 
     # =========================
     # 7b) POTENCIA RELATIVA WELCH
