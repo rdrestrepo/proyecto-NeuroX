@@ -8618,6 +8618,7 @@ class AppEEG:
        
     def _graficar_fft_filtrada(self, idx, canal, nombre_canal):
         from matplotlib.patches import Patch
+        from scipy.ndimage import gaussian_filter1d
         
         if not self.cache_ultimo:
             return
@@ -8627,14 +8628,9 @@ class AppEEG:
 
         try:
             freqs = np.load(ruta_f, mmap_mode="r")
-        except Exception as e:
-            messagebox.showerror("Error", f"No pude cargar las frecuencias de Welch:\n{e}")
-            return
-
-        try:
             amps = np.load(ruta_a, mmap_mode="r")
         except Exception as e:
-            messagebox.showerror("Error", f"No pude cargar la PSD de Welch:\n{e}")
+            messagebox.showerror("Error", f"No pude cargar las frecuencias de Welch:\n{e}")
             return
 
         self.log("[OK] Densidad Espectral (Welch) cargada desde cache.")
@@ -8648,13 +8644,34 @@ class AppEEG:
         except Exception:
             fmax = 40.0
             
-        # Nos enfocamos en la región clínica útil (0.5 Hz en adelante)
-        mask = (freqs >= 0.5) & (freqs <= fmax)
+        # 1. Incluimos desde 0.0 Hz para que la curva nazca pegada a la pared izquierda
+        mask = (freqs >= 0.0) & (freqs <= fmax)
+        x_raw = np.asarray(freqs[mask], dtype=np.float64)
+        y_raw = np.asarray(amps[idx, mask], dtype=np.float64)
 
-        x = np.asarray(freqs[mask], dtype=np.float64)
-        y = np.asarray(amps[idx, mask], dtype=np.float64)
+        # 2. Reconstruimos el componente de 0.0 Hz copiando el primer bin válido.
+        # Esto evita caídas artificiales y asegura que al aplicar el filtro, la 
+        # curva nazca redondeada y continua desde el eje Y.
+        if len(x_raw) > 1 and x_raw[0] == 0.0:
+            y_raw[0] = y_raw[1]
+
+        # 3. Suavizado matemático para una curva natural y fluida
+        y_smooth = gaussian_filter1d(y_raw, sigma=0.6)
+
+        # 4. Inyección de puntos de corte exactos para que no haya huecos en el sombreado
+        puntos_corte = [0.5, 4.0, 8.0, 13.0]
+        for corte in puntos_corte:
+            if 0.0 < corte < fmax and corte not in x_raw:
+                y_corte = np.interp(corte, x_raw, y_smooth)
+                idx_insert = np.searchsorted(x_raw, corte)
+                x_raw = np.insert(x_raw, idx_insert, corte)
+                y_smooth = np.insert(y_smooth, idx_insert, y_corte)
+
+        x = x_raw
         
-        # Unidades correctas para PSD (Potencia por Hz)
+        # Volvemos a Escala Lineal para que el suelo natural sea 0 y las bandas no se aplasten
+        y = y_smooth  
+        
         unidad_fft = self._leer_unidad_fft_desde_cache()
         if unidad_fft == "µV":
             ylabel = "Densidad Espectral (µV²/Hz)"
@@ -8664,64 +8681,101 @@ class AppEEG:
             ylabel = "Densidad Espectral (u.a.)"
 
         self.fig.clear()
+        
+        # Tema claro y profesional
+        color_fondo = "#FFFFFF"
+        color_grid = "#E5E7EB"
+        color_texto = "#4B5563"
+        color_titulo = "#111827"
+        
+        self.fig.patch.set_facecolor(color_fondo)
         ax = self.fig.add_subplot(111)
+        ax.set_facecolor(color_fondo)
 
-        # Límites IFCN y colores clínicos
         bandas_clinicas = [
-            ("Delta (0.5-4 Hz)", 0.5, 4.0, "#4682B4"),  # Azul acero
-            ("Theta (4-8 Hz)",   4.0, 8.0, "#3CB371"),  # Verde mar
-            ("Alfa (8-13 Hz)",   8.0, 13.0, "#FFD700"), # Dorado
-            ("Beta (13-30 Hz)",  13.0, 30.0, "#CD5C5C") # Coral
+            ("Delta (0.5-4 Hz)", 0.5, 4.0, "#0284C7"),  
+            ("Theta (4-8 Hz)",   4.0, 8.0, "#059669"),  
+            ("Alfa (8-13 Hz)",   8.0, 13.0, "#D97706"), 
+            ("Beta (13-30 Hz)",  13.0, 30.0, "#9333EA") 
         ]
 
-        # 1. Trazar la línea principal de la curva suave
-        ax.plot(x, y, color='#2c3e50', linewidth=1.2)
-
-        # 2. Rellenar el área bajo la curva (sombreado por bandas)
         handles = []
-        for nombre, f0, f1, col in bandas_clinicas:
-            if f0 < fmax:
-                # Máscara estricta para sombrear solo el ancho de esta banda
-                mask_banda = (x >= f0) & (x < min(f1, fmax))
-                if np.any(mask_banda):
-                    ax.fill_between(x[mask_banda], 0, y[mask_banda], color=col, alpha=0.5)
-                    # Añadir parche de color para la leyenda
-                    handles.append(Patch(facecolor=col, edgecolor="gray", label=nombre, alpha=0.8))
+        
+        # 5. Dibujar la línea de la porción 0.0 a 0.5 Hz sin sombreado
+        mask_pre = (x <= 0.5)
+        if np.any(mask_pre):
+            ax.plot(x[mask_pre], y[mask_pre], color="#0284C7", linewidth=1.6, zorder=4)
 
-        # 3. Ajuste dinámico del techo Y basado en el pico real
-        # 3. Ajuste dinámico del techo Y (Ignorando ruido ocular sub-hertz)
-        if len(y) > 0:
-            # Calculamos el techo Y ignorando las frecuencias < 1.0 Hz. 
-            # En canales frontales (FP1/FP2), el sudor y los movimientos oculares
-            # a 0.5Hz son gigantes y aplastan visualmente la gráfica.
-            mask_escala = (x >= 1.0) & (x <= fmax)
+        # 6. Dibujar las bandas y rellenar estrictamente hasta 0
+        for nombre, f0, f1, col in bandas_clinicas:
+            if f0 >= fmax:
+                continue
             
+            f1_limit = min(f1, fmax)
+            mask_banda = (x >= f0) & (x <= f1_limit)
+            
+            if np.any(mask_banda):
+                x_b = x[mask_banda]
+                y_b = y[mask_banda]
+                
+                ax.plot(x_b, y_b, color=col, linewidth=1.6, zorder=4)
+                ax.fill_between(x_b, 0, y_b, color=col, alpha=0.20, edgecolor="none", zorder=3)
+                
+                handles.append(Patch(facecolor=col, edgecolor="none", label=nombre, alpha=0.85))
+
+        # 7. Escala dinámica inteligente: Zoom automático
+        # Ignoramos el pico masivo inicial para que Alfa y Beta siempre se vean grandes y legibles.
+        PERCENTIL_ESCALA_PSD = 99.5
+        MARGEN_ESCALA_PSD = 1.25
+
+        if len(y) > 0:
+            mask_escala = (x >= 1.0) & (x <= fmax)
             if np.any(mask_escala):
-                techo_real = float(np.max(y[mask_escala])) * 1.15
+                techo_real = float(np.percentile(y[mask_escala], PERCENTIL_ESCALA_PSD)) * MARGEN_ESCALA_PSD
             else:
-                techo_real = float(np.max(y)) * 1.15
+                techo_real = float(np.max(y)) * MARGEN_ESCALA_PSD
                 
             techo_real = max(techo_real, 1e-6)
             ax.set_ylim(0, techo_real)
+            
+            # Si el pico de Delta es tan gigante que sale del gráfico, mostramos un aviso elegante
+            pico_real = float(np.max(y))
+            if pico_real > techo_real:
+                idx_pico = int(np.argmax(y))
+                ax.annotate(
+                    f"⚠ pico fuera de escala: {pico_real:.1f} a {x[idx_pico]:.1f} Hz",
+                    xy=(x[idx_pico], techo_real), xytext=(0.5, 0.95),
+                    textcoords="axes fraction", ha="center", va="top",
+                    fontsize=8, color="#EF476F",
+                    arrowprops=dict(arrowstyle="->", color="#EF476F", lw=1),
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#EF476F", alpha=0.85),
+                    zorder=5
+                )
 
-        # 4. Configurar Leyenda, Ejes y Títulos
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#D1D5DB")
+        ax.spines["bottom"].set_color("#D1D5DB")
+        ax.tick_params(colors=color_texto, labelsize=9)
+
         if handles:
-            ax.legend(
-                handles=handles,
-                loc="upper right",
-                title="Bandas Clínicas",
-                fontsize=8,
-                title_fontsize=9,
-                frameon=True
+            legend = ax.legend(
+                handles=handles, loc="upper right", title="Dominio de Frecuencia",
+                fontsize=9, title_fontsize=10, frameon=True,
+                facecolor="#FFFFFF", edgecolor="#E5E7EB", labelcolor=color_texto
             )
+            legend.get_title().set_color(color_titulo)
 
-        ax.set_title(f"Densidad Espectral (Welch PSD) - Canal {nombre_canal} (#{canal})")
-        ax.set_xlabel("Frecuencia (Hz)")
-        ax.set_ylabel(ylabel)
-        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Densidad Espectral (Welch PSD) - Canal {nombre_canal}", 
+                     fontsize=11, pad=15, color=color_titulo, fontweight="bold")
+        ax.set_xlabel("Frecuencia (Hz)", fontsize=10, color=color_texto, labelpad=8)
+        ax.set_ylabel(ylabel, fontsize=10, color=color_texto, labelpad=8)
+        
+        ax.grid(True, linestyle='--', alpha=0.6, color=color_grid)
 
+        # 8. Anclaje estricto en X=0.0
         if len(x) > 1:
-            ax.set_xlim(0.5, fmax)
+            ax.set_xlim(0.0, fmax)
         
         self._vista_actual = "fft"
         self._line_canal = None
@@ -8931,7 +8985,13 @@ class AppEEG:
             messagebox.showwarning("Espectrograma", "No hay contenido espectral en el rango seleccionado.")
             return
 
+        # 1. Transformación a decibelios
         sxx_db = 10.0 * np.log10(sxx + 1e-12)
+
+        # 2. NUEVO: Suavizado Gaussiano 2D
+        # Difumina el ruido estático individual para igualar la textura del promedio del informe PDF
+        from scipy.ndimage import gaussian_filter
+        sxx_db = gaussian_filter(sxx_db, sigma=(0.8, 1.5))
 
         self.fig.clear()
         gs = self.fig.add_gridspec(
@@ -8944,11 +9004,19 @@ class AppEEG:
             wspace=0.06
         )
         ax = self.fig.add_subplot(gs[0, 0])
-
         ax_bandas = self.fig.add_subplot(gs[0, 1])
         cax = self.fig.add_subplot(gs[0, 2])
 
-        mesh = ax.pcolormesh(t, f, sxx_db, shading="auto", cmap="viridis")
+        # 3. Límites de color robustos mediante percentiles
+        vmin = float(np.percentile(sxx_db, 2))
+        vmax = float(np.percentile(sxx_db, 98))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmin, vmax = float(np.min(sxx_db)), float(np.max(sxx_db))
+            if vmax <= vmin:
+                vmax = vmin + 1e-6
+
+        # 4. Renderizado idéntico al PDF (gouraud + turbo)
+        mesh = ax.pcolormesh(t, f, sxx_db, shading="gouraud", cmap="turbo", vmin=vmin, vmax=vmax)
 
         for yref in (4.0, 8.0, 12.0, 30.0):
             if yref <= fmax:

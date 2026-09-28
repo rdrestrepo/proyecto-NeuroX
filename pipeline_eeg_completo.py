@@ -1346,9 +1346,38 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
         ica.exclude = excluir
         log(f"[MNE] Se neutralizaron {len(excluir)} fuentes de ruido extracerebral "
             f"de {len(labels)} componentes totales.")
+
+        # Porcentaje de varianza de la señal atribuida a los componentes
+        # removidos -- metrica de calidad post-limpieza estandar en la
+        # literatura de ICA para EEG (se reporta tipicamente como "X% de la
+        # varianza correspondia a componentes oculares/musculares removidos").
+        # A diferencia de un SNR por bandas, no depende de ningun limite de
+        # frecuencia, asi que no lo afecta el pasa-banda de 40 Hz. MNE la
+        # calcula de forma nativa con get_explained_variance_ratio().
+        if excluir:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    var_ratio = ica.get_explained_variance_ratio(
+                        raw_fit, components=excluir, ch_type="eeg"
+                    )
+                # Puede salir negativo en casos raros (ver documentacion de
+                # MNE); se recorta a 0 para que el numero reportado siempre
+                # sea interpretable como un porcentaje.
+                porcentaje_varianza_removida = max(0.0, float(var_ratio.get("eeg", 0.0))) * 100.0
+            except Exception as e:
+                log(f"[MNE][AVISO] No se pudo calcular la varianza removida: {e}")
+                porcentaje_varianza_removida = None
+        else:
+            porcentaje_varianza_removida = 0.0
+
+        if porcentaje_varianza_removida is not None:
+            log(f"[MNE] Varianza de la señal atribuida a los componentes removidos: "
+                f"{porcentaje_varianza_removida:.1f}%")
     else:
         log("[MNE][ADVERTENCIA] mne-icalabel no esta instalado: no se excluyo "
             "ningun componente, ICA no esta limpiando nada en este archivo.")
+        porcentaje_varianza_removida = None
 
     # 4. Proyeccion de limpieza
     # Se proyecta la matriz experta sobre la señal CRUDA original (sin el
@@ -1359,7 +1388,7 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
     ica.apply(raw_limpio, verbose=False)
 
     datos_limpios = raw_limpio.get_data() * 1e6
-    return datos_limpios.astype(np.float32)
+    return datos_limpios.astype(np.float32), porcentaje_varianza_removida
 
 
 def wavelet_denoise_1d(signal_1d, wavelet=WAVELET_NAME, nivel=WAVELET_NIVEL):
@@ -1555,6 +1584,85 @@ def energia_relativa_por_region(pct_por_canal: dict, nombres_canales: list, band
     return promedios_region
 
 
+def calcular_paf_por_canal(freqs, psd, banda_alfa=(8.0, 13.0)):
+    """
+    Frecuencia Pico de Alfa (PAF) por canal: la frecuencia, dentro de la
+    banda Alfa, donde la densidad espectral de potencia (PSD) es maxima.
+    Metrica estandar en qEEG clinico -- se reporta consistentemente
+    desplazada hacia abajo (8-9 Hz en vez de 9.5-10.5 Hz) en poblaciones
+    con deterioro cognitivo, independientemente de si la potencia relativa
+    de Alfa esta alta o baja.
+
+    Reutiliza el freqs/psd que ya calcula calcular_psd_welch_por_canal --
+    no vuelve a correr Welch.
+
+    Retorna (paf_hz, valido):
+    - paf_hz: array (n_canales,) con la frecuencia del pico por canal.
+    - valido: array booleano -- False si el "pico" esta en el borde de la
+      banda o no se distingue lo suficiente del resto (espectro plano),
+      caso en el cual paf_hz no deberia interpretarse como un pico real.
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    psd = np.asarray(psd, dtype=np.float64)
+    mask = (freqs >= banda_alfa[0]) & (freqs <= banda_alfa[1])
+
+    n_canales = psd.shape[0]
+    paf_hz = np.full(n_canales, np.nan, dtype=np.float32)
+    valido = np.zeros(n_canales, dtype=bool)
+
+    if not np.any(mask) or np.count_nonzero(mask) < 3:
+        return paf_hz, valido
+
+    freqs_alfa = freqs[mask]
+    psd_alfa = psd[:, mask]
+
+    for c in range(n_canales):
+        fila = psd_alfa[c]
+        if not np.all(np.isfinite(fila)) or np.all(fila <= 0):
+            continue
+        idx_max = int(np.argmax(fila))
+        paf_hz[c] = freqs_alfa[idx_max]
+
+        # Un "pico" en el primer o ultimo bin de la banda probablemente no
+        # es un pico real, sino el borde de una pendiente que sigue fuera
+        # de la banda Alfa. Tambien se exige que el maximo supere al
+        # promedio de la banda por un margen razonable (evita reportar un
+        # "pico" en un espectro esencialmente plano).
+        en_el_borde = idx_max == 0 or idx_max == len(fila) - 1
+        promedio_banda = float(np.mean(fila))
+        supera_promedio = promedio_banda > 0 and (fila[idx_max] / promedio_banda) >= 1.2
+        valido[c] = (not en_el_borde) and supera_promedio
+
+    return paf_hz, valido
+
+
+def _promedio_por_region_generico(valores_por_canal, nombres_canales, idx_excluir=None):
+    """
+    Promedio simple por region (Frontal/Central/Temporal/Parietal/Occipital)
+    de un unico array de valores por canal (a diferencia de
+    energia_relativa_por_region, que espera un dict por banda). Se
+    ignoran NaN y los indices en idx_excluir.
+    """
+    if idx_excluir is None:
+        idx_excluir = []
+    idx_excluir = set(int(i) for i in idx_excluir)
+
+    valores_por_canal = np.asarray(valores_por_canal, dtype=np.float64)
+    regiones = {}
+    for i, nom in enumerate(nombres_canales):
+        if i in idx_excluir:
+            continue
+        reg = _region_de_canal(nom)
+        regiones.setdefault(reg, []).append(i)
+
+    promedios = {}
+    for reg, idxs in regiones.items():
+        vals = valores_por_canal[idxs]
+        vals = vals[np.isfinite(vals)]
+        promedios[reg] = float(np.mean(vals)) if len(vals) else float("nan")
+    return promedios
+
+
 def calcular_psd_welch_por_canal(datos, fs_real, logger=None):
     """
     Calcula PSD por canal con Welch sobre una señal limpia (canales x muestras).
@@ -1639,6 +1747,11 @@ def calcular_potencia_relativa_welch(
         for b in bandas_def.keys()
     }
 
+    # Frecuencia Pico de Alfa (PAF) por canal. Banda tomada de bandas_def
+    # si esta definida "Alfa", si no se usa 8-13 Hz por defecto.
+    banda_alfa_paf = bandas_def.get("Alfa", (8.0, 13.0))
+    paf_hz, paf_valido = calcular_paf_por_canal(freqs, psd, banda_alfa=banda_alfa_paf)
+
     return {
         "freqs": freqs,
         "psd": psd,
@@ -1646,6 +1759,8 @@ def calcular_potencia_relativa_welch(
         "pot_abs": pot_abs,
         "pot_rel": pot_rel,
         "promedios_globales": promedios_globales,
+        "paf_hz": paf_hz,
+        "paf_valido": paf_valido,
     }
 
 
@@ -1689,12 +1804,43 @@ def guardar_potencia_relativa_welch(
             idx_excluir=idx_excluir
         )
 
+    # PAF (Frecuencia Pico de Alfa): se guarda el array completo por canal,
+    # y se resume a nivel global/regional usando solo los canales donde se
+    # detectó un pico valido (paf_valido), para no promediar "picos" que en
+    # realidad eran un espectro plano o el borde de la banda.
+    paf_hz = resultado_welch.get("paf_hz")
+    paf_valido = resultado_welch.get("paf_valido")
+    paf_global = float("nan")
+    paf_region = {}
+    if paf_hz is not None and paf_valido is not None:
+        np.save(os.path.join(carpeta_salida, "paf_alfa_hz.npy"), paf_hz)
+        np.save(os.path.join(carpeta_salida, "paf_alfa_valido.npy"), paf_valido)
+
+        idx_excluir_set = set(int(i) for i in idx_excluir)
+        idx_validos_paf = [
+            i for i in range(len(paf_hz))
+            if paf_valido[i] and i not in idx_excluir_set and np.isfinite(paf_hz[i])
+        ]
+        if idx_validos_paf:
+            paf_global = float(np.mean(paf_hz[idx_validos_paf]))
+        if nombres_canales is not None:
+            # Los canales sin pico valido entran como NaN y
+            # _promedio_por_region_generico ya los ignora.
+            paf_para_region = np.where(paf_valido, paf_hz, np.nan)
+            paf_region = _promedio_por_region_generico(
+                paf_para_region, nombres_canales, idx_excluir=idx_excluir
+            )
+
     resumen = {
         "metodo": "Welch",
         "rango_total_hz": list(RANGO_TOTAL_WELCH),
         "bandas_hz": {b: list(v) for b, v in bandas_def.items()},
         "promedios_globales": resultado_welch["promedios_globales"],
         "promedios_regionales": promedios_region,
+        "paf_global_hz": paf_global,
+        "paf_regional_hz": paf_region,
+        "paf_canales_validos": int(len(idx_validos_paf)) if paf_hz is not None else 0,
+        "paf_canales_totales": int(len(paf_hz)) if paf_hz is not None else 0,
     }
 
     with open(os.path.join(carpeta_salida, "pot_rel_promedios.json"), "w", encoding="utf-8") as f:
@@ -2239,82 +2385,6 @@ def evaluar_banda(banda, valor, umbral_amarillo=5):
     }
 
 
-def interpretar_region(nombre_region, valores_region, promedios_globales):
-    """
-    Analisis descriptivo por region comparando contra el promedio global
-    del mismo registro.
-    """
-    lineas = []
-
-    for banda in ["Delta", "Theta", "Alfa", "Beta"]:
-        vr = valores_region.get(banda, np.nan)
-        vg = promedios_globales.get(banda, np.nan)
-
-        if np.isnan(vr) or np.isnan(vg):
-            continue
-
-        diff = vr - vg
-
-        if abs(diff) < 3:
-            continue
-
-        if diff > 0:
-            lineas.append(
-                f"{banda}: {vr:.1f}% en la region, por encima del promedio global ({vg:.1f}%)."
-            )
-        else:
-            lineas.append(
-                f"{banda}: {vr:.1f}% en la region, por debajo del promedio global ({vg:.1f}%)."
-            )
-
-    conclusion = ""
-
-    delta_r = valores_region.get("Delta", np.nan)
-    alfa_r = valores_region.get("Alfa", np.nan)
-    beta_r = valores_region.get("Beta", np.nan)
-
-    delta_g = promedios_globales.get("Delta", np.nan)
-    alfa_g = promedios_globales.get("Alfa", np.nan)
-    beta_g = promedios_globales.get("Beta", np.nan)
-
-    if nombre_region == "Frontal":
-        if not np.isnan(beta_r) and not np.isnan(beta_g) and beta_r >= beta_g + 3:
-            conclusion = (
-                "Esto sugiere un predominio relativo de actividad rapida en la region frontal."
-            )
-
-    elif nombre_region in ("Parietal", "Occipital"):
-        if not np.isnan(alfa_r) and not np.isnan(alfa_g) and alfa_r >= alfa_g + 3:
-            conclusion = (
-                "Esto sugiere un predominio relativo de alfa en region posterior."
-            )
-        elif not np.isnan(delta_r) and not np.isnan(delta_g) and delta_r >= delta_g + 4:
-            conclusion = (
-                "Esto describe una mayor proporcion relativa de actividad lenta en esta region posterior."
-            )
-
-    elif nombre_region == "Temporal":
-        if not np.isnan(delta_r) and not np.isnan(delta_g) and delta_r >= delta_g + 4:
-            conclusion = (
-                "Esto sugiere una lentificacion relativa temporal respecto al promedio global del registro."
-            )
-
-    elif nombre_region == "Central":
-        conclusion = (
-            "Los porcentajes regionales se mantienen cercanos al promedio global, sin predominio marcado."
-        )
-
-    if not lineas:
-        return (
-            f"{nombre_region}: los porcentajes de energia relativa regional son cercanos "
-            f"al promedio global del registro, sin predominio marcado."
-        )
-
-    texto = f"{nombre_region}: " + " ".join(lineas)
-    if conclusion:
-        texto += " " + conclusion
-
-    return texto
 
 
 REGIONES_PRINCIPALES_INFORME = ("Frontal", "Central", "Temporal", "Parietal", "Occipital")
@@ -3352,6 +3422,77 @@ class InformeEEG(FPDF):
             self.ln(row_height)
         self.ln(4.4)
 
+    def add_tabla_comparacion_referencia(
+        self,
+        filas_evaluacion,
+        col_widths=(32, 28, 40, 68),
+        row_height=6.6,
+    ):
+        """
+        Tabla: Banda | Valor global | Rango de referencia | Estado (coloreado).
+        'filas_evaluacion' es una lista de dicts, cada uno con la forma que
+        devuelve evaluar_banda(): {"banda","valor","low","high","estado",
+        "detalle","color"}. La celda de "Estado" se colorea segun 'color'
+        ("green"/"yellow"/"red"), igual que un semaforo. No modifica
+        add_visual_table (usada por otras tablas del informe) para no
+        arriesgar su comportamiento en el resto del reporte.
+        """
+        if not filas_evaluacion:
+            return
+
+        colores_fill = {
+            "green":  (211, 240, 216),
+            "yellow": (255, 236, 179),
+            "red":    (248, 205, 205),
+        }
+        colores_texto = {
+            "green":  (30, 110, 50),
+            "yellow": (150, 105, 0),
+            "red":    (160, 30, 30),
+        }
+
+        headers = ["Banda", "Valor global", "Rango de referencia", "Estado"]
+        usable_width = self.w - self.l_margin - self.r_margin
+        total_width = sum(col_widths)
+        x_start = self.l_margin + max(0, (usable_width - total_width) / 2.0)
+
+        self.ensure_space(18 + row_height * (len(filas_evaluacion) + 1))
+
+        self.set_fill_color(229, 236, 245)
+        self.set_draw_color(173, 183, 197)
+        self.set_text_color(33, 63, 104)
+        self.set_font("Helvetica", "B", 10)
+        self.set_x(x_start)
+        for header, width in zip(headers, col_widths):
+            self.cell(width, row_height, header, border=1, align="C", fill=True)
+        self.ln(row_height)
+
+        self.set_font("Helvetica", "", 9.5)
+        for fila in filas_evaluacion:
+            self.set_x(x_start)
+            color = fila.get("color", "yellow")
+            fill_rgb = colores_fill.get(color, colores_fill["yellow"])
+            texto_rgb = colores_texto.get(color, colores_texto["yellow"])
+
+            self.set_text_color(28, 32, 38)
+            self.cell(col_widths[0], row_height, str(fila.get("banda", "")), border=1, align="C")
+            self.cell(col_widths[1], row_height, f"{fila.get('valor', 0):.1f}%", border=1, align="C")
+            self.cell(
+                col_widths[2], row_height,
+                f"{fila.get('low', 0):.0f}-{fila.get('high', 0):.0f}%",
+                border=1, align="C",
+            )
+
+            self.set_fill_color(*fill_rgb)
+            self.set_text_color(*texto_rgb)
+            self.set_font("Helvetica", "B", 9.5)
+            self.cell(col_widths[3], row_height, str(fila.get("detalle", "")), border=1, align="C", fill=True)
+            self.set_font("Helvetica", "", 9.5)
+            self.ln(row_height)
+
+        self.set_text_color(28, 32, 38)
+        self.ln(4.4)
+
     def _image_height_mm(self, image_path, width_mm):
         try:
             with Image.open(image_path) as img:
@@ -3513,12 +3654,38 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     datos_fil = None
     bandas_filtradas = {}
     bandas_filtradas_fil = {}
+    porcentaje_varianza_ica = None
+    snr_final_db = None
     try:
         ruta_ica = os.path.join(carpeta_archivo_cache, "ica", "eeg_ica.npy")
         ruta_wavelet = os.path.join(carpeta_archivo_cache, "wavelet", "eeg_wavelet.npy")
         carpeta_bandas = os.path.join(carpeta_archivo_cache, "bandas")
         ruta_fil = os.path.join(carpeta_archivo_cache, "filtrado", "eeg_filtrado.npy")
         carpeta_bandas_fil = os.path.join(carpeta_archivo_cache, "bandas_filtrado")
+
+        # Porcentaje de varianza atribuida a componentes de artefacto
+        # removidos por ICA (ver aplicar_ica_mne). None si el archivo se
+        # proceso con una version anterior a este cambio, o si no se pudo
+        # calcular.
+        porcentaje_varianza_ica = None
+        ruta_calidad_ica = os.path.join(carpeta_archivo_cache, "ica", "calidad_ica.json")
+        if os.path.exists(ruta_calidad_ica):
+            try:
+                with open(ruta_calidad_ica, "r", encoding="utf-8") as f:
+                    porcentaje_varianza_ica = json.load(f).get("porcentaje_varianza_removida")
+            except Exception:
+                porcentaje_varianza_ica = None
+
+        # SNR post-limpieza (1-30 vs 30-40 Hz, sobre la señal final). None
+        # si el archivo se proceso con una version anterior a este cambio.
+        snr_final_db = None
+        ruta_snr_final = os.path.join(carpeta_archivo_cache, "calidad_senal", "snr_final.json")
+        if os.path.exists(ruta_snr_final):
+            try:
+                with open(ruta_snr_final, "r", encoding="utf-8") as f:
+                    snr_final_db = json.load(f).get("snr_final_db")
+            except Exception:
+                snr_final_db = None
 
         if (
             os.path.exists(ruta_ica)
@@ -3796,6 +3963,102 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
         col_widths=[52, 66],
         alignments=["L", "C"],
     )
+
+    pdf.add_block_title("1b. Comparación contra rango de referencia")
+    pdf.add_wrapped_text(
+        "Los siguientes rangos son de referencia orientativa y deben interpretarse "
+        "en conjunto con el criterio clínico del profesional a cargo; no constituyen "
+        "por si solos un diagnóstico.",
+        font_size=9.0,
+    )
+    filas_evaluacion_bandas = []
+    for banda in ("Delta", "Theta", "Alfa", "Beta"):
+        valor_banda = promedios_globales_welch.get(banda, np.nan)
+        if np.isfinite(valor_banda) and banda in rangos_referencia:
+            filas_evaluacion_bandas.append(evaluar_banda(banda, float(valor_banda)))
+    if filas_evaluacion_bandas:
+        pdf.add_tabla_comparacion_referencia(filas_evaluacion_bandas)
+    else:
+        pdf.add_wrapped_text(
+            "No hay suficientes datos de potencia relativa para esta comparación.",
+            font_size=10.0,
+        )
+
+    pdf.add_block_title("1c. Limpieza de artefactos (ICA)")
+    if porcentaje_varianza_ica is not None:
+        pdf.add_wrapped_text(
+            f"El {porcentaje_varianza_ica:.1f}% de la varianza de la señal fue atribuido "
+            f"por el análisis de componentes independientes (ICA) a fuentes de artefacto "
+            f"(oculares, musculares u otras) y removido antes del análisis espectral. "
+            f"Este porcentaje describe cuánta señal se identificó como no cerebral; no es, "
+            f"por sí solo, un indicador de que 'más es mejor' o 'menos es mejor' -- un "
+            f"valor alto puede reflejar una limpieza extensa de contaminación real, y un "
+            f"valor inusualmente alto conviene revisarlo junto con los trazados de canal "
+            f"para descartar remoción excesiva de actividad cerebral genuina.",
+            font_size=9.0,
+        )
+    else:
+        pdf.add_wrapped_text(
+            "No se pudo calcular el porcentaje de varianza removida por ICA para este registro.",
+            font_size=9.0,
+        )
+
+    pdf.add_block_title("1d. SNR posterior a la limpieza")
+    if snr_final_db is not None:
+        pdf.add_wrapped_text(
+            f"SNR de la señal final (post-ICA + wavelet): {snr_final_db:.1f} dB, calculado "
+            f"entre 1-30 Hz (señal) y 30-40 Hz (ruido residual dentro del límite del filtro). "
+            f"Este valor es independiente del 'SNR global' reportado en la sección de calidad "
+            f"técnica -- aquel se calcula deliberadamente sobre la señal cruda para medir la "
+            f"calidad de la adquisición, y no cambia sin importar qué tan bien limpie el "
+            f"pipeline. Este SNR final, en cambio, sí refleja el efecto de la limpieza; al usar "
+            f"un margen de frecuencia más angosto que el SNR crudo, discrimina con menos "
+            f"detalle y no es directamente comparable con SNR reportados por otro software "
+            f"(por ejemplo, los basados en promediado de múltiples repeticiones de un estímulo, "
+            f"que no aplican a un registro continuo en reposo).",
+            font_size=9.0,
+        )
+    else:
+        pdf.add_wrapped_text(
+            "No se pudo calcular el SNR posterior a la limpieza para este registro.",
+            font_size=9.0,
+        )
+
+    pdf.add_block_title("1e. Frecuencia Pico de Alfa (PAF)")
+    paf_global_hz = resumen_welch.get("paf_global_hz") if isinstance(resumen_welch, dict) else None
+    paf_regional_hz = resumen_welch.get("paf_regional_hz", {}) if isinstance(resumen_welch, dict) else {}
+    paf_canales_validos = resumen_welch.get("paf_canales_validos", 0) if isinstance(resumen_welch, dict) else 0
+    paf_canales_totales = resumen_welch.get("paf_canales_totales", 0) if isinstance(resumen_welch, dict) else 0
+
+    if paf_global_hz is not None and np.isfinite(paf_global_hz):
+        pdf.add_wrapped_text(
+            f"PAF global: {paf_global_hz:.2f} Hz (calculado sobre {paf_canales_validos} de "
+            f"{paf_canales_totales} canales, donde se identificó un pico distinguible dentro "
+            f"de la banda Alfa; en los demás el espectro no mostró un pico claro en esa banda). "
+            f"La literatura de qEEG reporta típicamente un PAF entre 9.5 y 10.5 Hz en adultos "
+            f"sanos, con desplazamientos hacia frecuencias más bajas (8-9 Hz) descritos en "
+            f"poblaciones con deterioro cognitivo -- esto es una referencia orientativa general, "
+            f"no un punto de corte diagnóstico, y debe interpretarse junto con el resto del "
+            f"cuadro clínico.",
+            font_size=9.0,
+        )
+        if paf_regional_hz:
+            filas_paf = [
+                [region, f"{valor:.2f} Hz" if np.isfinite(valor) else "sin pico claro"]
+                for region, valor in paf_regional_hz.items()
+            ]
+            pdf.add_visual_table(
+                headers=["Región", "PAF"],
+                rows=filas_paf,
+                col_widths=[60, 50],
+                alignments=["L", "C"],
+            )
+    else:
+        pdf.add_wrapped_text(
+            "No se pudo calcular un PAF confiable para este registro (ningún canal mostró un "
+            "pico claramente distinguible dentro de la banda Alfa).",
+            font_size=9.0,
+        )
 
     # 2. Tabla regional: se reserva espacio antes del título
     # para evitar que el título quede en una página y la tabla en otra.
@@ -4105,7 +4368,10 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         logger=silent_logger
     )
 
-    # UNIFICACIÓN VITAL: Agrupamos todos los canales defectuosos para aislarlos
+    # Los "sospechosos" ya NO se interpolan (ver mas abajo) -- se siguen
+    # excluyendo del promedio de referencia CAR mas adelante, porque no
+    # confiar en ellos para calcular el promedio comun es un gesto mucho
+    # mas conservador que reconstruir por completo su serie de tiempo.
     idx_malos_totales = list(set(list(idx_fuertes) + list(idx_sospechosos)))
 
     canales_atipicos_nombres = []
@@ -4125,14 +4391,24 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         log("[OK] No se detectaron canales sospechosos.")
 
     # --- INTERPOLACIÓN ESPACIAL ESTRICTA ---
-    if len(idx_malos_totales) > 0:
-        log(f"[Proceso] Interpolando {len(idx_malos_totales)} canal(es) defectuoso(s) desde vecinos sanos...")
-        datos_fn = interpolar_canales_malos(datos_fn, idx_malos_totales, nombres_canales_archivo)
+    # Solo se interpolan los "fuertes". Los "sospechosos" son una categoría
+    # deliberadamente mas leve -- interpolarlos tambien (como se hacia antes,
+    # usando idx_malos_totales aqui) trataba por igual a un canal claramente
+    # dañado y a uno apenas dudoso, reconstruyendo hasta un tercio del
+    # montaje en algunos archivos. Ahora "sospechoso" queda como aviso
+    # informativo en el informe, sin alterar su señal.
+    idx_a_interpolar = list(idx_fuertes)
+    if len(idx_a_interpolar) > 0:
+        log(f"[Proceso] Interpolando {len(idx_a_interpolar)} canal(es) defectuoso(s) desde vecinos sanos...")
+        datos_fn = interpolar_canales_malos(datos_fn, idx_a_interpolar, nombres_canales_archivo)
         log("[OK] Canales defectuosos reconstruidos espacialmente.")
     else:
-        log("[OK] No se detectaron canales atípicos fuertes ni sospechosos.")
+        log("[OK] No se detectaron canales atípicos fuertes para interpolar.")
 
     # --- ESTABILIZACIÓN GLOBAL (CAR ROBUSTO) ---
+    # Aqui SÍ se sigue usando idx_malos_totales (fuertes + sospechosos): no
+    # dejar que un canal sospechoso contamine el promedio de referencia es
+    # una precaución razonable y de bajo riesgo, distinta de reconstruirlo.
     log("[Proceso] Aplicando Referencia Promedio Común (CAR Robusto)...")
     datos_fn = aplicar_car_robusto(datos_fn, idx_malos_totales, nombres_canales_archivo)
     log("[OK] Señal estabilizada por CAR.")
@@ -4201,11 +4477,21 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # 6) ICA (MNE-ICLabel)
     # =========================
     log("[Proceso] Ejecutando ICA de grado médico con MNE...")
-    datos_ica = aplicar_ica_mne(datos_fn, fs_real, nombres_canales_archivo, logger=log)
+    datos_ica, porcentaje_varianza_ica = aplicar_ica_mne(
+        datos_fn, fs_real, nombres_canales_archivo, logger=log
+    )
     np.save(
         os.path.join(rutas["ica"], "eeg_ica.npy"),
         datos_ica.astype(np.float32, copy=False)
     )
+    try:
+        with open(os.path.join(rutas["ica"], "calidad_ica.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {"porcentaje_varianza_removida": porcentaje_varianza_ica},
+                f, ensure_ascii=False
+            )
+    except Exception as e:
+        log(f"[AVISO] No se pudo guardar calidad_ica.json: {e}")
 
     # =========================
     # 7) WAVELET POST-ICA
@@ -4248,6 +4534,35 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         logger=silent_logger
     )
     log("[OK] FFT final calculada sobre la señal limpia (post-ICA + wavelet).")
+
+    # =========================
+    # 7d) SNR POST-LIMPIEZA (sobre señal final)
+    # =========================
+    # El SNR "crudo" (calcular_resumen_calidad_senal, mas abajo) se calcula
+    # a proposito sobre datos_crudo_para_calidad, con banda de ruido 40-100
+    # Hz -- mide la calidad de la ADQUISICION, no de la limpieza, y por
+    # diseño no debe cambiar sin importar que tan bien limpie el pipeline.
+    # Este es un indicador NUEVO y aparte: mismo tipo de calculo
+    # (calcular_snr_por_canal, sin modificarla), pero sobre datos_wavelet
+    # (la señal ya limpia). Como el pasa-banda corta en highcut Hz, la banda
+    # de ruido 40-100 Hz ya no existe aqui -- se usa la unica franja de
+    # "ruido" que sigue disponible dentro del filtro (30-40 Hz). Es un
+    # margen mucho mas angosto que el original (10 Hz vs 70 Hz), asi que
+    # este numero discrimina menos finamente que el SNR crudo; aun asi, es
+    # el mejor indicador disponible de "que tan limpia quedo la señal", que
+    # es lo que el SNR crudo, por diseño, no puede responder.
+    try:
+        resumen_snr_final, _ = calcular_snr_por_canal(
+            datos_wavelet, fs_real, banda_senal=(1, 30), banda_ruido=(30, 40)
+        )
+        snr_final_db = resumen_snr_final["snr_global_db"]
+        carpeta_calidad_snr_final = os.path.join(rutas["archivo"], "calidad_senal")
+        os.makedirs(carpeta_calidad_snr_final, exist_ok=True)
+        with open(os.path.join(carpeta_calidad_snr_final, "snr_final.json"), "w", encoding="utf-8") as f:
+            json.dump({"snr_final_db": snr_final_db}, f, ensure_ascii=False)
+        log(f"[OK] SNR post-limpieza (1-30 vs 30-40 Hz, señal final): {snr_final_db:.2f} dB")
+    except Exception as e:
+        log(f"[AVISO] No se pudo calcular el SNR post-limpieza: {e}")
 
     # =========================
     # 7b) POTENCIA RELATIVA WELCH
