@@ -1,0 +1,11 @@
+numpy
+scipy
+matplotlib
+Pillow
+fpdf2
+openpyxl
+pypdf
+PyWavelets
+mne
+mne-icalabel
+onnxruntime
