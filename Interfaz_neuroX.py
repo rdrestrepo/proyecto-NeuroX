@@ -9,6 +9,7 @@ import threading
 import subprocess
 import textwrap
 import json
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, filedialog, messagebox
@@ -22,7 +23,7 @@ from matplotlib.ticker import FuncFormatter
 from scipy.signal import spectrogram
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw, ImageColor
 
 ## Configuración de Matplotlib
 # Intenta forzar TkAgg SOLO si no hay Qt ya corriendo.
@@ -50,17 +51,38 @@ from consolidado_excel import generar_consolidado_excel
 from consolidado_pdf import combinar_informes_pdf
 # -*- coding: utf-8 -*-
 
-AZUL_NEUROX = "#061A5B"
-AZUL_MEDIO = "#1D4ED8"
-NARANJA_NEUROX = "#FF6A00"
-FONDO_APP = "#FFFFFF"
-FONDO_PANEL = "#FFFFFF"
-FONDO_PANEL_SUAVE = "#F5F5F5"
-TEXTO_PRINCIPAL = "#111827"
-TEXTO_SECUNDARIO = "#4B5563"
-BORDE_SUAVE = "#D9E1EC"
+## =========================================================
+## Sistema de diseño NeuroX — paleta Índigo/Turquesa (ref. dashboard clínico)
+## =========================================================
+## Mismos NOMBRES de constantes que antes (se usan en cientos de puntos del
+## archivo); solo se refinan los valores hacia la paleta índigo/turquesa del
+## prototipo de referencia. No se toca ninguna lógica de negocio.
+
+AZUL_NEUROX = "#3730A3"          # Índigo profundo (marca) — antes cobalto #0B1D45
+AZUL_MEDIO = "#4F46E5"           # Índigo vibrante para foco/selección/tabs activos
+AZUL_ACCENT = AZUL_MEDIO         # Alias explícito solicitado en el sistema de diseño
+TURQUESA_NEUROX = "#0D9488"      # Turquesa secundario (acento de marca, isotipo)
+NARANJA_NEUROX = "#F97316"       # Naranja de estado/alerta (p. ej. "en vivo", avisos)
+FONDO_APP = "#F7F7FC"            # Lienzo lavanda-blanco ultrasuave detrás de tarjetas
+FONDO_PANEL = "#FFFFFF"          # Blanco puro para tarjetas / paneles
+FONDO_PANEL_SUAVE = "#F1F1F9"    # Superficie secundaria con tinte índigo muy sutil
+FONDO_HOVER = "#EEEEFC"          # Tinte sutil índigo para hover sobre filas/botones
+TEXTO_PRINCIPAL = "#111827"      # Texto principal, alto contraste
+TEXTO_SECUNDARIO = "#6B7280"     # Texto de soporte / labels (gris neutro)
+TEXTO_TERCIARIO = "#9CA3AF"      # Texto auxiliar / placeholders
+BORDE_SUAVE = "#E5E7EB"          # Micro-borde 1px, estilo "hairline"
+NEUTRO_BORDE = BORDE_SUAVE       # Alias explícito solicitado en el sistema de diseño
+BORDE_FOCO = AZUL_MEDIO          # Color de foco/anillo para inputs activos
 FUENTE_UI = "Segoe UI"
 FUENTE_UI_FALLBACK = "Arial"
+# Orden de preferencia al resolver la fuente real disponible en el sistema
+# (ver _resolver_fuente_ui): Segoe UI Variable > Segoe UI > Inter > SF Pro
+# Text > Helvetica Neue > Arial. Windows siempre tendrá Segoe UI, pero esto
+# deja la puerta abierta a que se vea igual de bien en otros sistemas.
+FUENTE_UI_CANDIDATOS = (
+    "Segoe UI Variable Text", "Segoe UI", "Inter",
+    "SF Pro Text", "Helvetica Neue", FUENTE_UI_FALLBACK,
+)
 
 
 ## Utilidades de DPI / pantalla
@@ -128,21 +150,25 @@ def obtener_ruta_config():
 
 class _TabBar(tk.Frame):
     """
-    Barra de tabs con esquinas superiores redondeadas, estilo Chrome.
-    Parámetros:
-      fill_width  – True: los tabs se reparten todo el ancho disponible.
-      active_fill – color de fondo del tab activo.
-      active_fg   – color de texto del tab activo.
-    """
-    H      = 36   # altura total del widget
-    RADIO  = 9    # radio de las esquinas superiores
-    PAD_X  = 18   # padding horizontal dentro de cada tab (solo si fill_width=False)
-    GAP    = 3    # separación entre tabs
+    Barra de tabs estilo "pill" (totalmente redondeadas), inspirada en
+    Linear/Notion/Xcode: tab activo relleno en color sólido, tabs inactivos
+    transparentes con texto atenuado y una transición sutil de color al
+    pasar el mouse (hover).
 
-    C_INACT_BG   = "#E4EAF4"
+    API pública sin cambios respecto a la versión anterior:
+      seleccionar(idx, dibujar=True)
+    Parámetros del constructor sin cambios:
+      fill_width, active_fill, active_fg
+    """
+    H      = 38   # altura total del widget
+    RADIO  = 19   # radio total (H/2) → pill completamente redondeada
+    PAD_X  = 20   # padding horizontal dentro de cada tab (solo si fill_width=False)
+    GAP    = 6    # separación entre tabs
+
+    C_INACT_BG   = FONDO_APP
     C_INACT_FG   = TEXTO_SECUNDARIO
-    C_BORDE      = BORDE_SUAVE
-    C_BASE       = BORDE_SUAVE
+    C_HOVER_BG   = FONDO_HOVER
+    C_HOVER_FG   = AZUL_NEUROX
 
     def __init__(self, parent, labels, on_select, fuente=FUENTE_UI,
                  fill_width=False, active_fill=FONDO_PANEL, active_fg=AZUL_NEUROX,
@@ -155,6 +181,7 @@ class _TabBar(tk.Frame):
         self._labels      = list(labels)
         self._on_select   = on_select
         self._activo      = 0
+        self._hover       = -1
         self._rects       = []
         self._fill_width  = fill_width
         self._active_fill = active_fill
@@ -167,6 +194,9 @@ class _TabBar(tk.Frame):
         self._cv.pack(fill=tk.BOTH, expand=True)
         self._cv.bind("<Configure>", lambda _e: self._draw())
         self._cv.bind("<Button-1>", self._click)
+        self._cv.bind("<Motion>", self._on_motion)
+        self._cv.bind("<Leave>", self._on_leave)
+        self._tk_images = []   # mantiene referencias vivas a los PhotoImage de las pills
 
     # ── API pública ───────────────────────────────────────────────────
     def seleccionar(self, idx, dibujar=True):
@@ -178,6 +208,7 @@ class _TabBar(tk.Frame):
     def _draw(self):
         cv = self._cv
         cv.delete("all")
+        self._tk_images = []   # libera las imágenes del frame anterior
         W  = cv.winfo_width()
         H  = self.H
         if W < 2:
@@ -186,86 +217,280 @@ class _TabBar(tk.Frame):
         R   = self.RADIO
         gap = self.GAP
         n   = len(self._labels)
-        h_i = H - 5   # altura de tabs inactivos (un poco más bajos)
 
         # Calcular anchos
         if self._fill_width:
             total_gap = gap * (n - 1)
-            tab_w = max(40, (W - total_gap) // n)
+            tab_w = max(48, (W - total_gap) // n)
             widths = [tab_w] * n
         else:
             widths = [self._font_b.measure(lbl) + self.PAD_X * 2 for lbl in self._labels]
 
-        # Posiciones
+        # Posiciones (centradas verticalmente, todas a altura H)
         xs = []
-        x  = 0 if self._fill_width else 4
+        x  = 0
         for w in widths:
             xs.append(x)
             x += w + gap
 
         self._rects = [(xs[i], xs[i] + widths[i]) for i in range(n)]
 
-        # Línea base
-        cv.create_line(0, H, W, H, fill=self.C_BASE, width=1)
-
-        # Inactivos primero
         for i, (lbl, xi, wi) in enumerate(zip(self._labels, xs, widths)):
             if i == self._activo:
-                continue
-            yi = 5
-            self._tab(cv, xi, yi, wi, h_i, R,
-                      fill=self.C_INACT_BG, borde=self.C_BORDE)
-            cv.create_text(xi + wi // 2, yi + h_i // 2,
-                           text=lbl, fill=self.C_INACT_FG,
-                           font=self._font_n, anchor="center")
+                fill = self._active_fill
+                fg = self._active_fg
+                fuente = self._font_b
+            elif i == self._hover:
+                fill = self.C_HOVER_BG
+                fg = self.C_HOVER_FG
+                fuente = self._font_n
+            else:
+                fill = self.C_INACT_BG
+                fg = self.C_INACT_FG
+                fuente = self._font_n
 
-        # Activo encima (altura completa, sin borde inferior)
-        i  = self._activo
-        xi = xs[i]
-        wi = widths[i]
-        self._tab(cv, xi, 0, wi, H, R,
-                  fill=self._active_fill, borde=self.C_BORDE)
-        cv.create_rectangle(xi + 1, H - 1, xi + wi - 1, H + 2,
-                             fill=self._active_fill, outline="")
-        cv.create_text(xi + wi // 2, H // 2,
-                       text=self._labels[i], fill=self._active_fg,
-                       font=self._font_b, anchor="center")
+            self._pill(cv, xi, 0, wi, H, R, fill=fill)
+            cv.create_text(xi + wi // 2, H // 2, text=lbl, fill=fg,
+                           font=fuente, anchor="center")
 
-    def _tab(self, cv, x, y, w, h, r, fill, borde):
-        """Dibuja un tab con esquinas superiores redondeadas."""
-        # Relleno principal
-        cv.create_polygon(
-            x,         y + r,
-            x + r,     y,
-            x + w - r, y,
-            x + w,     y + r,
-            x + w,     y + h,
-            x,         y + h,
-            fill=fill, outline="", smooth=False
+    def _pill(self, cv, x, y, w, h, r, fill):
+        """
+        Dibuja una cápsula (pill) totalmente redondeada, sin borde, con
+        antialiasing real: se renderiza con PIL a 4x de resolución y se
+        reduce con filtro LANCZOS antes de mostrarla. Los arcos nativos de
+        tk.Canvas (create_arc) no tienen antialiasing y por eso se ven
+        pixelados/dentados en los bordes curvos, sobre todo en pantallas
+        de alta densidad; este enfoque evita ese problema por completo.
+        """
+        r = min(r, h // 2, w // 2)
+        escala = 4
+        w_i, h_i = max(1, int(w)), max(1, int(h))
+        try:
+            color_rgba = ImageColor.getrgb(fill) + (255,)
+        except ValueError:
+            color_rgba = (0, 0, 0, 255)
+
+        img = Image.new("RGBA", (w_i * escala, h_i * escala), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle(
+            [0, 0, w_i * escala - 1, h_i * escala - 1],
+            radius=max(1, int(r * escala)),
+            fill=color_rgba,
         )
-        # Relleno de los arcos en esquinas (chord elimina triángulo residual)
-        for ax, ay in [(x, y), (x + w - 2*r, y)]:
-            cv.create_arc(ax, ay, ax + 2*r, ay + 2*r,
-                          start=(90 if ax == x else 0),
-                          extent=90, fill=fill, outline="", style="chord")
-        # Bordes (sin borde inferior)
-        cv.create_line(x, y + h, x, y + r, fill=borde)
-        cv.create_arc(x, y, x + 2*r, y + 2*r,
-                      start=90, extent=90, outline=borde, fill="", style="arc")
-        cv.create_line(x + r, y, x + w - r, y, fill=borde)
-        cv.create_arc(x + w - 2*r, y, x + w, y + 2*r,
-                      start=0, extent=90, outline=borde, fill="", style="arc")
-        cv.create_line(x + w, y + r, x + w, y + h, fill=borde)
+        img = img.resize((w_i, h_i), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        self._tk_images.append(photo)
+        cv.create_image(x, y, image=photo, anchor="nw")
 
     # ── Interacción ───────────────────────────────────────────────────
-    def _click(self, evt):
+    def _tab_en(self, x, y):
+        if not (0 <= y <= self.H):
+            return -1
         for i, (x0, x1) in enumerate(self._rects):
-            if x0 <= evt.x <= x1 and 0 <= evt.y <= self.H:
-                if i != self._activo:
-                    self._activo = i
-                    self._draw()
-                    self._on_select(i)
-                break
+            if x0 <= x <= x1:
+                return i
+        return -1
+
+    def _click(self, evt):
+        i = self._tab_en(evt.x, evt.y)
+        if i != -1 and i != self._activo:
+            self._activo = i
+            self._draw()
+            self._on_select(i)
+
+    def _on_motion(self, evt):
+        i = self._tab_en(evt.x, evt.y)
+        if i != self._hover:
+            self._hover = i
+            self._draw()
+
+    def _on_leave(self, _evt):
+        if self._hover != -1:
+            self._hover = -1
+            self._draw()
+
+
+def _generar_pill_glass(color_hex, ancho, alto, radio, brillo=1.0, oscurecer=0.0):
+    """
+    Genera una imagen de cápsula (pill) redondeada con apariencia de
+    vidrio ("glassmorphism"): degradado vertical en 'color_hex' + un
+    realce translúcido uniforme en la mitad superior. Se renderiza a 4x
+    y se reduce con LANCZOS para antialiasing real (mismo enfoque que las
+    pill-tabs de _TabBar). Función a nivel de módulo porque la usan tanto
+    _GlassButton como (potencialmente) otros widgets.
+    """
+    escala = 4
+    w, h, r = ancho * escala, alto * escala, radio * escala
+    r0, g0, b0 = ImageColor.getrgb(color_hex)
+
+    ys = np.linspace(0, 1, h)
+    base_rgb = np.array([r0, g0, b0], dtype=np.float64)
+    grad = np.empty((h, 3), dtype=np.float64)
+    for i, t in enumerate(ys):
+        if t < 0.45:
+            f = 1 - (t / 0.45)
+            col = base_rgb + (255 - base_rgb) * 0.14 * f
+        else:
+            f = (t - 0.45) / 0.55
+            col = base_rgb * (1 - 0.12 * f)
+        grad[i] = col
+    if oscurecer > 0:
+        grad = grad * (1 - oscurecer)
+    grad = np.clip(grad, 0, 255).astype(np.uint8)
+    grad_rows = np.repeat(grad[:, None, :], w, axis=1)
+    img_rgb = Image.fromarray(grad_rows, mode="RGB").convert("RGBA")
+
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=r, fill=255)
+
+    base = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    base.paste(img_rgb, (0, 0), mask)
+
+    # Brillo en banda horizontal, uniforme en x (no una elipse): así se ve
+    # bien sin importar el ancho real que termine teniendo el botón.
+    # Sutil a propósito -- un botón "técnico" plano, no una cápsula de
+    # vidrio abultada.
+    y_fin_brillo = max(1, int(h * 0.42))
+    brillo_arr = np.zeros((h, 1), dtype=np.uint8)
+    for yy in range(y_fin_brillo):
+        t = yy / y_fin_brillo
+        brillo_arr[yy, 0] = max(0, int(45 * brillo * (1 - t)))
+    brillo_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    brillo_rgba[:, :, 0:3] = 255
+    brillo_rgba[:, :, 3] = np.repeat(brillo_arr, w, axis=1)
+    brillo_layer = Image.fromarray(brillo_rgba, mode="RGBA")
+    brillo_masked = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    brillo_masked.paste(brillo_layer, (0, 0), mask)
+    out = Image.alpha_composite(base, brillo_masked)
+
+    borde = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    ImageDraw.Draw(borde).rounded_rectangle(
+        [1, 1, w - 2, h - 2], radius=r, outline=(255, 255, 255, 60), width=escala
+    )
+    out = Image.alpha_composite(out, borde)
+
+    return out.resize((ancho, alto), Image.LANCZOS)
+
+
+class _GlassButton(tk.Frame):
+    """
+    Botón con apariencia "vidrio" (glassmorphism): cápsula redondeada con
+    degradado y brillo translúcido, dibujada con PIL/antialiasing real
+    (mismo patrón que _TabBar) y regenerada a su tamaño EXACTO cada vez
+    que cambia el ancho — a diferencia de un elemento de imagen 9-slice de
+    ttk (que resultó distorsionar el tramo central al estirarse), este
+    enfoque simplemente vuelve a dibujar la imagen completa al tamaño real,
+    así que siempre se ve nítido sin importar el ancho del botón.
+
+    Expone .config()/.configure() compatibles con las llamadas que ya usa
+    el resto de la app (state="normal"/"disabled", text="...", command=...),
+    para no romper ningún código existente que llame
+    self.btn_proc.config(state=...) o self.btn_graficar.config(text=...).
+    """
+    def __init__(self, parent, text="", command=None, color_hex=None,
+                 fuente=FUENTE_UI, height=30, radius=9, state="normal", **kw):
+        kw.setdefault("bg", FONDO_PANEL)
+        kw.setdefault("height", height)
+        super().__init__(parent, **kw)
+        self.pack_propagate(False)
+
+        self._text = text
+        self._command = command
+        self._color = color_hex or TURQUESA_NEUROX
+        self._height = height
+        self._radius = radius
+        self._state = state
+        self._hover = False
+        self._pressed = False
+        self._photo = None
+        self._font = tkfont.Font(family=fuente, size=8, weight="bold")
+
+        self._cv = tk.Canvas(self, bg=FONDO_PANEL, bd=0, highlightthickness=0, height=height)
+        self._cv.pack(fill=tk.BOTH, expand=True)
+        self._cv.bind("<Configure>", lambda _e: self._draw())
+        self._cv.bind("<Button-1>", self._on_press)
+        self._cv.bind("<ButtonRelease-1>", self._on_release)
+        self._cv.bind("<Enter>", self._on_enter)
+        self._cv.bind("<Leave>", self._on_leave)
+
+    # ── API compatible con ttk.Button ───────────────────────────────────
+    def config(self, **kwargs):
+        cambio = False
+        if "text" in kwargs:
+            self._text = kwargs.pop("text")
+            cambio = True
+        if "state" in kwargs:
+            self._state = kwargs.pop("state")
+            cambio = True
+        if "command" in kwargs:
+            self._command = kwargs.pop("command")
+        if kwargs:
+            super().configure(**kwargs)
+        if cambio:
+            self._draw()
+
+    configure = config
+
+    def cget(self, key):
+        if key == "text":
+            return self._text
+        if key == "state":
+            return self._state
+        return super().cget(key)
+
+    # ── Dibujo ───────────────────────────────────────────────────────
+    def _draw(self):
+        cv = self._cv
+        w = cv.winfo_width()
+        h = cv.winfo_height() or self._height
+        if w < 2:
+            return
+
+        if self._state == "disabled":
+            color, brillo = "#9CA3AF", 0.5
+        elif self._pressed:
+            color, brillo = self._color, 0.5
+        elif self._hover:
+            color, brillo = self._color, 1.4
+        else:
+            color, brillo = self._color, 1.0
+
+        oscurecer = 0.12 if (self._pressed and self._state != "disabled") else 0.0
+        img = _generar_pill_glass(color, w, h, min(self._radius, h // 2), brillo=brillo, oscurecer=oscurecer)
+        self._photo = ImageTk.PhotoImage(img)   # referencia viva en self._photo
+
+        cv.delete("all")
+        cv.create_image(0, 0, anchor="nw", image=self._photo)
+        color_texto = "#FFFFFF" if self._state != "disabled" else "#F3F4F6"
+        cv.create_text(w // 2, h // 2, text=self._text, fill=color_texto,
+                       font=self._font, anchor="center")
+
+    # ── Interacción ───────────────────────────────────────────────────
+    def _on_enter(self, _evt):
+        if self._state != "disabled":
+            self._hover = True
+            self._draw()
+
+    def _on_leave(self, _evt):
+        self._hover = False
+        self._pressed = False
+        self._draw()
+
+    def _on_press(self, _evt):
+        if self._state != "disabled":
+            self._pressed = True
+            self._draw()
+
+    def _on_release(self, evt):
+        if self._state == "disabled":
+            return
+        estaba_presionado = self._pressed
+        self._pressed = False
+        self._draw()
+        if estaba_presionado and callable(self._command):
+            # Solo dispara si el clic se soltó todavía dentro del botón.
+            if 0 <= evt.x <= self._cv.winfo_width() and 0 <= evt.y <= self._cv.winfo_height():
+                self._command()
 
 
 class _LoadingOverlay:
@@ -614,7 +839,7 @@ class AppEEG:
             on_select=lambda i: self._activar_tab_global("grafica" if i == 0 else "analisis"),
             fuente=self.fuente_ui,
             fill_width=True,
-            active_fill=NARANJA_NEUROX,
+            active_fill=AZUL_NEUROX,
             active_fg="#FFFFFF",
         )
         self.tabbar_global.pack(fill=tk.X)
@@ -626,31 +851,35 @@ class AppEEG:
             command=self.seleccionar_carpeta,
             style="Secondary.TButton",
         )
-        self.btn_proc = ttk.Button(
+        self.btn_proc = _GlassButton(
             self.panel_izq_fijo_sup,
             text="Procesar seleccionados",
             command=self._reprocesar_forzado,
-            style="Accent.TButton",
+            color_hex=TURQUESA_NEUROX,
+            fuente=self.fuente_ui,
             state="disabled",
         )
-        self.btn_pdf = ttk.Button(
+        self.btn_pdf = _GlassButton(
             self.panel_izq_fijo_sup,
             text="Vista previa",
             command=self.abrir_informe,
+            color_hex=AZUL_MEDIO,
+            fuente=self.fuente_ui,
             state="disabled",
-            style="Primary.TButton",
         )
-        self.btn_consolidado = ttk.Button(
+        self.btn_consolidado = _GlassButton(
             self.panel_izq_fijo_sup,
             text="Descargar consolidado Excel",
             command=self.abrir_ventana_consolidado,
-            style="Secondary.TButton",
+            color_hex=TURQUESA_NEUROX,
+            fuente=self.fuente_ui,
         )
-        self.btn_consolidado_pdf = ttk.Button(
+        self.btn_consolidado_pdf = _GlassButton(
             self.panel_izq_fijo_sup,
             text="Descargar consolidado PDF",
             command=self.abrir_ventana_consolidado_pdf,
-            style="Secondary.TButton",
+            color_hex=TURQUESA_NEUROX,
+            fuente=self.fuente_ui,
         )
         self.btn_limpiar = ttk.Button(
             self.panel_izq_fijo_inf,
@@ -665,6 +894,9 @@ class AppEEG:
         self.btn_grafica      = self.tabbar_global
 
         ## Botón seleccionar carpeta (columna izquierda)
+        ttk.Label(
+            self.panel_izq_fijo_sup, text="DATOS DE ENTRADA", style="Subtle.TLabel"
+        ).pack(anchor="w", pady=(0, 4))
         self.btn_sel.pack(fill=tk.X, pady=(0, 4))
 
         ## Estado + progreso
@@ -675,6 +907,7 @@ class AppEEG:
         )
         self.progress_var = tk.DoubleVar(value=0.0)
         self.var_estado_trabajo = tk.StringVar(value="")
+
         self.lbl_estado_trabajo = ttk.Label(
             self.marco_estado_trabajo,
             textvariable=self.var_estado_trabajo,
@@ -784,7 +1017,7 @@ class AppEEG:
         self.lista.tag_configure(
             "noprocesado",
             font=(self.fuente_ui, 9),
-            foreground="#A8B4C8",
+            foreground=TEXTO_TERCIARIO,
         )
         self.lista.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -808,9 +1041,13 @@ class AppEEG:
         self.lista.bind("<Button-1>", _evitar_seleccion_vacia)
 
         ## Botones de archivo debajo de la lista
-        self.btn_proc.pack(fill=tk.X, pady=(8, 2))
-        self.btn_pdf.pack(fill=tk.X, pady=(2, 0))
-        self.btn_consolidado.pack(fill=tk.X, pady=(2, 0))
+        ttk.Separator(self.panel_izq_fijo_sup, orient="horizontal").pack(fill=tk.X, pady=(8, 8))
+        ttk.Label(
+            self.panel_izq_fijo_sup, text="PROCESAMIENTO", style="Subtle.TLabel"
+        ).pack(anchor="w", pady=(0, 4))
+        self.btn_proc.pack(fill=tk.X, pady=(0, 2))
+        self.btn_pdf.pack(fill=tk.X, pady=(6, 2))
+        self.btn_consolidado.pack(fill=tk.X, pady=(2, 2))
         self.btn_consolidado_pdf.pack(fill=tk.X, pady=(2, 0))
 
         ## Controles del visor
@@ -834,6 +1071,9 @@ class AppEEG:
         self.lbl_atipicos_grafica.pack_forget()
         self.lbl_sospechosos_grafica.pack_forget()
         ## Sección Calidad técnica — LabelFrame con toggle interno (vía _crear_bloque_resumen_calidad)
+        ttk.Label(
+            self.panel_izq_grafica, text="RESULTADOS", style="Subtle.TLabel"
+        ).pack(anchor="w", pady=(4, 4))
         self._calidad_wrapper_grafica = ttk.Frame(self.panel_izq_grafica, style="Sidebar.TFrame")
         self._calidad_wrapper_grafica.pack(fill=tk.X, pady=(0, 4))
         self.frm_resumen_calidad_grafica = self._crear_bloque_resumen_calidad(
@@ -868,7 +1108,7 @@ class AppEEG:
         
         self.frame_fft = ttk.Frame(_visor_body, style="Sidebar.TFrame")
         
-        self.lbl_fmax = ttk.Label(self.frame_fft, text="Límite Espectro (Hz):")
+        self.lbl_fmax = ttk.Label(self.frame_fft, text="FFT hasta (Hz):")
         self.lbl_fmax.pack(anchor="w", pady=(6, 0))
         
         self.spin_fmax = ttk.Spinbox(
@@ -1047,11 +1287,12 @@ class AppEEG:
         
 
         
-        self.btn_graficar = ttk.Button(
+        self.btn_graficar = _GlassButton(
             _visor_body,
             text="Graficar",
             command=self.graficar,
-            style="Accent.TButton"
+            color_hex=TURQUESA_NEUROX,
+            fuente=self.fuente_ui,
         )
         self.btn_graficar.pack(fill=tk.X, pady=(10, 0))
         self._marco_visor_visible = True
@@ -1133,8 +1374,8 @@ class AppEEG:
         self.modos_grafica_tabs = {
             "Multicanal": "Filtrado multicanal",
             "Canal Filtrado": "Canal filtrado",
-            "FFT": "FFT final",  # <--- Pestaña restaurada: FFT post-ICA+wavelet (no confundir con "Espectro PSD")
-            "Espectro PSD": "FFT filtrada",  # <--- Clave nueva, valor interno original
+            "FFT": "FFT final",  # Pestaña restaurada: FFT post-ICA+wavelet (no confundir con "Espectro PSD")
+            "Espectro PSD": "FFT filtrada",  # Clave nueva, valor interno original
             "Bandas": "Bandas",
             "Espectrograma": "Espectrograma",
         }
@@ -1214,6 +1455,7 @@ class AppEEG:
         
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
+        self._restilizar_toolbar_matplotlib(self.toolbar)
         
         self._activar_pan_tiempo()
 
@@ -1271,7 +1513,7 @@ class AppEEG:
         except Exception:
             familias = set()
 
-        for nombre in (FUENTE_UI, FUENTE_UI_FALLBACK):
+        for nombre in FUENTE_UI_CANDIDATOS:
             if str(nombre).lower() in familias:
                 return nombre
         return FUENTE_UI_FALLBACK if familias else FUENTE_UI
@@ -1286,90 +1528,111 @@ class AppEEG:
         fuente_ui = getattr(self, "fuente_ui", FUENTE_UI)
         fuente_base = (fuente_ui, 9)
         fuente_bold = (fuente_ui, 9, "bold")
-        fuente_titulo = (fuente_ui, 10, "bold")
+        fuente_titulo = (fuente_ui, 11, "bold")
 
-        self.style.configure(".", font=fuente_base)
+        # ---- Base --------------------------------------------------------
+        self.style.configure(".", font=fuente_base, bordercolor=BORDE_SUAVE)
         self.style.configure("TFrame", background=FONDO_PANEL)
         self.style.configure("NeuroX.TFrame", background=FONDO_APP)
         self.style.configure("Sidebar.TFrame", background=FONDO_PANEL)
         self.style.configure("Card.TFrame", background=FONDO_PANEL)
 
+        # ---- Etiquetas -----------------------------------------------------
         self.style.configure("TLabel", background=FONDO_PANEL, foreground=TEXTO_PRINCIPAL, font=fuente_base)
         self.style.configure("Sidebar.TLabel", background=FONDO_PANEL, foreground=TEXTO_SECUNDARIO, font=fuente_base)
         self.style.configure("Header.TLabel", background=FONDO_PANEL, foreground=AZUL_NEUROX, font=fuente_titulo)
         self.style.configure("Logo.TLabel", background=FONDO_PANEL, foreground=AZUL_NEUROX, font=(fuente_ui, 19, "bold"))
-        self.style.configure("Subtle.TLabel", background=FONDO_PANEL, foreground=TEXTO_SECUNDARIO, font=(fuente_ui, 8))
+        self.style.configure("Subtle.TLabel", background=FONDO_PANEL, foreground=TEXTO_TERCIARIO, font=(fuente_ui, 8))
 
-        self.style.configure("TLabelframe", background=FONDO_PANEL, borderwidth=1, relief="solid",
-                             bordercolor=BORDE_SUAVE)
+        # ---- Tarjetas (LabelFrame) — micro-borde 1px, esquinas limpias ----
+        self.style.configure(
+            "TLabelframe", background=FONDO_PANEL, borderwidth=1, relief="solid",
+            bordercolor=BORDE_SUAVE, padding=12,
+        )
         self.style.configure("TLabelframe.Label", background=FONDO_PANEL, foreground=AZUL_NEUROX, font=fuente_bold)
-        self.style.configure("Card.TLabelframe", background=FONDO_PANEL, borderwidth=1, relief="solid",
-                             bordercolor=BORDE_SUAVE)
+        self.style.configure(
+            "Card.TLabelframe", background=FONDO_PANEL, borderwidth=1, relief="solid",
+            bordercolor=BORDE_SUAVE, padding=12,
+        )
         self.style.configure("Card.TLabelframe.Label", background=FONDO_PANEL, foreground=AZUL_NEUROX, font=fuente_bold)
 
+        # ---- Botones ---------------------------------------------------
+        # Primary: acción principal de marca (azul cobalto sólido)
         self.style.configure(
             "Primary.TButton",
             font=fuente_bold,
-            padding=(12, 8),
+            padding=(14, 9),
             background=AZUL_NEUROX,
             foreground="#FFFFFF",
-            borderwidth=0
+            borderwidth=0,
+            relief="flat",
+            focusthickness=0,
         )
         self.style.map(
             "Primary.TButton",
             background=[
-                ("disabled", "#B8C4D6"),
-                ("pressed", "#04133D"),
-                ("active", "#0A257A"),
+                ("disabled", "#C7C8E8"),
+                ("pressed", "#312E81"),
+                ("active", "#4338CA"),
             ],
-            foreground=[("disabled", "#FFFFFF")]
+            foreground=[("disabled", "#FFFFFF")],
         )
 
+        # Accent: acción principal destacada (turquesa vibrante — CTA)
         self.style.configure(
             "Accent.TButton",
             font=fuente_bold,
-            padding=(12, 8),
-            background=NARANJA_NEUROX,
+            padding=(14, 9),
+            background=TURQUESA_NEUROX,
             foreground="#FFFFFF",
-            borderwidth=0
+            borderwidth=0,
+            relief="flat",
+            focusthickness=0,
         )
         self.style.map(
             "Accent.TButton",
             background=[
-                ("disabled", "#F7C9A4"),
-                ("pressed", "#D85700"),
-                ("active", "#FF7F26"),
+                ("disabled", "#A7E8DE"),
+                ("pressed", "#0F766E"),
+                ("active", "#14B8A6"),
             ],
-            foreground=[("disabled", "#FFFFFF")]
+            foreground=[("disabled", "#FFFFFF")],
         )
 
+        # Secondary: acción neutra (superficie clara, texto de marca)
         self.style.configure(
             "Secondary.TButton",
             font=fuente_bold,
-            padding=(12, 8),
-            background="#E8EEF8",
+            padding=(14, 9),
+            background=FONDO_PANEL_SUAVE,
             foreground=AZUL_NEUROX,
-            borderwidth=0
+            borderwidth=1,
+            relief="solid",
+            bordercolor=BORDE_SUAVE,
+            focusthickness=0,
         )
         self.style.map(
             "Secondary.TButton",
             background=[
-                ("disabled", "#EEF2F7"),
-                ("pressed", "#D5E1F4"),
-                ("active", "#DCE8FF"),
+                ("disabled", FONDO_PANEL_SUAVE),
+                ("pressed", "#E0E1FB"),
+                ("active", FONDO_HOVER),
             ],
-            foreground=[("disabled", "#8191A8")]
+            bordercolor=[("active", AZUL_MEDIO)],
+            foreground=[("disabled", TEXTO_TERCIARIO)],
         )
 
+        # Danger: acción destructiva/alerta (contorno neutro -> rojo en hover)
         self.style.configure(
             "Danger.TButton",
             font=fuente_bold,
-            padding=(12, 8),
+            padding=(14, 9),
             background=FONDO_PANEL,
             foreground=TEXTO_SECUNDARIO,
             borderwidth=1,
             relief="solid",
             bordercolor=BORDE_SUAVE,
+            focusthickness=0,
         )
         self.style.map(
             "Danger.TButton",
@@ -1378,50 +1641,74 @@ class AppEEG:
                 ("pressed", "#B91C1C"),
                 ("active", "#DC2626"),
             ],
+            bordercolor=[("active", "#DC2626"), ("pressed", "#B91C1C")],
             foreground=[
-                ("disabled", TEXTO_SECUNDARIO),
+                ("disabled", TEXTO_TERCIARIO),
                 ("pressed", "#FFFFFF"),
                 ("active", "#FFFFFF"),
             ],
         )
 
+        # ---- Barra de progreso -------------------------------------------
         self.style.configure(
             "NeuroX.Horizontal.TProgressbar",
             troughcolor=FONDO_PANEL_SUAVE,
             background=AZUL_MEDIO,
             lightcolor=AZUL_MEDIO,
-            darkcolor=AZUL_NEUROX,
-            bordercolor=BORDE_SUAVE,
-            thickness=10
+            darkcolor=AZUL_MEDIO,
+            bordercolor=FONDO_PANEL_SUAVE,
+            thickness=8,
         )
+
+        # ---- Scrollbars: carril ultra-delgado -----------------------------
         try:
             self.style.configure(
                 "NeuroX.Vertical.TScrollbar",
                 gripcount=0,
-                background="#CBD5E1",
-                darkcolor="#CBD5E1",
-                lightcolor="#CBD5E1",
-                troughcolor="#F1F5F9",
-                bordercolor="#F1F5F9",
-                arrowcolor=AZUL_NEUROX,
+                background="#C9CADD",
+                darkcolor="#C9CADD",
+                lightcolor="#C9CADD",
+                troughcolor=FONDO_APP,
+                bordercolor=FONDO_APP,
+                arrowcolor=TEXTO_TERCIARIO,
                 relief="flat",
-                arrowsize=11,
-                width=10
+                arrowsize=9,
+                width=7,
+            )
+            self.style.map(
+                "NeuroX.Vertical.TScrollbar",
+                background=[("active", AZUL_MEDIO)],
+                arrowcolor=[("active", AZUL_MEDIO)],
             )
             self.style.configure(
                 "NeuroX.Horizontal.TScrollbar",
-                background="#CBD5E1",
-                darkcolor="#CBD5E1",
-                lightcolor="#CBD5E1",
-                troughcolor="#F1F5F9",
-                bordercolor="#F1F5F9",
-                arrowcolor=AZUL_NEUROX,
+                background="#C9CADD",
+                darkcolor="#C9CADD",
+                lightcolor="#C9CADD",
+                troughcolor=FONDO_APP,
+                bordercolor=FONDO_APP,
+                arrowcolor=TEXTO_TERCIARIO,
                 relief="flat",
-                arrowsize=11
+                arrowsize=9,
+                width=7,
+            )
+            self.style.map(
+                "NeuroX.Horizontal.TScrollbar",
+                background=[("active", AZUL_MEDIO)],
+                arrowcolor=[("active", AZUL_MEDIO)],
+            )
+            # También refina la scrollbar ttk por defecto (widgets que no
+            # usan el estilo "NeuroX.*" explícitamente).
+            self.style.configure(
+                "Vertical.TScrollbar", gripcount=0,
+                background="#C9CADD", darkcolor="#C9CADD", lightcolor="#C9CADD",
+                troughcolor=FONDO_APP, bordercolor=FONDO_APP,
+                arrowcolor=TEXTO_TERCIARIO, relief="flat", arrowsize=9, width=7,
             )
         except Exception:
             pass
 
+        # ---- Notebook / tabs nativos --------------------------------------
         self.style.configure("TNotebook", background=FONDO_APP, borderwidth=0)
         self.style.configure("NeuroX.TNotebook", background=FONDO_APP, borderwidth=0, tabmargins=(0, 0, 0, 0))
         # Notebook sin tab-strip visual (los tabs los maneja _TabBar)
@@ -1433,9 +1720,9 @@ class AppEEG:
             pass
         self.style.configure(
             "NeuroX.TNotebook.Tab",
-            background="#E8EEF8",
+            background=FONDO_PANEL_SUAVE,
             foreground=TEXTO_SECUNDARIO,
-            padding=(14, 7),
+            padding=(16, 8),
             font=fuente_bold,
             borderwidth=0,
         )
@@ -1443,7 +1730,7 @@ class AppEEG:
             "NeuroX.TNotebook.Tab",
             background=[
                 ("selected", AZUL_NEUROX),
-                ("active", "#DCE8FF"),
+                ("active", FONDO_HOVER),
             ],
             foreground=[
                 ("selected", "#FFFFFF"),
@@ -1452,52 +1739,220 @@ class AppEEG:
             expand=[("selected", (0, 0, 0, 2))],
         )
 
+        # ---- Combobox / Spinbox: campo limpio con foco visible ------------
         self.style.configure(
             "TCombobox",
-            padding=4,
+            padding=6,
             fieldbackground=FONDO_PANEL,
             background=FONDO_PANEL,
-            foreground=TEXTO_PRINCIPAL
+            foreground=TEXTO_PRINCIPAL,
+            bordercolor=BORDE_SUAVE,
+            lightcolor=FONDO_PANEL,
+            darkcolor=FONDO_PANEL,
+            arrowcolor=TEXTO_SECUNDARIO,
+            relief="flat",
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", FONDO_PANEL), ("disabled", FONDO_PANEL_SUAVE)],
+            bordercolor=[("focus", AZUL_MEDIO), ("hover", "#B6B8E6")],
+            arrowcolor=[("focus", AZUL_MEDIO), ("disabled", TEXTO_TERCIARIO)],
+            foreground=[("disabled", TEXTO_TERCIARIO)],
         )
         self.style.configure(
             "TSpinbox",
-            padding=4,
+            padding=6,
             fieldbackground=FONDO_PANEL,
             background=FONDO_PANEL,
-            foreground=TEXTO_PRINCIPAL
+            foreground=TEXTO_PRINCIPAL,
+            bordercolor=BORDE_SUAVE,
+            arrowcolor=TEXTO_SECUNDARIO,
+            relief="flat",
         )
-        self.style.configure("TCheckbutton", background=FONDO_PANEL, foreground=TEXTO_PRINCIPAL, font=fuente_base)
+        self.style.map(
+            "TSpinbox",
+            bordercolor=[("focus", AZUL_MEDIO), ("hover", "#B6B8E6")],
+            arrowcolor=[("focus", AZUL_MEDIO)],
+            fieldbackground=[("disabled", FONDO_PANEL_SUAVE)],
+        )
+
+        # ---- Checkbutton: indicador claro en cada estado ------------------
+        self.style.configure(
+            "TCheckbutton",
+            background=FONDO_PANEL,
+            foreground=TEXTO_PRINCIPAL,
+            font=fuente_base,
+            focuscolor=FONDO_PANEL,
+        )
+        self.style.map(
+            "TCheckbutton",
+            foreground=[("disabled", TEXTO_TERCIARIO), ("active", AZUL_NEUROX)],
+            indicatorcolor=[("selected", AZUL_MEDIO), ("!selected", FONDO_PANEL)],
+        )
+
+        # ---- Treeview (lista de archivos) ---------------------------------
         self.style.configure(
             "NeuroX.Treeview",
-            rowheight=24,
+            rowheight=26,
             font=(fuente_ui, 9),
             background=FONDO_PANEL,
             fieldbackground=FONDO_PANEL,
             foreground=TEXTO_PRINCIPAL,
             borderwidth=0,
-            relief="flat"
+            relief="flat",
         )
         self.style.map(
             "NeuroX.Treeview",
             background=[("selected", AZUL_MEDIO)],
-            foreground=[("selected", "#FFFFFF")]
+            foreground=[("selected", "#FFFFFF")],
         )
         self.style.configure(
             "NeuroX.Treeview.Heading",
             font=(fuente_ui, 9, "bold"),
-            background="#E8EEF7",
+            background=FONDO_PANEL_SUAVE,
             foreground=AZUL_NEUROX,
             borderwidth=0,
             relief="flat",
-            padding=(6, 4)
+            padding=(8, 6),
         )
         self.style.map(
             "NeuroX.Treeview.Heading",
-            background=[("active", "#DCE8FF")],
-            foreground=[("active", AZUL_NEUROX)]
+            background=[("active", FONDO_HOVER)],
+            foreground=[("active", AZUL_NEUROX)],
         )
         self.style.configure("Treeview", rowheight=24, font=(fuente_ui, 8.5))
         self.style.configure("Treeview.Heading", font=(fuente_ui, 8.5, "bold"))
+
+        # ---- Tema de Matplotlib embebido (coherente con la UI) ------------
+        self._aplicar_tema_matplotlib()
+
+    def _aplicar_tema_matplotlib(self):
+        """
+        Ajusta rcParams globales de Matplotlib para que ejes, títulos,
+        rejillas y leyendas de TODAS las gráficas embebidas usen la misma
+        paleta y tipografía que el resto de la interfaz. Es puramente
+        visual (rcParams), así que no toca ninguna lógica de cálculo ni de
+        graficación existente: cada gráfica sigue calculando y dibujando
+        exactamente lo mismo, solo cambia su apariencia por defecto.
+        """
+        fuente_ui = getattr(self, "fuente_ui", FUENTE_UI)
+        # NOTA: aquí se usa una lista de fuentes "seguras" para Matplotlib,
+        # NO el nombre resuelto por Tkinter (self.fuente_ui). Tkinter y
+        # Matplotlib detectan fuentes instaladas de formas distintas e
+        # independientes: Tkinter puede reportar como "disponible" una
+        # fuente (p. ej. "Segoe UI Variable Text") que Matplotlib no logra
+        # localizar como archivo real, lo que genera el aviso repetido
+        # "findfont: Font family '...' not found." en la consola. Esta
+        # lista evita ese cruce: Matplotlib prueba cada una en orden y usa
+        # la primera que sí encuentra; "DejaVu Sans" viene empaquetada con
+        # Matplotlib, así que siempre hay una opción válida sin avisos.
+        # Lista de fuentes reales para Windows (evita el aviso repetido
+        # "findfont: Font family 'Helvetica Neue' not found." -- esa es una
+        # fuente de macOS que nunca existe en Windows, así que no tiene
+        # sentido dejarla en la lista de opciones a probar).
+        fuentes_matplotlib = ["Segoe UI", "Arial", "DejaVu Sans"]
+        # Paleta de líneas acorde al tema índigo/turquesa de la app, en vez
+        # del ciclo por defecto de Matplotlib (azul/naranja/verde/rojo/café/
+        # oliva...). Se usan 8 tonos distinguibles entre sí pero todos
+        # dentro de la misma familia fría índigo→violeta→turquesa, para que
+        # canales adyacentes en la vista multicanal sigan siendo fáciles de
+        # diferenciar sin salirse de la paleta de marca.
+        ciclo_colores_neurox = [
+            "#4F46E5",  # índigo
+            "#0D9488",  # turquesa
+            "#7C3AED",  # violeta
+            "#0891B2",  # cian
+            "#6366F1",  # índigo claro
+            "#059669",  # verde azulado
+            "#4338CA",  # índigo oscuro
+            "#14B8A6",  # turquesa claro
+        ]
+        try:
+            from cycler import cycler
+            ciclo = cycler(color=ciclo_colores_neurox)
+        except Exception:
+            ciclo = None
+        try:
+            plt.rcParams.update({
+                "font.family": fuentes_matplotlib,
+                "font.size": 9,
+                "text.color": TEXTO_PRINCIPAL,
+                "axes.facecolor": "white",
+                "axes.edgecolor": BORDE_SUAVE,
+                "axes.labelcolor": TEXTO_SECUNDARIO,
+                "axes.titlecolor": AZUL_NEUROX,
+                "axes.titleweight": "bold",
+                "axes.titlesize": 11,
+                "axes.labelsize": 9,
+                "axes.linewidth": 0.9,
+                **({"axes.prop_cycle": ciclo} if ciclo is not None else {}),
+                "axes.grid": True,
+                "grid.color": BORDE_SUAVE,
+                "grid.linestyle": "--",
+                "grid.linewidth": 0.7,
+                "grid.alpha": 0.55,
+                "xtick.color": TEXTO_SECUNDARIO,
+                "ytick.color": TEXTO_SECUNDARIO,
+                "xtick.labelsize": 8,
+                "ytick.labelsize": 8,
+                "legend.frameon": False,
+                "legend.fontsize": 8,
+                "figure.facecolor": "white",
+                "savefig.facecolor": "white",
+            })
+        except Exception:
+            pass
+
+    def _restilizar_toolbar_matplotlib(self, toolbar):
+        """
+        NavigationToolbar2Tk usa widgets de Tk clásico (Frame/Button/Label),
+        no ttk, así que ttk.Style no lo alcanza. Aquí se retocan colores y
+        bordes a mano para que combine con el resto de la interfaz. Es
+        puramente cosmético: no se toca ningún comando ni comportamiento
+        del toolbar (zoom, pan, guardar, etc. siguen funcionando igual).
+        """
+        try:
+            toolbar.configure(background=FONDO_PANEL)
+        except Exception:
+            pass
+
+        def _restilizar(widget):
+            try:
+                clase = widget.winfo_class()
+            except Exception:
+                clase = ""
+            try:
+                if clase == "Button":
+                    widget.configure(
+                        background=FONDO_PANEL,
+                        activebackground=FONDO_HOVER,
+                        foreground=TEXTO_SECUNDARIO,
+                        activeforeground=AZUL_NEUROX,
+                        relief="flat",
+                        bd=0,
+                        highlightthickness=0,
+                    )
+                elif clase == "Checkbutton":
+                    widget.configure(
+                        background=FONDO_PANEL,
+                        activebackground=FONDO_HOVER,
+                        selectcolor=FONDO_HOVER,
+                        foreground=TEXTO_SECUNDARIO,
+                        activeforeground=TURQUESA_NEUROX,
+                        relief="flat",
+                        bd=0,
+                        highlightthickness=0,
+                    )
+                elif clase == "Label":
+                    widget.configure(background=FONDO_PANEL, foreground=TEXTO_SECUNDARIO)
+                elif clase == "Frame":
+                    widget.configure(background=FONDO_PANEL)
+            except Exception:
+                pass
+            for hijo in widget.winfo_children():
+                _restilizar(hijo)
+
+        _restilizar(toolbar)
 
     def _crear_encabezado_neurox(self):
         self.frame_marca = ttk.Frame(self.panel_izq_fijo_sup, style="Sidebar.TFrame", padding=(2, 0, 2, 6))
@@ -2617,8 +3072,8 @@ class AppEEG:
             "Multicanal": "Filtrado multicanal",
             "multicanal": "Filtrado multicanal",
             "Canal Filtrado": "Canal filtrado",
-            "FFT": "FFT filtrada",             # <--- Soporte legado
-            "Espectro PSD": "FFT filtrada",    # <--- La pestaña nueva ejecuta la función correcta
+            "FFT": "FFT filtrada",             # Soporte legado
+            "Espectro PSD": "FFT filtrada",    # La pestaña nueva ejecuta la función correcta
             "Espectrograma": "Espectrograma",
             "espectrograma": "Espectrograma",
         }
@@ -2725,13 +3180,13 @@ class AppEEG:
             self.frame_fft.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
             self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
             self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
-
+    
         elif modo == "FFT final":
             self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
             self.frame_fft.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
             self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
             self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
-    
+
         elif modo == "Canal filtrado":
             self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
             self.frame_ventana.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
@@ -2819,7 +3274,7 @@ class AppEEG:
                 canal = idx + 1
                 nombre = self.nombres_canales[idx]
                 self._graficar_fft_filtrada(idx, canal, nombre)
-
+    
             elif modo == "FFT final":
                 idx = self.combo_canal.current()
                 if idx < 0:
@@ -4766,6 +5221,7 @@ class AppEEG:
         total = len(nombres_archivo)
         resultados = []  # (nombre, ok, error_o_None)
         ultimo_ok = None  # (nombre, carpeta_cache, ruta_pdf)
+        t_inicio_lote = time.time()
 
         def logger(msg):
             if self._cerrando:
@@ -4829,6 +5285,13 @@ class AppEEG:
             exitosos = [n for n, ok, _ in resultados if ok]
             fallidos = [(n, err) for n, ok, err in resultados if not ok]
 
+            segundos_totales = time.time() - t_inicio_lote
+            mins, segs = divmod(int(round(segundos_totales)), 60)
+            if mins > 0:
+                texto_tiempo = f"{mins} min {segs} s"
+            else:
+                texto_tiempo = f"{segs} s"
+
             # Deja la interfaz mostrando el último archivo procesado con éxito
             if ultimo_ok:
                 nombre_archivo, carpeta_cache, ruta_pdf = ultimo_ok
@@ -4863,24 +5326,26 @@ class AppEEG:
                 detalle = "\n".join(f"• {n}: {err}" for n, err in fallidos[:10])
                 if len(fallidos) > 10:
                     detalle += f"\n... y {len(fallidos) - 10} más."
-                self._set_barra(f"Lote terminado con errores: {len(exitosos)} OK, {len(fallidos)} con error.")
-                self.log(f"[Aviso] Lote terminado: {len(exitosos)} OK, {len(fallidos)} con error.")
+                self._set_barra(f"Lote terminado con errores: {len(exitosos)} OK, {len(fallidos)} con error. ({texto_tiempo})")
+                self.log(f"[Aviso] Lote terminado: {len(exitosos)} OK, {len(fallidos)} con error. Tiempo total: {texto_tiempo}.")
                 messagebox.showwarning(
                     "Procesamiento finalizado con errores",
-                    f"Se procesaron {len(exitosos)} de {total} archivo(s) correctamente.\n\n"
+                    f"Se procesaron {len(exitosos)} de {total} archivo(s) correctamente.\n"
+                    f"Tiempo total: {texto_tiempo}.\n\n"
                     f"Con errores ({len(fallidos)}):\n{detalle}\n\n"
                     f"Usa 'Vista previa' para ver el último informe generado con éxito."
                 )
             else:
-                self._set_barra(f"Lote terminado: {len(exitosos)}/{total} procesado(s) con éxito.")
-                self.log(f"[OK] Lote terminado: {len(exitosos)}/{total} procesado(s) con éxito.")
+                self._set_barra(f"Lote terminado: {len(exitosos)}/{total} procesado(s) con éxito. ({texto_tiempo})")
+                self.log(f"[OK] Lote terminado: {len(exitosos)}/{total} procesado(s) con éxito. Tiempo total: {texto_tiempo}.")
                 if total == 1:
                     mensaje = "El archivo se procesó correctamente y el informe está listo."
                 else:
                     mensaje = f"Se procesaron correctamente los {len(exitosos)} archivos seleccionados."
                 messagebox.showinfo(
                     "Procesado con éxito",
-                    f"{mensaje}\n\nUsa 'Vista previa' para ver el último informe generado."
+                    f"{mensaje}\nTiempo total: {texto_tiempo}.\n\n"
+                    f"Usa 'Vista previa' para ver el último informe generado."
                 )
 
         try:
@@ -6312,7 +6777,7 @@ class AppEEG:
                 ax.text(
                     0.5, 0.5,
                     "⏳ Calculando Calidad Técnica de la señal...\nPor favor espere un momento.",
-                    ha="center", va="center", fontsize=11, color="#1a5276"
+                    ha="center", va="center", fontsize=11, color=AZUL_NEUROX
                 )
                 self.canvas_calidad.draw()
                 self.canvas_calidad.flush_events()
@@ -6861,7 +7326,7 @@ class AppEEG:
                     ax.text(
                         0.5, 0.5,
                         "⏳ Procesando análisis Welch y Calidad Técnica...\nPor favor espere un momento.",
-                        ha="center", va="center", fontsize=11, color="#1a5276"
+                        ha="center", va="center", fontsize=11, color=AZUL_NEUROX
                     )
                     self.canvas_welch.draw()
                     self.canvas_welch.flush_events()  
@@ -6943,7 +7408,7 @@ class AppEEG:
                     ax.text(
                         0.5, 0.5,
                         "⏳ Calculando proporción de bandas...\nPor favor espere un momento.",
-                        ha="center", va="center", fontsize=11, color="#1a5276"
+                        ha="center", va="center", fontsize=11, color=AZUL_NEUROX
                     )
                     self.canvas_ratios.draw()
                     self.canvas_ratios.flush_events()
@@ -8398,7 +8863,11 @@ class AppEEG:
         self._ax_main.set_yticks(offsets)
         self._ax_main.set_yticklabels(self.nombres_canales, fontsize=6)
         self._ax_main.invert_yaxis()
-        self._ax_main.grid(True, alpha=0.25)
+        # linestyle="-" explícito: con ~64 canales apilados muy juntos, la
+        # cuadrícula punteada global (más vistosa en gráficas con pocas
+        # líneas) generaba un efecto de "ruido" visual sobre las señales.
+        # Aquí se necesita una referencia horizontal sólida y discreta.
+        self._ax_main.grid(True, alpha=0.2, linestyle="-", linewidth=0.6)
         self._ax_main.set_xlim(float(x[0]), float(x[-1]))
 
         self._vista_actual = "multicanal"
@@ -8618,8 +9087,7 @@ class AppEEG:
        
     def _graficar_fft_filtrada(self, idx, canal, nombre_canal):
         from matplotlib.patches import Patch
-        from scipy.ndimage import gaussian_filter1d
-        
+
         if not self.cache_ultimo:
             return
 
@@ -8628,9 +9096,14 @@ class AppEEG:
 
         try:
             freqs = np.load(ruta_f, mmap_mode="r")
-            amps = np.load(ruta_a, mmap_mode="r")
         except Exception as e:
             messagebox.showerror("Error", f"No pude cargar las frecuencias de Welch:\n{e}")
+            return
+
+        try:
+            amps = np.load(ruta_a, mmap_mode="r")
+        except Exception as e:
+            messagebox.showerror("Error", f"No pude cargar la PSD de Welch:\n{e}")
             return
 
         self.log("[OK] Densidad Espectral (Welch) cargada desde cache.")
@@ -8643,35 +9116,14 @@ class AppEEG:
             fmax = float(self.var_fmax.get())
         except Exception:
             fmax = 40.0
-            
-        # 1. Incluimos desde 0.0 Hz para que la curva nazca pegada a la pared izquierda
-        mask = (freqs >= 0.0) & (freqs <= fmax)
-        x_raw = np.asarray(freqs[mask], dtype=np.float64)
-        y_raw = np.asarray(amps[idx, mask], dtype=np.float64)
 
-        # 2. Reconstruimos el componente de 0.0 Hz copiando el primer bin válido.
-        # Esto evita caídas artificiales y asegura que al aplicar el filtro, la 
-        # curva nazca redondeada y continua desde el eje Y.
-        if len(x_raw) > 1 and x_raw[0] == 0.0:
-            y_raw[0] = y_raw[1]
+        # Nos enfocamos en la región clínica útil (0.5 Hz en adelante)
+        mask = (freqs >= 0.5) & (freqs <= fmax)
 
-        # 3. Suavizado matemático para una curva natural y fluida
-        y_smooth = gaussian_filter1d(y_raw, sigma=0.6)
+        x = np.asarray(freqs[mask], dtype=np.float64)
+        y = np.asarray(amps[idx, mask], dtype=np.float64)
 
-        # 4. Inyección de puntos de corte exactos para que no haya huecos en el sombreado
-        puntos_corte = [0.5, 4.0, 8.0, 13.0]
-        for corte in puntos_corte:
-            if 0.0 < corte < fmax and corte not in x_raw:
-                y_corte = np.interp(corte, x_raw, y_smooth)
-                idx_insert = np.searchsorted(x_raw, corte)
-                x_raw = np.insert(x_raw, idx_insert, corte)
-                y_smooth = np.insert(y_smooth, idx_insert, y_corte)
-
-        x = x_raw
-        
-        # Volvemos a Escala Lineal para que el suelo natural sea 0 y las bandas no se aplasten
-        y = y_smooth  
-        
+        # Unidades correctas para PSD (Potencia por Hz)
         unidad_fft = self._leer_unidad_fft_desde_cache()
         if unidad_fft == "µV":
             ylabel = "Densidad Espectral (µV²/Hz)"
@@ -8681,108 +9133,70 @@ class AppEEG:
             ylabel = "Densidad Espectral (u.a.)"
 
         self.fig.clear()
-        
-        # Tema claro y profesional
-        color_fondo = "#FFFFFF"
-        color_grid = "#E5E7EB"
-        color_texto = "#4B5563"
-        color_titulo = "#111827"
-        
-        self.fig.patch.set_facecolor(color_fondo)
         ax = self.fig.add_subplot(111)
-        ax.set_facecolor(color_fondo)
 
+        # Límites IFCN y colores clínicos
         bandas_clinicas = [
-            ("Delta (0.5-4 Hz)", 0.5, 4.0, "#0284C7"),  
-            ("Theta (4-8 Hz)",   4.0, 8.0, "#059669"),  
-            ("Alfa (8-13 Hz)",   8.0, 13.0, "#D97706"), 
-            ("Beta (13-30 Hz)",  13.0, 30.0, "#9333EA") 
+            ("Delta (0.5-4 Hz)", 0.5, 4.0, "#4682B4"),  # Azul acero
+            ("Theta (4-8 Hz)",   4.0, 8.0, "#3CB371"),  # Verde mar
+            ("Alfa (8-13 Hz)",   8.0, 13.0, "#FFD700"), # Dorado
+            ("Beta (13-30 Hz)",  13.0, 30.0, "#CD5C5C") # Coral
         ]
 
+        # 1. Trazar la línea principal de la curva suave
+        ax.plot(x, y, color='#2c3e50', linewidth=1.2)
+
+        # 2. Rellenar el área bajo la curva (sombreado por bandas)
         handles = []
-        
-        # 5. Dibujar la línea de la porción 0.0 a 0.5 Hz sin sombreado
-        mask_pre = (x <= 0.5)
-        if np.any(mask_pre):
-            ax.plot(x[mask_pre], y[mask_pre], color="#0284C7", linewidth=1.6, zorder=4)
-
-        # 6. Dibujar las bandas y rellenar estrictamente hasta 0
         for nombre, f0, f1, col in bandas_clinicas:
-            if f0 >= fmax:
-                continue
-            
-            f1_limit = min(f1, fmax)
-            mask_banda = (x >= f0) & (x <= f1_limit)
-            
-            if np.any(mask_banda):
-                x_b = x[mask_banda]
-                y_b = y[mask_banda]
-                
-                ax.plot(x_b, y_b, color=col, linewidth=1.6, zorder=4)
-                ax.fill_between(x_b, 0, y_b, color=col, alpha=0.20, edgecolor="none", zorder=3)
-                
-                handles.append(Patch(facecolor=col, edgecolor="none", label=nombre, alpha=0.85))
+            if f0 < fmax:
+                # Máscara estricta para sombrear solo el ancho de esta banda
+                mask_banda = (x >= f0) & (x < min(f1, fmax))
+                if np.any(mask_banda):
+                    ax.fill_between(x[mask_banda], 0, y[mask_banda], color=col, alpha=0.5)
+                    # Añadir parche de color para la leyenda
+                    handles.append(Patch(facecolor=col, edgecolor="gray", label=nombre, alpha=0.8))
 
-        # 7. Escala dinámica inteligente: Zoom automático
-        # Ignoramos el pico masivo inicial para que Alfa y Beta siempre se vean grandes y legibles.
-        PERCENTIL_ESCALA_PSD = 99.5
-        MARGEN_ESCALA_PSD = 1.25
-
+        # 3. Ajuste dinámico del techo Y (Ignorando ruido ocular sub-hertz)
         if len(y) > 0:
+            # Calculamos el techo Y ignorando las frecuencias < 1.0 Hz.
+            # En canales frontales (FP1/FP2), el sudor y los movimientos oculares
+            # a 0.5Hz son gigantes y aplastan visualmente la gráfica.
             mask_escala = (x >= 1.0) & (x <= fmax)
+
             if np.any(mask_escala):
-                techo_real = float(np.percentile(y[mask_escala], PERCENTIL_ESCALA_PSD)) * MARGEN_ESCALA_PSD
+                techo_real = float(np.max(y[mask_escala])) * 1.15
             else:
-                techo_real = float(np.max(y)) * MARGEN_ESCALA_PSD
-                
+                techo_real = float(np.max(y)) * 1.15
+
             techo_real = max(techo_real, 1e-6)
             ax.set_ylim(0, techo_real)
-            
-            # Si el pico de Delta es tan gigante que sale del gráfico, mostramos un aviso elegante
-            pico_real = float(np.max(y))
-            if pico_real > techo_real:
-                idx_pico = int(np.argmax(y))
-                ax.annotate(
-                    f"⚠ pico fuera de escala: {pico_real:.1f} a {x[idx_pico]:.1f} Hz",
-                    xy=(x[idx_pico], techo_real), xytext=(0.5, 0.95),
-                    textcoords="axes fraction", ha="center", va="top",
-                    fontsize=8, color="#EF476F",
-                    arrowprops=dict(arrowstyle="->", color="#EF476F", lw=1),
-                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#EF476F", alpha=0.85),
-                    zorder=5
-                )
 
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.spines["left"].set_color("#D1D5DB")
-        ax.spines["bottom"].set_color("#D1D5DB")
-        ax.tick_params(colors=color_texto, labelsize=9)
-
+        # 4. Configurar Leyenda, Ejes y Títulos
         if handles:
-            legend = ax.legend(
-                handles=handles, loc="upper right", title="Dominio de Frecuencia",
-                fontsize=9, title_fontsize=10, frameon=True,
-                facecolor="#FFFFFF", edgecolor="#E5E7EB", labelcolor=color_texto
+            ax.legend(
+                handles=handles,
+                loc="upper right",
+                title="Bandas Clínicas",
+                fontsize=8,
+                title_fontsize=9,
+                frameon=True
             )
-            legend.get_title().set_color(color_titulo)
 
-        ax.set_title(f"Densidad Espectral (Welch PSD) - Canal {nombre_canal}", 
-                     fontsize=11, pad=15, color=color_titulo, fontweight="bold")
-        ax.set_xlabel("Frecuencia (Hz)", fontsize=10, color=color_texto, labelpad=8)
-        ax.set_ylabel(ylabel, fontsize=10, color=color_texto, labelpad=8)
-        
-        ax.grid(True, linestyle='--', alpha=0.6, color=color_grid)
+        ax.set_title(f"Densidad Espectral (Welch PSD) - Canal {nombre_canal} (#{canal})")
+        ax.set_xlabel("Frecuencia (Hz)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
 
-        # 8. Anclaje estricto en X=0.0
         if len(x) > 1:
-            ax.set_xlim(0.0, fmax)
-        
+            ax.set_xlim(0.5, fmax)
+
         self._vista_actual = "fft"
         self._line_canal = None
         self._lines_multicanal = []
         self._axes_bandas = []
         self._lines_bandas = []
-            
+
         self._limpiar_controles_tiempo()
         self._desactivar_pan_tiempo()
         self.fig.tight_layout()
@@ -8985,13 +9399,7 @@ class AppEEG:
             messagebox.showwarning("Espectrograma", "No hay contenido espectral en el rango seleccionado.")
             return
 
-        # 1. Transformación a decibelios
         sxx_db = 10.0 * np.log10(sxx + 1e-12)
-
-        # 2. NUEVO: Suavizado Gaussiano 2D
-        # Difumina el ruido estático individual para igualar la textura del promedio del informe PDF
-        from scipy.ndimage import gaussian_filter
-        sxx_db = gaussian_filter(sxx_db, sigma=(0.8, 1.5))
 
         self.fig.clear()
         gs = self.fig.add_gridspec(
@@ -9004,19 +9412,11 @@ class AppEEG:
             wspace=0.06
         )
         ax = self.fig.add_subplot(gs[0, 0])
+
         ax_bandas = self.fig.add_subplot(gs[0, 1])
         cax = self.fig.add_subplot(gs[0, 2])
 
-        # 3. Límites de color robustos mediante percentiles
-        vmin = float(np.percentile(sxx_db, 2))
-        vmax = float(np.percentile(sxx_db, 98))
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-            vmin, vmax = float(np.min(sxx_db)), float(np.max(sxx_db))
-            if vmax <= vmin:
-                vmax = vmin + 1e-6
-
-        # 4. Renderizado idéntico al PDF (gouraud + turbo)
-        mesh = ax.pcolormesh(t, f, sxx_db, shading="gouraud", cmap="turbo", vmin=vmin, vmax=vmax)
+        mesh = ax.pcolormesh(t, f, sxx_db, shading="auto", cmap="viridis")
 
         for yref in (4.0, 8.0, 12.0, 30.0):
             if yref <= fmax:
@@ -9077,7 +9477,7 @@ class AppEEG:
                 ha="left",
                 va="center",
                 fontsize=9,
-                color="#4B5563"
+                color=TEXTO_SECUNDARIO
             )
 
         self._vista_actual = "espectrograma"
