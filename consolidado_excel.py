@@ -1,3 +1,5 @@
+
+
 import os
 import json
 
@@ -18,8 +20,11 @@ ENCABEZADOS = [
     "Archivo procesado", "Estado calidad", "Duración (s)", "Fs (Hz)",
     "Delta (%)", "Theta (%)", "Alfa (%)", "Beta (%)", "Banda dominante",
     "Theta/Alfa", "Delta/Alfa", "Theta/Beta", "Lentificación",
+    "TAR Estado", "DAR Estado", "TBR Estado", "Slow Estado",
+    "PAF Global (Hz)", "PAF Global Estado", "PAF Occipital (Hz)", "PAF Occipital Estado",
+    "Gradiente AP", "Gradiente AP Estado",
     "Atípicos (%)", "Sospechosos (%)", "Índice técnico (%)", "SNR (dB)",
-    "Observaciones",
+    "Confiabilidad", "Observaciones",
 ]
 
 
@@ -78,6 +83,7 @@ def recolectar_datos_archivo(nombre_archivo, carpeta_cache):
         banda_dominante = max(valores_validos, key=valores_validos.get)
 
     ratios = resumen_ratios.get("promedios_globales", {}) or {}
+    semaforos = resumen_ratios.get("semaforos", {}) or {}
     snr_info = resumen_calidad.get("snr") or {}
 
     duracion_s = meta.get("duracion_s")
@@ -99,14 +105,89 @@ def recolectar_datos_archivo(nombre_archivo, carpeta_cache):
         "delta_alfa": ratios.get("Delta_Alfa"),
         "theta_beta": ratios.get("Theta_Beta"),
         "lentificacion": ratios.get("Lentificacion"),
+        "tar_estado": semaforos.get("Theta_Alfa", {}).get("estado", "N/D"),
+        "dar_estado": semaforos.get("Delta_Alfa", {}).get("estado", "N/D"),
+        "tbr_estado": semaforos.get("Theta_Beta", {}).get("estado", "N/D"),
+        "slow_estado": semaforos.get("Lentificacion", {}).get("estado", "N/D"),
+        "paf_global": resumen_welch.get("paf_global_hz"),
+        "paf_global_estado": clasificar_semaforo_simple(resumen_welch.get("paf_global_hz"), "PAF"),
+        "paf_occipital": resumen_welch.get("paf_occipital_hz"),
+        "paf_occipital_estado": clasificar_semaforo_simple(resumen_welch.get("paf_occipital_hz"), "PAF"),
+        "gradiente_ap": resumen_welch.get("gradiente_ap"),
+        "gradiente_ap_estado": clasificar_semaforo_simple(resumen_welch.get("gradiente_ap"), "Gradiente_AP"),
         "atipicos": resumen_calidad.get("porcentaje_atipicos"),
         "sospechosos": resumen_calidad.get("porcentaje_sospechosos"),
         "indice_tecnico": resumen_calidad.get("porcentaje_ponderado"),
         "snr": snr_info.get("snr_global_db"),
+        "confiabilidad": _calcular_confiabilidad_excel(snr_info.get("snr_global_db"), resumen_calidad.get("porcentaje_atipicos")),
         "observaciones": "",
         "potencia_regional": resumen_welch.get("promedios_regionales", {}) or {},
     }
     return fila
+
+
+def _calcular_confiabilidad_excel(snr_db, porcentaje_atipicos):
+    """
+    Calcula confiabilidad de biomarcadores para el consolidado Excel.
+    Returns: 'ALTA' | 'MEDIA' | 'BAJA' | 'NULA'
+    """
+    score = 0
+
+    if snr_db is not None:
+        if snr_db >= 15:
+            score += 3
+        elif snr_db >= 10:
+            score += 2
+        elif snr_db >= 5:
+            score += 1
+        elif snr_db < 3:
+            score -= 3
+
+    if porcentaje_atipicos is not None:
+        if porcentaje_atipicos <= 3:
+            score += 3
+        elif porcentaje_atipicos <= 8:
+            score += 2
+        elif porcentaje_atipicos <= 15:
+            score += 1
+        elif porcentaje_atipicos > 20:
+            score -= 3
+
+    if score >= 5:
+        return "ALTA"
+    elif score >= 3:
+        return "MEDIA"
+    elif score >= 1:
+        return "BAJA"
+    else:
+        return "NULA"
+
+
+def clasificar_semaforo_simple(valor, tipo):
+    """
+    Clasifica un valor según los rangos de referencia clínicos.
+    Versión simplificada para el consolidado Excel.
+    """
+    if valor is None or not isinstance(valor, (int, float)):
+        return "N/D"
+    
+    if tipo == "PAF":
+        if valor >= 9.50:
+            return "Normal"
+        elif valor >= 9.00:
+            return "Borderline"
+        else:
+            return "Lentificado"
+    
+    elif tipo == "Gradiente_AP":
+        if valor > 1.50:
+            return "Normal"
+        elif valor >= 1.00:
+            return "Intermedio"
+        else:
+            return "Anteriorizado"
+    
+    return "N/D"
 
 
 def _fila_a_lista(fila):
@@ -114,8 +195,14 @@ def _fila_a_lista(fila):
         fila["archivo"], fila["estado"], fila["duracion_s"], fila["fs"],
         fila["delta"], fila["theta"], fila["alfa"], fila["beta"],
         fila["banda_dominante"], fila["theta_alfa"], fila["delta_alfa"],
-        fila["theta_beta"], fila["lentificacion"], fila["atipicos"],
+        fila["theta_beta"], fila["lentificacion"],
+        fila["tar_estado"], fila["dar_estado"], fila["tbr_estado"], fila["slow_estado"],
+        fila["paf_global"], fila["paf_global_estado"],
+        fila["paf_occipital"], fila["paf_occipital_estado"],
+        fila["gradiente_ap"], fila["gradiente_ap_estado"],
+        fila["atipicos"],
         fila["sospechosos"], fila["indice_tecnico"], fila["snr"],
+        fila["confiabilidad"],
         fila["observaciones"],
     ]
 
@@ -210,8 +297,8 @@ def _hoja_resumen(wb, filas):
 
     ws["E1"] = "POTENCIA RELATIVA"
     ws["J1"] = "PROPORCION ENTRE BANDAS (BIOMARCADORES)"
-    ws["N1"] = "CALIDAD DE LA SEÑAL"
-    for c in ("E1", "J1", "N1"):
+    ws["R1"] = "CALIDAD DE LA SEÑAL"
+    for c in ("E1", "J1", "R1"):
         ws[c].font = Font(bold=True, color=BLANCO)
         ws[c].fill = PatternFill("solid", fgColor=NARANJA_NEUROX)
 
@@ -225,9 +312,50 @@ def _hoja_resumen(wb, filas):
         r = fila_inicial + i
         for j, valor in enumerate(_fila_a_lista(fila), start=1):
             ws.cell(row=r, column=j, value=valor)
+        
+        # Formato condicional para semáforos de ratios (columnas N-P)
+        for col_letter in ["N", "O", "P", "Q"]:
+            celda = ws[f"{col_letter}{r}"]
+            if celda.value == "Normal":
+                celda.fill = PatternFill("solid", fgColor="D3F0D8")
+                celda.font = Font(color="1E6E32")
+            elif celda.value == "Borderline":
+                celda.fill = PatternFill("solid", fgColor="FFECB3")
+                celda.font = Font(color="966900")
+            elif celda.value in ("Patologico", "Lentificado", "Anteriorizado"):
+                celda.fill = PatternFill("solid", fgColor="F8CDCD")
+                celda.font = Font(color="A01E1E")
+        
+        # Formato condicional para PAF (columnas S-T) y Gradiente AP (columnas V-W)
+        for col_letter in ["S", "T", "V", "W"]:
+            celda = ws[f"{col_letter}{r}"]
+            if celda.value == "Normal":
+                celda.fill = PatternFill("solid", fgColor="D3F0D8")
+                celda.font = Font(color="1E6E32")
+            elif celda.value == "Borderline":
+                celda.fill = PatternFill("solid", fgColor="FFECB3")
+                celda.font = Font(color="966900")
+            elif celda.value in ("Lentificado", "Anteriorizado"):
+                celda.fill = PatternFill("solid", fgColor="F8CDCD")
+                celda.font = Font(color="A01E1E")
+
+        # Formato condicional para Confiabilidad (columna Y, índice 25)
+        celda_conf = ws[f"Y{r}"]
+        if celda_conf.value == "ALTA":
+            celda_conf.fill = PatternFill("solid", fgColor="D3F0D8")
+            celda_conf.font = Font(color="1E6E32", bold=True)
+        elif celda_conf.value == "MEDIA":
+            celda_conf.fill = PatternFill("solid", fgColor="FFECB3")
+            celda_conf.font = Font(color="966900", bold=True)
+        elif celda_conf.value == "BAJA":
+            celda_conf.fill = PatternFill("solid", fgColor="FFE0B2")
+            celda_conf.font = Font(color="B45309", bold=True)
+        elif celda_conf.value == "NULA":
+            celda_conf.fill = PatternFill("solid", fgColor="F8CDCD")
+            celda_conf.font = Font(color="A01E1E", bold=True)
 
     fila_final = fila_inicial + len(filas) - 1
-    ref = f"A2:R{fila_final}"
+    ref = f"A2:AB{fila_final}"
     tabla = Table(displayName="Tabla1", ref=ref)
     tabla.tableStyleInfo = _tabla_estilo()
     ws.add_table(tabla)
@@ -235,8 +363,9 @@ def _hoja_resumen(wb, filas):
     ws.freeze_panes = "A3"
     _autoancho(ws, {
         "A": 18, "B": 14, "C": 12, "D": 10, "E": 10, "F": 10, "G": 10, "H": 10,
-        "I": 14, "J": 10, "K": 10, "L": 10, "M": 12, "N": 10, "O": 12, "P": 14,
-        "Q": 10, "R": 20,
+        "I": 14, "J": 10, "K": 10, "L": 10, "M": 12, "N": 10, "O": 10, "P": 10,
+        "Q": 10, "R": 12, "S": 14, "T": 14, "U": 14, "V": 14, "W": 14, "X": 10,
+        "Y": 12, "Z": 14, "AA": 10, "AB": 20,
     })
     return ws
 
@@ -296,15 +425,16 @@ def _hojas_detalle(wb, filas):
 
         fila_final = max(r - 1, 3)
         if fila_final >= 4:
-            tabla = Table(displayName=tablas[i], ref=f"A3:R{fila_final}")
+            tabla = Table(displayName=tablas[i], ref=f"A3:AB{fila_final}")
             tabla.tableStyleInfo = _tabla_estilo()
             ws.add_table(tabla)
 
         ws.sheet_state = "hidden"  # igual que en la plantilla original
         _autoancho(ws, {
             "A": 18, "B": 14, "C": 12, "D": 10, "E": 10, "F": 10, "G": 10, "H": 10,
-            "I": 14, "J": 10, "K": 10, "L": 10, "M": 12, "N": 10, "O": 12, "P": 14,
-            "Q": 10, "R": 20,
+            "I": 14, "J": 10, "K": 10, "L": 10, "M": 12, "N": 10, "O": 10, "P": 10,
+            "Q": 10, "R": 12, "S": 14, "T": 14, "U": 14, "V": 14, "W": 14, "X": 10,
+            "Y": 12, "Z": 14, "AA": 10, "AB": 20,
         })
 
 
@@ -327,7 +457,9 @@ def _hoja_estado_calidad(wb, total_filas):
     ws["C8"].font = Font(bold=True)
 
     _autoancho(ws, {"B": 20, "C": 10})
-    
+    # Nota: a propósito NO se agrega ningún gráfico aquí. Los datos (esta hoja,
+    # "Potencia regional bandas", "Biomarcadores", etc.) quedan listos para que
+    # el usuario arme sus propios gráficos manualmente en Excel si lo desea.
     return ws
 
 

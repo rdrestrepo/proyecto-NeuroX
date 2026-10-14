@@ -92,7 +92,7 @@ bandas = {
 }
 
 # CONFIGURACION FILTRO
-lowcut = 0.5 #Bajamos de 1.0 de Hz a 0.5 Hz para incluir mejor la banda Delta
+lowcut = 1.0 #Estándar clínico IFCN/ACNS: elimina artefactos sub-Delta (derivas, respiratorio, impedancia)
 highcut = 40
 order = 4
 AUTO_DETECTAR_PICOS_TECNICOS = False
@@ -198,6 +198,55 @@ rangos_referencia = {
     "Alfa":  (15, 35),# estaba en 20-40
     "Beta":  (10, 30),
     # "Gamma": (1, 10)
+}
+
+# =========================
+# RANGOS DE REFERENCIA CLÍNICOS PARA PROPORCIONES (BIOMARCADORES DCL)
+# =========================
+# Rangos basados en literatura de neurodegeneración para reposo con ojos cerrados en adultos.
+# TAR: Theta/Alfa, DAR: Delta/Alfa, TBR: Theta/Beta, SLOW: Índice de Lentificación
+REFERENCIA_RATIOS = {
+    "Theta_Alfa": {
+        "label": "Theta/Alfa (TAR)",
+        "normal": (0.30, 0.90),
+        "borderline": (0.90, 1.10),
+        "patologico": (1.10, None),
+    },
+    "Delta_Alfa": {
+        "label": "Delta/Alfa (DAR)",
+        "normal": (0.20, 0.80),
+        "borderline": (0.80, 1.00),
+        "patologico": (1.00, None),
+    },
+    "Theta_Beta": {
+        "label": "Theta/Beta (TBR)",
+        "normal": (0.80, 2.00),
+        "borderline": (2.00, 2.50),
+        "patologico": (2.50, None),
+    },
+    "Lentificacion": {
+        "label": "Índice de Lentificación",
+        "normal": (0.40, 0.95),
+        "borderline": (0.95, 1.15),
+        "patologico": (1.15, None),
+    },
+}
+
+# Umbrales de PAF (Frecuencia Pico de Alfa)
+PAF_UMBRALES = {
+    "normal": 9.50,        # >= 9.50 Hz: Normal/Conservado
+    "borderline_low": 9.00, # 9.00-9.49 Hz: Límite/Borderline
+    # < 9.00 Hz: Lentificado (Sugestivo de DCL)
+}
+
+# Canales fijos para cálculos específicos (montaje 10-20 estándar)
+CANALES_OCCIPITAL_PAF = ["O1", "O2", "OZ", "POZ"]
+CANALES_FRONTAL_GRADIENTE = ["FP1", "FP2", "F3", "F4", "F7", "F8", "FZ"]
+
+# Umbrales de Gradiente Antero-Posterior de Alfa
+GRADIENTE_AP_UMBRALES = {
+    "normal": 1.50,    # > 1.50: Fuerte dominancia posterior
+    "patologico": 1.00, # < 1.00: Anteriorizado/Patológico
 }
 
 
@@ -427,9 +476,9 @@ def analizar_frecuencia_fft(datos, fs_real, carpeta_fft, sufijo="crudo", logger=
     dejando la magnitud en las mismas unidades que la señal de entrada (µV).
 
     Archivos guardados:
-        freqs_{sufijo}.npy   → frecuencias en Hz (float32)
-        fft_amp_{sufijo}.npy → amplitud en µV, espectro unilateral (float32)
-        fft_db_{sufijo}.npy  → misma amplitud en dBµV, solo por compatibilidad
+        freqs_{sufijo}.npy   -> frecuencias en Hz (float32)
+        fft_amp_{sufijo}.npy -> amplitud en uV, espectro unilateral (float32)
+        fft_db_{sufijo}.npy  -> misma amplitud en dBuV, solo por compatibilidad
     """
     log = _mklogger(logger)
 
@@ -1250,6 +1299,66 @@ def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
     return resultado
 
 
+def _detectar_epocas_contaminadas(datos, fs_real, ventana_s=2.0, umbral_std=5.0):
+    """
+    Detecta segmentos contaminados por artefactos no-estereotipados:
+    - Pops/electrode jumps: desviación estándar > umbral_std en ventana corta
+    - Deriva lenta anómala: pendiente lineal > 100 µV/s en ventana
+
+    Retorna: máscara booleana (True = válida, False = contaminada)
+    """
+    x = np.asarray(datos, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] < 2:
+        return np.ones(x.shape[1], dtype=bool)
+
+    n_canales, n_muestras = x.shape
+    n_ventana = int(fs_real * ventana_s)
+    if n_ventana < 10:
+        n_ventana = min(10, n_muestras)
+
+    mask_valido = np.ones(n_muestras, dtype=bool)
+
+    # Detectar ventanas con desviación extrema (pops/movimientos)
+    for inicio in range(0, n_muestras - n_ventana, n_ventana // 2):
+        fin = min(inicio + n_ventana, n_muestras)
+        ventana = x[:, inicio:fin]
+        std_ventana = np.std(ventana, axis=1)
+        std_global = np.std(x, axis=1)
+        std_global_safe = np.where(std_global < 1e-12, 1e-12, std_global)
+
+        ratio = std_ventana / std_global_safe
+        if np.any(ratio > umbral_std):
+            mask_valido[inicio:fin] = False
+
+    return mask_valido
+
+
+def _calcular_snr_crudo_rapido(datos, fs_real):
+    """
+    Estima SNR crudo (señal 1-30 Hz vs ruido 40-100 Hz) sobre la señal filtrada
+    pre-ICA. Rápido: usa FFT directa en lugar de Welch.
+    Retorna SNR en dB.
+    """
+    x = np.asarray(datos, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] < 2:
+        return 0.0
+
+    n_muestras = x.shape[1]
+    freqs = np.fft.rfftfreq(n_muestras, d=1.0 / float(fs_real))
+    potencia = np.abs(np.fft.rfft(x, axis=1)) ** 2
+
+    mask_senal = (freqs >= 1.0) & (freqs < 30.0)
+    mask_ruido = (freqs >= 40.0) & (freqs < 100.0)
+
+    p_senal = np.sum(potencia[:, mask_senal], axis=1)
+    p_ruido = np.sum(potencia[:, mask_ruido], axis=1)
+    p_ruido_safe = np.where(p_ruido <= 0, 1e-12, p_ruido)
+
+    snr_lineal = p_senal / p_ruido_safe
+    snr_db = 10.0 * np.log10(np.mean(snr_lineal))
+    return float(snr_db)
+
+
 def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
     """
     Aplica ICA utilizando la libreria MNE y mne-icalabel.
@@ -1266,15 +1375,31 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
 
     log = logger if logger else print
 
-    # Categorias de ICLabel que se consideran artefacto y umbral minimo
-    # de confianza para excluir un componente. Se excluye todo lo que no
-    # sea 'brain' ni 'other' (practica estandar en la literatura), con un
-    # umbral de 0.70. 
-    CATEGORIAS_ARTEFACTO = {
+    # Categorias de ICLabel que se consideran artefacto
+    CATEGORIAS_ARTEFACTO_ESTANDAR = {
         'eye blink', 'eye movement', 'muscle artifact',
         'heart beat', 'line noise', 'channel noise',
     }
-    UMBRAL_EXCLUSION = 0.70
+    CATEGORIAS_ARTEFACTO_AGRESIVO = CATEGORIAS_ARTEFACTO_ESTANDAR | {'other'}
+
+    # Calcular SNR crudo para decidir umbral adaptativo
+    # (SNR crudo: 1-30 Hz vs 40-100 Hz sobre señal filtrada pre-ICA)
+    snr_crudo_db = _calcular_snr_crudo_rapido(datos, fs_real)
+    log(f"[MNE] SNR crudo estimado: {snr_crudo_db:.1f} dB")
+
+    # Umbral adaptativo: señales buenas usan estándar, señales malas usan agresivo
+    if snr_crudo_db < 5.0:
+        UMBRAL_EXCLUSION = 0.50
+        CATEGORIAS_ARTEFACTO = CATEGORIAS_ARTEFACTO_AGRESIVO
+        log("[MNE][ADAPTATIVO] SNR critico (<5 dB) -> modo agresivo (umbral 0.50, incluye 'other')")
+    elif snr_crudo_db < 10.0:
+        UMBRAL_EXCLUSION = 0.60
+        CATEGORIAS_ARTEFACTO = CATEGORIAS_ARTEFACTO_AGRESIVO
+        log("[MNE][ADAPTATIVO] SNR bajo (<10 dB) -> modo moderado (umbral 0.60, incluye 'other')")
+    else:
+        UMBRAL_EXCLUSION = 0.70
+        CATEGORIAS_ARTEFACTO = CATEGORIAS_ARTEFACTO_ESTANDAR
+        log("[MNE] SNR normal (>=10 dB) -> modo estandar (umbral 0.70)")
 
     log("[MNE] Inicializando entorno para ICA...")
     datos_v = np.asarray(datos, dtype=np.float64) * 1e-6
@@ -1636,6 +1761,143 @@ def calcular_paf_por_canal(freqs, psd, banda_alfa=(8.0, 13.0)):
     return paf_hz, valido
 
 
+def calcular_paf_occipital(freqs, psd, nombres_canales, banda_alfa=(8.0, 13.0)):
+    """
+    Calcula el PAF (Frecuencia Pico de Alfa) promediado solo en canales occipitales.
+    
+    El ritmo Alfa espontáneo es un generador tálamo-cortical que se proyecta
+    con máxima potencia en la región occipital/parieto-occipital durante ojos
+    cerrados. Esta métrica es más específica que el PAF global para detectar
+    lentificación del ritmo posterior.
+    
+    Args:
+        freqs: Array de frecuencias del PSD
+        psd: Matriz PSD (canales x frecuencias)
+        nombres_canales: Lista de nombres de canales
+        banda_alfa: Tupla (fmin, fmax) de la banda Alfa
+    
+    Returns:
+        paf_occipital: Valor promedio de PAF en canales occipitales válidos
+        n_canales_validos: Número de canales occipitales con pico válido
+    """
+    paf_hz, paf_valido = calcular_paf_por_canal(freqs, psd, banda_alfa=banda_alfa)
+    
+    # Encontrar índices de canales occipitales
+    idx_occipital = []
+    for i, nom in enumerate(nombres_canales):
+        nom_upper = nom.upper()
+        if nom_upper in [c.upper() for c in CANALES_OCCIPITAL_PAF]:
+            idx_occipital.append(i)
+    
+    if not idx_occipital:
+        return float("nan"), 0
+    
+    # Promediar PAF solo en canales occipitales válidos
+    valores_validos = [
+        paf_hz[i] for i in idx_occipital
+        if paf_valido[i] and np.isfinite(paf_hz[i])
+    ]
+    
+    if not valores_validos:
+        return float("nan"), 0
+    
+    return float(np.mean(valores_validos)), len(valores_validos)
+
+
+def calcular_gradiente_ap_alfa(pot_rel_alfa, nombres_canales, eps=1e-12):
+    """
+    Calcula el Gradiente Antero-Posterior de Alfa.
+    
+    En sujetos sanos con ojos cerrados, la potencia de Alfa es predominante
+    atrás (Occipital) y muy baja adelante (Frontal). En el deterioro cognitivo
+    temprano se produce la "anteriorización del ritmo Alfa" (el gradiente
+    posterior se aplasta o se vuelve difuso).
+    
+    Gradiente AP = Potencia Alfa Occipital / Potencia Alfa Frontal
+    
+    Args:
+        pot_rel_alfa: Array de potencia relativa de Alfa por canal
+        nombres_canales: Lista de nombres de canales
+        eps: Valor mínimo para evitar división por cero
+    
+    Returns:
+        gradiente_ap: Valor del gradiente (típicamente > 1.5 en sanos)
+        alfa_occipital: Promedio de Alfa en canales occipitales
+        alfa_frontal: Promedio de Alfa en canales frontales
+    """
+    pot_rel_alfa = np.asarray(pot_rel_alfa, dtype=np.float64)
+    
+    # Encontrar índices de canales occipitales y frontales
+    idx_occipital = []
+    idx_frontal = []
+    
+    for i, nom in enumerate(nombres_canales):
+        nom_upper = nom.upper()
+        if nom_upper in [c.upper() for c in CANALES_OCCIPITAL_PAF]:
+            idx_occipital.append(i)
+        elif nom_upper in [c.upper() for c in CANALES_FRONTAL_GRADIENTE]:
+            idx_frontal.append(i)
+    
+    # Calcular promedios
+    alfa_occipital = float(np.nanmean(pot_rel_alfa[idx_occipital])) if idx_occipital else float("nan")
+    alfa_frontal = float(np.nanmean(pot_rel_alfa[idx_frontal])) if idx_frontal else float("nan")
+    
+    # Calcular gradiente con protección contra división por cero
+    if not np.isfinite(alfa_frontal) or alfa_frontal <= eps:
+        gradiente_ap = float("nan")
+    else:
+        gradiente_ap = alfa_occipital / alfa_frontal
+    
+    return gradiente_ap, alfa_occipital, alfa_frontal
+
+
+def clasificar_semaforo(valor, tipo):
+    """
+    Clasifica un valor según los rangos de referencia clínicos.
+    
+    Args:
+        valor: Valor a clasificar
+        tipo: Tipo de métrica ("Theta_Alfa", "Delta_Alfa", "Theta_Beta", 
+              "Lentificacion", "PAF", "Gradiente_AP")
+    
+    Returns:
+        dict con "estado" ("Normal", "Borderline", "Patologico") y 
+        "color" ("green", "yellow", "red")
+    """
+    if not np.isfinite(valor):
+        return {"estado": "N/D", "color": "gray"}
+    
+    if tipo in REFERENCIA_RATIOS:
+        ref = REFERENCIA_RATIOS[tipo]
+        low_normal, high_normal = ref["normal"]
+        low_border, high_border = ref["borderline"]
+        
+        if low_normal <= valor <= high_normal:
+            return {"estado": "Normal", "color": "green"}
+        elif low_border <= valor <= high_border:
+            return {"estado": "Borderline", "color": "yellow"}
+        else:
+            return {"estado": "Patologico", "color": "red"}
+    
+    elif tipo == "PAF":
+        if valor >= PAF_UMBRALES["normal"]:
+            return {"estado": "Normal", "color": "green"}
+        elif valor >= PAF_UMBRALES["borderline_low"]:
+            return {"estado": "Borderline", "color": "yellow"}
+        else:
+            return {"estado": "Lentificado", "color": "red"}
+    
+    elif tipo == "Gradiente_AP":
+        if valor > GRADIENTE_AP_UMBRALES["normal"]:
+            return {"estado": "Normal", "color": "green"}
+        elif valor >= GRADIENTE_AP_UMBRALES["patologico"]:
+            return {"estado": "Intermedio", "color": "yellow"}
+        else:
+            return {"estado": "Anteriorizado", "color": "red"}
+    
+    return {"estado": "N/D", "color": "gray"}
+
+
 def _promedio_por_region_generico(valores_por_canal, nombres_canales, idx_excluir=None):
     """
     Promedio simple por region (Frontal/Central/Temporal/Parietal/Occipital)
@@ -1657,6 +1919,9 @@ def _promedio_por_region_generico(valores_por_canal, nombres_canales, idx_exclui
 
     promedios = {}
     for reg, idxs in regiones.items():
+        # Excluir regiones periféricas/no cerebrales de tablas clínicas
+        if reg in ("Mastoides", "Otro", "Referencia/Periféricos"):
+            continue
         vals = valores_por_canal[idxs]
         vals = vals[np.isfinite(vals)]
         promedios[reg] = float(np.mean(vals)) if len(vals) else float("nan")
@@ -1831,6 +2096,27 @@ def guardar_potencia_relativa_welch(
                 paf_para_region, nombres_canales, idx_excluir=idx_excluir
             )
 
+    # PAF Occipital (métrica primaria para DCL)
+    paf_occipital = float("nan")
+    paf_occipital_canales = 0
+    if nombres_canales is not None and "paf_hz" in resultado_welch:
+        paf_occipital, paf_occipital_canales = calcular_paf_occipital(
+            resultado_welch["freqs"],
+            resultado_welch["psd"],
+            nombres_canales,
+            banda_alfa=bandas_def.get("Alfa", (8.0, 13.0))
+        )
+
+    # Gradiente Antero-Posterior de Alfa
+    gradiente_ap = float("nan")
+    alfa_occipital = float("nan")
+    alfa_frontal = float("nan")
+    if nombres_canales is not None and "Alfa" in resultado_welch.get("pot_rel", {}):
+        gradiente_ap, alfa_occipital, alfa_frontal = calcular_gradiente_ap_alfa(
+            resultado_welch["pot_rel"]["Alfa"],
+            nombres_canales
+        )
+
     resumen = {
         "metodo": "Welch",
         "rango_total_hz": list(RANGO_TOTAL_WELCH),
@@ -1841,6 +2127,11 @@ def guardar_potencia_relativa_welch(
         "paf_regional_hz": paf_region,
         "paf_canales_validos": int(len(idx_validos_paf)) if paf_hz is not None else 0,
         "paf_canales_totales": int(len(paf_hz)) if paf_hz is not None else 0,
+        "paf_occipital_hz": paf_occipital,
+        "paf_occipital_canales": paf_occipital_canales,
+        "gradiente_ap": gradiente_ap,
+        "alfa_occipital": alfa_occipital,
+        "alfa_frontal": alfa_frontal,
     }
 
     with open(os.path.join(carpeta_salida, "pot_rel_promedios.json"), "w", encoding="utf-8") as f:
@@ -1922,6 +2213,11 @@ def guardar_ratios_welch_principales(
             idx_excluir=idx_excluir
         )
 
+    # Calcular semáforos para cada ratio
+    semaforos = {}
+    for clave, valor in resultado_ratios["promedios_globales"].items():
+        semaforos[clave] = clasificar_semaforo(valor, clave)
+
     resumen = {
         "metodo": "ratios_desde_potencia_relativa_welch",
         "ratios": {
@@ -1934,6 +2230,7 @@ def guardar_ratios_welch_principales(
         },
         "promedios_globales": resultado_ratios["promedios_globales"],
         "promedios_regionales": promedios_region,
+        "semaforos": semaforos,
     }
 
     with open(os.path.join(carpeta_salida, "ratios_promedios_principales.json"), "w", encoding="utf-8") as f:
@@ -2006,6 +2303,54 @@ def interpretar_snr(snr_db):
         return "Relación señal/ruido baja. La señal presenta ruido importante y debe interpretarse con precaución."
     else:
         return "Ruido dominante. La muestra puede no ser técnicamente confiable para interpretación."
+
+
+def _calcular_confiabilidad_metrica(snr_final_db, porcentaje_atipicos, porcentaje_varianza_ica):
+    """
+    Calcula nivel de confiabilidad de biomarcadores basado en métricas objetivas.
+    Returns: 'ALTA' | 'MEDIA' | 'BAJA' | 'NULA'
+    """
+    score = 0
+
+    # SNR post-limpieza (ponderación: alta)
+    if snr_final_db is not None:
+        if snr_final_db >= 15:
+            score += 3
+        elif snr_final_db >= 10:
+            score += 2
+        elif snr_final_db >= 5:
+            score += 1
+        elif snr_final_db < 3:
+            score -= 3
+
+    # Canales atípicos (ponderación: alta)
+    if porcentaje_atipicos is not None:
+        if porcentaje_atipicos <= 3:
+            score += 3
+        elif porcentaje_atipicos <= 8:
+            score += 2
+        elif porcentaje_atipicos <= 15:
+            score += 1
+        elif porcentaje_atipicos > 20:
+            score -= 3
+
+    # ICA effectiveness (ponderación: media)
+    if porcentaje_varianza_ica is not None:
+        if porcentaje_varianza_ica >= 15:
+            score += 2
+        elif porcentaje_varianza_ica >= 5:
+            score += 1
+        elif porcentaje_varianza_ica == 0:
+            score -= 2
+
+    if score >= 5:
+        return "ALTA"
+    elif score >= 3:
+        return "MEDIA"
+    elif score >= 1:
+        return "BAJA"
+    else:
+        return "NULA"
 
 
 def clasificar_calidad_global(
@@ -2212,6 +2557,34 @@ def crear_grafico_circular_calidad(resumen, ruta_salida):
     plt.close(fig)
 
 
+def _calcular_snr_por_bandas(datos, fs):
+    """
+    Calcula SNR por bandas (1-30 vs 40-100 Hz) para detectar engaño en SNR global.
+    Returns dict: {'delta': x, 'theta': y, 'alfa': z, 'beta': w}
+    """
+    x = np.asarray(datos, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] < 2:
+        return {"delta": 0.0, "theta": 0.0, "alfa": 0.0, "beta": 0.0}
+
+    n_muestras = x.shape[1]
+    freqs = np.fft.rfftfreq(n_muestras, d=1.0 / float(fs))
+    potencia = np.abs(np.fft.rfft(x, axis=1)) ** 2
+
+    mask_ruido = (freqs >= 40.0) & (freqs < 100.0)
+    p_ruido = np.sum(potencia[:, mask_ruido], axis=1)
+    p_ruido_safe = np.where(p_ruido <= 0, 1e-12, p_ruido)
+
+    snr_bandas = {}
+    for banda, (fmin, fmax) in {"delta": (1,4), "theta": (4,8), "alfa": (8,13), "beta": (13,30)}.items():
+        mask_banda = (freqs >= fmin) & (freqs < fmax)
+        p_banda = np.sum(potencia[:, mask_banda], axis=1)
+        snr_lineal = p_banda / p_ruido_safe
+        snr_db = 10.0 * np.log10(np.mean(snr_lineal))
+        snr_bandas[banda] = float(snr_db)
+
+    return snr_bandas
+
+
 def calcular_resumen_calidad_senal(
     datos_para_snr,
     fs,
@@ -2264,6 +2637,11 @@ def calcular_resumen_calidad_senal(
     snr_global_db = resumen_snr["snr_global_db"]
     log(f"[OK] SNR global estimada desde crudo: {snr_global_db:.2f} dB.")
 
+    # SNR por bandas (detecta engaño: SNR global alto puede ocultar Alfa ausente)
+    snr_por_banda = _calcular_snr_por_bandas(datos_para_snr, fs)
+    for banda, snr_val in snr_por_banda.items():
+        log(f"[OK] SNR {banda}: {snr_val:.1f} dB")
+
     canales_afectados = list(dict.fromkeys(canales_atipicos + canales_sospechosos))
     resumen_regional = analizar_distribucion_regional(canales_afectados)
 
@@ -2307,6 +2685,7 @@ def calcular_resumen_calidad_senal(
         "snr": resumen_snr,
         "snr_fuente": "señal cruda original antes de filtros, notch, atenuaciones, ICA o Wavelet",
         "interpretacion_snr": interpretacion_snr,
+        "snr_por_banda": snr_por_banda,
         "analisis_regional": resumen_regional,
         "interpretacion_global": interpretacion_global,
         "criterio_clasificacion": {
@@ -3953,15 +4332,20 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     )
     promedios_globales_welch = resumen_welch.get("promedios_globales", {}) if isinstance(resumen_welch, dict) else {}
 
-    pdf.add_block_title("1. Tabla de promedios globales de potencia relativa por bandas")
+    pdf.add_block_title("1. Tabla de promedios globales de potencia relativa por bandas con semáforo")
+    filas_potencia = []
+    for banda in ("Delta", "Theta", "Alfa", "Beta"):
+        valor = promedios_globales_welch.get(banda, np.nan)
+        if np.isfinite(valor) and banda in rangos_referencia:
+            evaluacion = evaluar_banda(banda, float(valor))
+            filas_potencia.append([banda, _fmt_pct_informe(valor), evaluacion["detalle"]])
+        else:
+            filas_potencia.append([banda, _fmt_pct_informe(valor), "N/D"])
     pdf.add_visual_table(
-        headers=["Banda", "Potencia relativa global"],
-        rows=[
-            [banda, _fmt_pct_informe(promedios_globales_welch.get(banda, np.nan))]
-            for banda in ("Delta", "Theta", "Alfa", "Beta")
-        ],
-        col_widths=[52, 66],
-        alignments=["L", "C"],
+        headers=["Banda", "Potencia relativa global", "Estado"],
+        rows=filas_potencia,
+        col_widths=[40, 50, 48],
+        alignments=["L", "C", "C"],
     )
 
     pdf.add_block_title("1b. Comparación contra rango de referencia")
@@ -4029,27 +4413,75 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     paf_regional_hz = resumen_welch.get("paf_regional_hz", {}) if isinstance(resumen_welch, dict) else {}
     paf_canales_validos = resumen_welch.get("paf_canales_validos", 0) if isinstance(resumen_welch, dict) else 0
     paf_canales_totales = resumen_welch.get("paf_canales_totales", 0) if isinstance(resumen_welch, dict) else 0
+    paf_occipital_hz = resumen_welch.get("paf_occipital_hz") if isinstance(resumen_welch, dict) else None
+    paf_occipital_canales = resumen_welch.get("paf_occipital_canales", 0) if isinstance(resumen_welch, dict) else 0
+    gradiente_ap = resumen_welch.get("gradiente_ap") if isinstance(resumen_welch, dict) else None
+    alfa_occipital = resumen_welch.get("alfa_occipital") if isinstance(resumen_welch, dict) else None
+    alfa_frontal = resumen_welch.get("alfa_frontal") if isinstance(resumen_welch, dict) else None
 
     if paf_global_hz is not None and np.isfinite(paf_global_hz):
+        semaforo_paf_global = clasificar_semaforo(paf_global_hz, "PAF")
         pdf.add_wrapped_text(
             f"PAF global: {paf_global_hz:.2f} Hz (calculado sobre {paf_canales_validos} de "
             f"{paf_canales_totales} canales, donde se identificó un pico distinguible dentro "
-            f"de la banda Alfa; en los demás el espectro no mostró un pico claro en esa banda). "
-            f"La literatura de qEEG reporta típicamente un PAF entre 9.5 y 10.5 Hz en adultos "
-            f"sanos, con desplazamientos hacia frecuencias más bajas (8-9 Hz) descritos en "
-            f"poblaciones con deterioro cognitivo -- esto es una referencia orientativa general, "
-            f"no un punto de corte diagnóstico, y debe interpretarse junto con el resto del "
-            f"cuadro clínico.",
+            f"de la banda Alfa; en los demás el espectro no mostró un pico claro en esa banda).",
             font_size=9.0,
         )
+        
+        # PAF Occipital (métrica primaria)
+        if paf_occipital_hz is not None and np.isfinite(paf_occipital_hz):
+            semaforo_paf_occipital = clasificar_semaforo(paf_occipital_hz, "PAF")
+            pdf.add_wrapped_text(
+                f"PAF Occipital (O1, O2, Oz, POz): {paf_occipital_hz:.2f} Hz "
+                f"(calculado sobre {paf_occipital_canales} canales occipitales). "
+                f"Esta es la métrica primaria para evaluar el ritmo posterior.",
+                font_size=9.0,
+            )
+        
+        # Tabla de estratificación PAF
+        filas_paf = [
+            ["PAF Global", f"{paf_global_hz:.2f} Hz", semaforo_paf_global["estado"]],
+        ]
+        if paf_occipital_hz is not None and np.isfinite(paf_occipital_hz):
+            filas_paf.append([
+                "PAF Occipital", 
+                f"{paf_occipital_hz:.2f} Hz", 
+                semaforo_paf_occipital["estado"]
+            ])
+        
+        pdf.add_visual_table(
+            headers=["Métrica", "Valor", "Estado"],
+            rows=filas_paf,
+            col_widths=[50, 40, 50],
+            alignments=["L", "C", "C"],
+        )
+        
+        # Gradiente Antero-Posterior
+        if gradiente_ap is not None and np.isfinite(gradiente_ap):
+            semaforo_ap = clasificar_semaforo(gradiente_ap, "Gradiente_AP")
+            pdf.add_wrapped_text(
+                f"Gradiente Antero-Posterior de Alfa: {gradiente_ap:.2f} "
+                f"(Alfa Occipital: {alfa_occipital:.2f}% / Alfa Frontal: {alfa_frontal:.2f}%). "
+                f"Valores > 1.50 indican fuerte dominancia posterior (normal); "
+                f"valores < 1.00 sugieren anteriorización del ritmo Alfa.",
+                font_size=9.0,
+            )
+            # Tabla con semáforo para Gradiente AP
+            pdf.add_visual_table(
+                headers=["Métrica", "Valor", "Estado"],
+                rows=[["Gradiente AP", f"{gradiente_ap:.2f}", semaforo_ap["estado"]]],
+                col_widths=[50, 40, 50],
+                alignments=["L", "C", "C"],
+            )
+        
         if paf_regional_hz:
-            filas_paf = [
+            filas_paf_regional = [
                 [region, f"{valor:.2f} Hz" if np.isfinite(valor) else "sin pico claro"]
                 for region, valor in paf_regional_hz.items()
             ]
             pdf.add_visual_table(
                 headers=["Región", "PAF"],
-                rows=filas_paf,
+                rows=filas_paf_regional,
                 col_widths=[60, 50],
                 alignments=["L", "C"],
             )
@@ -4116,6 +4548,105 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
             font_size=10.0,
         )
 
+    # =========================
+    # QUALITY GATE: Advertencia de fiabilidad de biomarcadores
+    # =========================
+    advertencia_calidad = False
+    advertencia_texto = ""
+
+    # --- Diagnóstico educativo: SNR por bandas y explicación de fiabilidad ---
+    snr_por_banda = resumen_calidad.get("snr_por_banda", {}) if isinstance(resumen_calidad, dict) else {}
+    snr_global_crudo = resumen_calidad.get("snr", {}).get("snr_global_db") if isinstance(resumen_calidad, dict) else None
+
+    # Detectar SNR engañoso: global alto pero Alfa muy bajo
+    snr_enganyoso = False
+    explicacion_adicional = ""
+    if snr_por_banda and snr_global_crudo is not None:
+        snr_alfa = snr_por_banda.get("alfa", 0)
+        snr_delta = snr_por_banda.get("delta", 0)
+        # Umbrales ajustados: Delta > 10 dB Y Alfa < 5 dB Y Global >= 5
+        if snr_global_crudo >= 5 and snr_alfa < 5 and snr_delta > 10:
+            snr_enganyoso = True
+            explicacion_adicional = (
+                f"NOTA IMPORTANTE: El SNR global ({snr_global_crudo:.1f} dB) parece aceptable, "
+                f"pero es ENGAÑOSO. El SNR se calcula como potencia(1-30 Hz) / potencia(40-100 Hz). "
+                f"Los artefactos de baja frecuencia (derivas, movimiento lento, 1-4 Hz) están DENTRO "
+                f"de la banda 'señal' y inflan el SNR global. La realidad es:\n"
+                f"  - SNR Delta (1-4 Hz): {snr_delta:.1f} dB  -> artefacto dominante\n"
+                f"  - SNR Alfa (8-13 Hz): {snr_alfa:.1f} dB  -> senal cerebral casi ausente\n"
+                f"Dos registros pueden tener SNR global similar (ej. 8 dB vs 9 dB) pero calidad "
+                f"clínica muy diferente: uno con Alfa sana (SNR Alfa > 10 dB) y otro con Alfa "
+                f"ausente por fallo de electrodos occipitales (SNR Alfa < 5 dB)."
+            )
+
+    advertencia_calidad = False
+    advertencia_texto = ""
+
+    # Condición 1: SNR post-limpieza crítico
+    if snr_final_db is not None and snr_final_db < 3.0:
+        advertencia_calidad = True
+        advertencia_texto = (
+            f"ADVERTENCIA CRÍTICA: SNR post-limpieza {snr_final_db:.1f} dB < 3 dB. "
+            "La señal residual es indistinguible del ruido. Los biomarcadores cuantitativos "
+            "en este informe tienen FIABILIDAD NULA y no deben usarse para decisiones clínicas. "
+            "El software funcionó correctamente, pero la señal cruda procesada no contiene "
+            "información cerebral suficiente. Se recomienda revisar impedancias de electrodos, "
+            "descartar electrodos defectuosos y repetir la adquisición."
+        )
+    # Condición 2: SNR global engañoso (Delta domina, Alfa ausente)
+    elif snr_enganyoso:
+        advertencia_calidad = True
+        advertencia_texto = (
+            f"ADVERTENCIA: La señal cruda tiene calidad insuficiente para biomarcadores fiables. "
+            f"El software procesó correctamente los datos, pero los resultados NO SON CONFIABLES "
+            f"porque la adquisición tuvo problemas técnicos (electrodos defectuosos, movimiento, "
+            f"o ruido excesivo). Los valores elevados de Delta y ausencia de Alfa son artefactos "
+            f"de la adquisición, no indicadores de patología."
+        )
+    # Condición 3: ICA falló (0% varianza) Y SNR crudo moderado/bajo
+    elif (porcentaje_varianza_ica is not None and porcentaje_varianza_ica < 1.0 and
+          snr_global_crudo is not None and snr_global_crudo < 15):
+        advertencia_calidad = True
+        advertencia_texto = (
+            f"ADVERTENCIA: ICA no logró limpieza efectiva ({porcentaje_varianza_ica:.1f}% varianza removida) "
+            f"y SNR crudo es moderado ({snr_global_crudo:.1f} dB). El software funcionó correctamente pero "
+            "la señal cruda estaba demasiado contaminada para que el algoritmo de limpieza "
+            "pudiera extraer componentes cerebrales fiables."
+        )
+    # Condición 4: Muchos canales atípicos en occipital + Alfa muy bajo
+    else:
+        canales_atipicos = resumen_calidad.get("canales_atipicos", [])
+        occipitales_malos = sum(1 for c in canales_atipicos if c.upper() in ["O1", "O2", "OZ", "POZ", "PO3", "PO4", "PO7", "PO8"])
+        alfa_global = resumen_welch.get("promedios_globales", {}).get("Alfa", 0) if isinstance(resumen_welch, dict) else 0
+        if occipitales_malos >= 3 and alfa_global < 10:
+            advertencia_calidad = True
+            advertencia_texto = (
+                f"ADVERTENCIA: {occipitales_malos} canales occipitales defectuosos y Alfa global muy bajo ({alfa_global:.1f}%). "
+                f"El ritmo Alfa posterior no pudo registrarse correctamente. Los biomarcadores "
+                f"que dependen del Alfa (PAF, Gradiente AP, ratios) NO SON FIABLES. "
+                f"El software procesó correctamente los datos, pero la adquisición falló en la región clave."
+            )
+
+    if advertencia_calidad:
+        pdf.ensure_space(40)
+        pdf.set_fill_color(255, 220, 180)
+        pdf.set_text_color(150, 50, 0)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.multi_cell(0, 6, f"[ADVERTENCIA] {advertencia_texto}", fill=True, border=1)
+        pdf.set_text_color(28, 32, 38)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.ln(3)
+
+        # Añadir explicación educativa sobre SNR engañoso
+        if snr_enganyoso and explicacion_adicional:
+            pdf.set_fill_color(255, 248, 220)
+            pdf.set_text_color(100, 60, 0)
+            pdf.set_font("Helvetica", "", 9.5)
+            pdf.multi_cell(0, 5.5, explicacion_adicional, fill=True, border=1)
+            pdf.set_text_color(28, 32, 38)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.ln(4)
+
     pdf.add_section_title("Proporciones de bandas e índice de lentificación")
     pdf.add_wrapped_text(
         "Las proporciones entre bandas resumen relaciones espectrales relevantes. El índice de lentificación compara la actividad lenta (Delta + Theta) frente a la actividad rápida relativa (Alfa + Beta).",
@@ -4123,16 +4654,37 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     )
     promedios_globales_ratios = resumen_ratios.get("promedios_globales", {}) if isinstance(resumen_ratios, dict) else {}
 
-    pdf.add_block_title("1. Tabla de valores globales de proporciones entre bandas")
+    pdf.add_block_title("1. Tabla de valores globales de proporciones entre bandas con semáforo clínico")
+    semaforos_ratios = resumen_ratios.get("semaforos", {}) if isinstance(resumen_ratios, dict) else {}
+
+    # Calcular confiabilidad global de biomarcadores
+    confiabilidad = _calcular_confiabilidad_metrica(snr_final_db, None, porcentaje_varianza_ica)
+    color_confiabilidad = {"ALTA": "green", "MEDIA": "yellow", "BAJA": "orange", "NULA": "red"}.get(confiabilidad, "gray")
+
+    filas_ratios = []
+    for clave in ("Theta_Alfa", "Delta_Alfa", "Theta_Beta", "Lentificacion"):
+        valor = promedios_globales_ratios.get(clave, np.nan)
+        semaforo = semaforos_ratios.get(clave, {"estado": "N/D", "color": "gray"})
+        filas_ratios.append([
+            RATIOS_WELCH_LABELS[clave],
+            _fmt_num_informe(valor, decimales=2),
+            semaforo["estado"]
+        ])
+
     pdf.add_visual_table(
-        headers=["Proporción", "Valor global"],
-        rows=[
-            [RATIOS_WELCH_LABELS[clave], _fmt_num_informe(promedios_globales_ratios.get(clave, np.nan), decimales=2)]
-            for clave in ("Theta_Alfa", "Delta_Alfa", "Theta_Beta", "Lentificacion")
-        ],
-        col_widths=[58, 58],
-        alignments=["L", "C"],
+        headers=["Proporción", "Valor global", "Estado"],
+        rows=filas_ratios,
+        col_widths=[58, 40, 42],
+        alignments=["L", "C", "C"],
     )
+
+    # Mostrar confiabilidad
+    pdf.set_font("Helvetica", "I", 9)
+    pdf.set_text_color(92, 102, 116)
+    pdf.cell(0, 5, f"Confiabilidad de biomarcadores: {confiabilidad}", ln=True)
+    pdf.set_text_color(28, 32, 38)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.ln(2)
 
     pdf.add_block_title("2. Mapas topográficos de proporciones e índice de lentificación")
     if ok_topomaps_ratios and os.path.exists(ruta_topomaps_ratios):
@@ -4390,14 +4942,20 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     else:
         log("[OK] No se detectaron canales sospechosos.")
 
-    # --- INTERPOLACIÓN ESPACIAL ESTRICTA ---
-    # Solo se interpolan los "fuertes". Los "sospechosos" son una categoría
-    # deliberadamente mas leve -- interpolarlos tambien (como se hacia antes,
-    # usando idx_malos_totales aqui) trataba por igual a un canal claramente
-    # dañado y a uno apenas dudoso, reconstruyendo hasta un tercio del
-    # montaje en algunos archivos. Ahora "sospechoso" queda como aviso
-    # informativo en el informe, sin alterar su señal.
+    # --- INTERPOLACIÓN ESPACIAL ADAPTATIVA ---
+    # Por defecto: solo se interpolan los "fuertes". Los "sospechosos" son una
+    # categoría deliberadamente mas leve -- interpolarlos tambien trataba por
+    # igual a un canal claramente dañado y a uno apenas dudoso.
+    # EXCEPCIÓN: si hay muchos fuertes (>10% del montaje), también interpolar
+    # sospechosos para evitar que artefactos residuales contaminen el análisis.
     idx_a_interpolar = list(idx_fuertes)
+    ratio_atipicos = len(idx_fuertes) / max(len(nombres_canales_archivo), 1)
+
+    if ratio_atipicos > 0.10 and len(idx_sospechosos) > 0:
+        idx_a_interpolar.extend(idx_sospechosos)
+        log(f"[Adaptativo] Ratio atipicos {ratio_atipicos:.1%} > 10% -> "
+            f"interpolando tambien {len(idx_sospechosos)} canal(es) 'sospechoso(s)'")
+
     if len(idx_a_interpolar) > 0:
         log(f"[Proceso] Interpolando {len(idx_a_interpolar)} canal(es) defectuoso(s) desde vecinos sanos...")
         datos_fn = interpolar_canales_malos(datos_fn, idx_a_interpolar, nombres_canales_archivo)
@@ -4476,9 +5034,19 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # =========================
     # 6) ICA (MNE-ICLabel)
     # =========================
+    # Pre-ICA: detectar y excluir épocas contaminadas antes de la descomposición
+    mask_valido = _detectar_epocas_contaminadas(datos_fn, fs_real)
+    n_excluidas = np.sum(~mask_valido)
+    if n_excluidas > 0:
+        dur_excluida_s = n_excluidas / fs_real
+        log(f"[Pre-ICA] Excluyendo {n_excluidas} muestras ({dur_excluida_s:.1f}s) de épocas contaminadas")
+        datos_para_ica = datos_fn[:, mask_valido]
+    else:
+        datos_para_ica = datos_fn
+
     log("[Proceso] Ejecutando ICA de grado médico con MNE...")
     datos_ica, porcentaje_varianza_ica = aplicar_ica_mne(
-        datos_fn, fs_real, nombres_canales_archivo, logger=log
+        datos_para_ica, fs_real, nombres_canales_archivo, logger=log
     )
     np.save(
         os.path.join(rutas["ica"], "eeg_ica.npy"),
