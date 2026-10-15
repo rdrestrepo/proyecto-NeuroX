@@ -191,20 +191,90 @@ REGIONES_EEG_64 = {
     ]
 }
 
-# Rangos normales de referencia (% energía relativa)
-rangos_referencia = {
-    "Delta": (0, 25),
-    "Theta": (0, 20),
-    "Alfa":  (15, 35),# estaba en 20-40
-    "Beta":  (10, 30),
-    # "Gamma": (1, 10)
+# =========================
+# CONDICIÓN DEL REGISTRO (PROTOCOLO DE ADQUISICIÓN)
+# =========================
+# NeuroX procesa por defecto registros de reposo vigil con OJOS ABIERTOS y
+# fijación visual sostenida (adultos 20-60 años), integrados en 1.0-30.0 Hz.
+# Las referencias de ojos cerrados (EC) se conservan por compatibilidad; el
+# modo activo se selecciona aquí.
+CONDICION_REGISTRO = "EO"   # "EO" = ojos abiertos con fijación | "EC" = ojos cerrados
+
+# Descripción legible de la condición activa, para informes y consolidados.
+CONDICION_REGISTRO_DESCRIPCION = {
+    "EO": "reposo con ojos abiertos y fijación visual (adultos 20-60 años)",
+    "EC": "reposo con ojos cerrados",
 }
+
+# Margen de flexibilidad general de referencia (puntos porcentuales).
+TOLERANCIA_PP = 4.0
+
+# =========================
+# RANGOS NORMALES DE REFERENCIA DE BANDAS (% energía relativa)
+# =========================
+# Estructura por banda: "normal" (verde), "borderline" (amarillo, lista de
+# intervalos) y "patologico" (rojo, lista de intervalos). None = sin límite.
+# OJOS CERRADOS (EC, legado). El margen borderline reproduce el antiguo
+# umbral_amarillo=5 pp simétrico.
+REFERENCIA_BANDAS_EC = {
+    "Delta": {
+        "normal": (0.0, 25.0),
+        "borderline": [(25.0, 30.0)],
+        "patologico": [(30.0, None)],
+    },
+    "Theta": {
+        "normal": (0.0, 20.0),
+        "borderline": [(20.0, 25.0)],
+        "patologico": [(25.0, None)],
+    },
+    "Alfa": {
+        "normal": (15.0, 35.0),
+        "borderline": [(10.0, 15.0), (35.0, 40.0)],
+        "patologico": [(None, 10.0), (40.0, None)],
+    },
+    "Beta": {
+        "normal": (10.0, 30.0),
+        "borderline": [(5.0, 10.0), (30.0, 35.0)],
+        "patologico": [(None, 5.0), (35.0, None)],
+    },
+}
+
+# OJOS ABIERTOS CON FIJACIÓN (EO). El bloqueo de Alfa (reactividad de Berger)
+# infla el porcentaje relativo de Delta y de los cocientes; se eleva el techo
+# normal de Delta y se admite un piso de Alfa/Beta más bajo. Bandas con piso en
+# 0.0 no penalizan valores bajos (no son patológicos en vigilia).
+REFERENCIA_BANDAS_EO = {
+    "Delta": {
+        "normal": (0.0, 32.0),
+        "borderline": [(32.0, 36.0)],
+        "patologico": [(36.0, None)],
+    },
+    "Theta": {
+        "normal": (0.0, 20.0),
+        "borderline": [(20.0, 24.0)],
+        "patologico": [(24.0, None)],
+    },
+    "Alfa": {
+        "normal": (10.0, 35.0),
+        "borderline": [(6.0, 10.0), (35.0, 39.0)],
+        "patologico": [(None, 6.0), (39.0, None)],
+    },
+    "Beta": {
+        "normal": (12.0, 32.0),
+        "borderline": [(8.0, 12.0), (32.0, 36.0)],
+        "patologico": [(None, 8.0), (36.0, None)],
+    },
+}
+
+# Vista simplificada (banda -> rango normal) conservada por compatibilidad con
+# código previo que solo consulta el intervalo normal de la condición EC.
+rangos_referencia = {banda: ref["normal"] for banda, ref in REFERENCIA_BANDAS_EC.items()}
 
 # =========================
 # RANGOS DE REFERENCIA CLÍNICOS PARA PROPORCIONES (BIOMARCADORES DCL)
 # =========================
-# Rangos basados en literatura de neurodegeneración para reposo con ojos cerrados en adultos.
 # TAR: Theta/Alfa, DAR: Delta/Alfa, TBR: Theta/Beta, SLOW: Índice de Lentificación
+# EC (legado): referencia clásica para reposo con ojos cerrados.
 REFERENCIA_RATIOS = {
     "Theta_Alfa": {
         "label": "Theta/Alfa (TAR)",
@@ -232,7 +302,41 @@ REFERENCIA_RATIOS = {
     },
 }
 
-# Umbrales de PAF (Frecuencia Pico de Alfa)
+# EO: umbrales para ojos abiertos con fijación. El piso se lleva a 0.00 para
+# evitar falsos "Patologico" en sujetos con cocientes muy bajos (bug de límite
+# inferior) y se eleva el techo normal para absorber la inflación relativa por
+# bloqueo de Alfa. Nota: el promedio de los cocientes por canal (E[D/A]) es
+# mayor que el cociente de los promedios (E[D]/E[A]) -- desigualdad de Jensen --
+# por eso los cortes son deliberadamente más permisivos que en EC.
+REFERENCIA_RATIOS_EO = {
+    "Theta_Alfa": {
+        "label": "Theta/Alfa (TAR)",
+        "normal": (0.00, 1.20),
+        "borderline": (1.20, 1.50),
+        "patologico": (1.50, None),
+    },
+    "Delta_Alfa": {
+        "label": "Delta/Alfa (DAR)",
+        "normal": (0.00, 1.60),
+        "borderline": (1.60, 2.20),
+        "patologico": (2.20, None),
+    },
+    "Theta_Beta": {
+        "label": "Theta/Beta (TBR)",
+        "normal": (0.00, 2.00),
+        "borderline": (2.00, 2.50),
+        "patologico": (2.50, None),
+    },
+    "Lentificacion": {
+        "label": "Índice de Lentificación",
+        "normal": (0.00, 1.35),
+        "borderline": (1.35, 1.70),
+        "patologico": (1.70, None),
+    },
+}
+
+# Umbrales de PAF (Frecuencia Pico de Alfa). Independientes de la condición: el
+# bloqueo visual reduce la amplitud de Alfa, no su frecuencia central.
 PAF_UMBRALES = {
     "normal": 9.50,        # >= 9.50 Hz: Normal/Conservado
     "borderline_low": 9.00, # 9.00-9.49 Hz: Límite/Borderline
@@ -244,9 +348,13 @@ CANALES_OCCIPITAL_PAF = ["O1", "O2", "OZ", "POZ"]
 CANALES_FRONTAL_GRADIENTE = ["FP1", "FP2", "F3", "F4", "F7", "F8", "FZ"]
 
 # Umbrales de Gradiente Antero-Posterior de Alfa
-GRADIENTE_AP_UMBRALES = {
+GRADIENTE_AP_UMBRALES = {   # EC (legado)
     "normal": 1.50,    # > 1.50: Fuerte dominancia posterior
     "patologico": 1.00, # < 1.00: Anteriorizado/Patológico
+}
+GRADIENTE_AP_UMBRALES_EO = {   # EO: el bloqueo occipital selectivo atenúa el gradiente
+    "normal": 1.20,    # > 1.20: dominancia posterior conservada
+    "patologico": 0.95, # < 0.95: Anteriorizado/Lentificado
 }
 
 
@@ -1808,10 +1916,11 @@ def calcular_gradiente_ap_alfa(pot_rel_alfa, nombres_canales, eps=1e-12):
     """
     Calcula el Gradiente Antero-Posterior de Alfa.
     
-    En sujetos sanos con ojos cerrados, la potencia de Alfa es predominante
-    atrás (Occipital) y muy baja adelante (Frontal). En el deterioro cognitivo
-    temprano se produce la "anteriorización del ritmo Alfa" (el gradiente
-    posterior se aplasta o se vuelve difuso).
+    En sujetos sanos, la potencia de Alfa es predominante atrás (Occipital) y
+    muy baja adelante (Frontal). En el deterioro cognitivo temprano se produce
+    la "anteriorización del ritmo Alfa" (el gradiente posterior se aplasta o se
+    vuelve difuso). Con ojos abiertos el bloqueo visual atenúa el gradiente de
+    forma fisiológica, por eso la interpretación usa umbrales específicos EO.
     
     Gradiente AP = Potencia Alfa Occipital / Potencia Alfa Frontal
     
@@ -1821,7 +1930,7 @@ def calcular_gradiente_ap_alfa(pot_rel_alfa, nombres_canales, eps=1e-12):
         eps: Valor mínimo para evitar división por cero
     
     Returns:
-        gradiente_ap: Valor del gradiente (típicamente > 1.5 en sanos)
+        gradiente_ap: Valor del gradiente (> 1.20 en sanos con ojos abiertos)
         alfa_occipital: Promedio de Alfa en canales occipitales
         alfa_frontal: Promedio de Alfa en canales frontales
     """
@@ -1851,7 +1960,27 @@ def calcular_gradiente_ap_alfa(pot_rel_alfa, nombres_canales, eps=1e-12):
     return gradiente_ap, alfa_occipital, alfa_frontal
 
 
-def clasificar_semaforo(valor, tipo):
+def _usar_referencia_eo(condicion=None):
+    """Indica si debe usarse la referencia de ojos abiertos (EO)."""
+    return str(condicion or CONDICION_REGISTRO).upper() == "EO"
+
+
+def _referencia_bandas_activa(condicion=None):
+    """Devuelve el diccionario de referencia de bandas según la condición activa."""
+    return REFERENCIA_BANDAS_EO if _usar_referencia_eo(condicion) else REFERENCIA_BANDAS_EC
+
+
+def _referencia_ratios_activa(condicion=None):
+    """Devuelve el diccionario de referencia de proporciones según la condición activa."""
+    return REFERENCIA_RATIOS_EO if _usar_referencia_eo(condicion) else REFERENCIA_RATIOS
+
+
+def _gradiente_ap_umbrales_activos(condicion=None):
+    """Devuelve los umbrales del Gradiente AP según la condición activa."""
+    return GRADIENTE_AP_UMBRALES_EO if _usar_referencia_eo(condicion) else GRADIENTE_AP_UMBRALES
+
+
+def clasificar_semaforo(valor, tipo, condicion=None):
     """
     Clasifica un valor según los rangos de referencia clínicos.
     
@@ -1859,6 +1988,7 @@ def clasificar_semaforo(valor, tipo):
         valor: Valor a clasificar
         tipo: Tipo de métrica ("Theta_Alfa", "Delta_Alfa", "Theta_Beta", 
               "Lentificacion", "PAF", "Gradiente_AP")
+        condicion: "EO" (ojos abiertos, por defecto) o "EC" (ojos cerrados)
     
     Returns:
         dict con "estado" ("Normal", "Borderline", "Patologico") y 
@@ -1867,8 +1997,8 @@ def clasificar_semaforo(valor, tipo):
     if not np.isfinite(valor):
         return {"estado": "N/D", "color": "gray"}
     
-    if tipo in REFERENCIA_RATIOS:
-        ref = REFERENCIA_RATIOS[tipo]
+    if tipo in _referencia_ratios_activa(condicion):
+        ref = _referencia_ratios_activa(condicion)[tipo]
         low_normal, high_normal = ref["normal"]
         low_border, high_border = ref["borderline"]
         
@@ -1888,9 +2018,10 @@ def clasificar_semaforo(valor, tipo):
             return {"estado": "Lentificado", "color": "red"}
     
     elif tipo == "Gradiente_AP":
-        if valor > GRADIENTE_AP_UMBRALES["normal"]:
+        umbrales = _gradiente_ap_umbrales_activos(condicion)
+        if valor > umbrales["normal"]:
             return {"estado": "Normal", "color": "green"}
-        elif valor >= GRADIENTE_AP_UMBRALES["patologico"]:
+        elif valor >= umbrales["patologico"]:
             return {"estado": "Intermedio", "color": "yellow"}
         else:
             return {"estado": "Anteriorizado", "color": "red"}
@@ -2162,11 +2293,19 @@ def calcular_ratios_welch_principales(pot_rel, ratios_def=None, eps=1e-12):
         ratios_def = RATIOS_WELCH_PRINCIPALES
 
     ratios = {}
+    # Cociente de medias (E[num]/E[den]) conservado solo con fines de auditoría:
+    # el promedio de los cocientes por canal (desigualdad de Jensen) es mayor que
+    # esta cantidad, lo que explica la inflación de los ratios globales en EO.
+    cociente_medias = {}
     for nombre, spec in ratios_def.items():
         num = _sumar_bandas_para_ratio(pot_rel, spec["numerador"])
         den = _sumar_bandas_para_ratio(pot_rel, spec["denominador"])
         den_safe = np.where(np.abs(den) <= eps, eps, den)
         ratios[nombre] = (num / den_safe).astype(np.float32)
+
+        num_media = float(np.nanmean(np.asarray(num, dtype=np.float64)))
+        den_media = float(np.nanmean(np.asarray(den, dtype=np.float64)))
+        cociente_medias[nombre] = (num_media / den_media) if abs(den_media) > eps else float("nan")
 
     promedios_globales = {
         nombre: float(np.nanmean(np.asarray(valores, dtype=np.float64)))
@@ -2176,6 +2315,7 @@ def calcular_ratios_welch_principales(pot_rel, ratios_def=None, eps=1e-12):
     return {
         "ratios": ratios,
         "promedios_globales": promedios_globales,
+        "cociente_medias": cociente_medias,
     }
 
 
@@ -2229,6 +2369,7 @@ def guardar_ratios_welch_principales(
             for k, v in ratios_def.items()
         },
         "promedios_globales": resultado_ratios["promedios_globales"],
+        "cociente_medias": resultado_ratios.get("cociente_medias", {}),
         "promedios_regionales": promedios_region,
         "semaforos": semaforos,
     }
@@ -2729,33 +2870,53 @@ def calcular_resumen_calidad_senal(
 
 
 
-def evaluar_banda(banda, valor, umbral_amarillo=5):
-    low, high = rangos_referencia[banda]
+def _clasificar_intervalo_banda(valor, referencia):
+    """
+    Evalúa un valor porcentual contra la estructura normal/borderline/patologico
+    de una banda. Devuelve (estado, color, detalle). Las zonas borderline y
+    patológicas pueden ser asimétricas (dos lados) y con extremos abiertos.
+    """
+    low, high = referencia["normal"]
+
+    if low <= valor <= high:
+        dist_pp = min(valor - low, high - valor)
+        return "En rango", "green", f"En rango (a {dist_pp:.2f} pp del límite más cercano)"
+
+    for b_low, b_high in referencia.get("borderline", []):
+        if (b_low is None or valor > b_low) and (b_high is None or valor <= b_high):
+            dist_pp = (low - valor) if valor < low else (valor - high)
+            return "Zona límite", "yellow", f"Zona límite (a {dist_pp:.2f} pp del rango normal)"
 
     if valor < low:
         estado = "Por debajo"
         diff_pp = low - valor
-        detalle = f"{estado} por {diff_pp:.2f} pp"
-    elif valor > high:
+    else:
         estado = "Por encima"
         diff_pp = valor - high
-        detalle = f"{estado} por {diff_pp:.2f} pp"
-    else:
-        estado = "En rango"
-        dist_pp = min(valor - low, high - valor)
-        detalle = f"{estado} (a {dist_pp:.2f} pp del límite más cercano)"
+    return estado, "red", f"{estado} por {diff_pp:.2f} pp"
 
-    if low <= valor <= high:
-        color = "green"
-    else:
-        if abs(valor - high) <= umbral_amarillo or abs(valor - low) <= umbral_amarillo:
-            color = "yellow"
-        else:
-            color = "red"
+
+def evaluar_banda(banda, valor, condicion=None):
+    """
+    Compara el valor global de una banda contra su rango de referencia según la
+    condición activa (EO por defecto, EC disponible).
+
+    Returns:
+        dict {"banda","valor","low","high","estado","detalle","color"} tal como
+        lo consume add_tabla_comparacion_referencia().
+    """
+    referencia = _referencia_bandas_activa(condicion)
+    if banda not in referencia:
+        raise KeyError(f"Banda sin referencia definida: {banda}")
+
+    ref = referencia[banda]
+    valor = float(valor)
+    estado, color, detalle = _clasificar_intervalo_banda(valor, ref)
+    low, high = ref["normal"]
 
     return {
         "banda": banda,
-        "valor": float(valor),
+        "valor": valor,
         "low": float(low),
         "high": float(high),
         "estado": estado,
@@ -4326,19 +4487,24 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
         pdf.add_wrapped_text(str(info_calidad), font_size=10.2)
 
     pdf.add_section_title("Potencia relativa por bandas")
+    descripcion_condicion = CONDICION_REGISTRO_DESCRIPCION.get(
+        CONDICION_REGISTRO, CONDICION_REGISTRO
+    )
     pdf.add_wrapped_text(
-        "La potencia relativa expresa qué porcentaje de la energía espectral total del EEG se concentra en cada banda de frecuencia, permitiendo comparar la distribución de Delta, Theta, Alfa y Beta entre canales y regiones.",
+        "La potencia relativa expresa qué porcentaje de la energía espectral total del EEG se concentra en cada banda de frecuencia (1.0-30.0 Hz), permitiendo comparar la distribución de Delta, Theta, Alfa y Beta entre canales y regiones. "
+        f"El registro corresponde a {descripcion_condicion}.",
         font_size=10.2,
     )
     promedios_globales_welch = resumen_welch.get("promedios_globales", {}) if isinstance(resumen_welch, dict) else {}
+    referencia_bandas_activa = _referencia_bandas_activa()
 
     pdf.add_block_title("1. Tabla de promedios globales de potencia relativa por bandas con semáforo")
     filas_potencia = []
     for banda in ("Delta", "Theta", "Alfa", "Beta"):
         valor = promedios_globales_welch.get(banda, np.nan)
-        if np.isfinite(valor) and banda in rangos_referencia:
+        if np.isfinite(valor) and banda in referencia_bandas_activa:
             evaluacion = evaluar_banda(banda, float(valor))
-            filas_potencia.append([banda, _fmt_pct_informe(valor), evaluacion["detalle"]])
+            filas_potencia.append([banda, _fmt_pct_informe(valor), evaluacion["estado"]])
         else:
             filas_potencia.append([banda, _fmt_pct_informe(valor), "N/D"])
     pdf.add_visual_table(
@@ -4358,7 +4524,7 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     filas_evaluacion_bandas = []
     for banda in ("Delta", "Theta", "Alfa", "Beta"):
         valor_banda = promedios_globales_welch.get(banda, np.nan)
-        if np.isfinite(valor_banda) and banda in rangos_referencia:
+        if np.isfinite(valor_banda) and banda in referencia_bandas_activa:
             filas_evaluacion_bandas.append(evaluar_banda(banda, float(valor_banda)))
     if filas_evaluacion_bandas:
         pdf.add_tabla_comparacion_referencia(filas_evaluacion_bandas)
@@ -4459,11 +4625,12 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
         # Gradiente Antero-Posterior
         if gradiente_ap is not None and np.isfinite(gradiente_ap):
             semaforo_ap = clasificar_semaforo(gradiente_ap, "Gradiente_AP")
+            umbrales_ap = _gradiente_ap_umbrales_activos()
             pdf.add_wrapped_text(
                 f"Gradiente Antero-Posterior de Alfa: {gradiente_ap:.2f} "
                 f"(Alfa Occipital: {alfa_occipital:.2f}% / Alfa Frontal: {alfa_frontal:.2f}%). "
-                f"Valores > 1.50 indican fuerte dominancia posterior (normal); "
-                f"valores < 1.00 sugieren anteriorización del ritmo Alfa.",
+                f"Valores > {umbrales_ap['normal']:.2f} indican dominancia posterior conservada (normal); "
+                f"valores < {umbrales_ap['patologico']:.2f} sugieren anteriorización del ritmo Alfa.",
                 font_size=9.0,
             )
             # Tabla con semáforo para Gradiente AP

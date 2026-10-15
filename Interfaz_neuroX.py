@@ -44,6 +44,9 @@ from pipeline_eeg_completo import (
     limpiar_nombre_canal,
     obtener_nombres_canales_64,
     buscar_logo_neurox,
+    clasificar_semaforo,
+    CONDICION_REGISTRO,
+    CONDICION_REGISTRO_DESCRIPCION,
 )
 
 ## Generadores de consolidados (nuevo)
@@ -6131,7 +6134,11 @@ class AppEEG:
 
         self.lbl_subtitulo_biomarcadores = ttk.Label(
             self.frm_biomarcadores_izq,
-            text="Métricas de apoyo para evaluación de deterioro cognitivo",
+            text=(
+                "Métricas descriptivas de apoyo a la evaluación de deterioro "
+                "cognitivo. Condición de referencia: "
+                f"{CONDICION_REGISTRO_DESCRIPCION.get(CONDICION_REGISTRO, CONDICION_REGISTRO)}."
+            ),
             style="Sidebar.TLabel",
             anchor="w",
             justify="left",
@@ -6205,67 +6212,75 @@ class AppEEG:
                 self._resumen_ratios = None
 
     def _actualizar_biomarcadores(self):
-        """Actualiza las etiquetas de biomarcadores DCL con datos del cache."""
+        """Actualiza las etiquetas de biomarcadores DCL con datos del cache.
+
+        Los estados y colores se derivan de clasificar_semaforo() del pipeline,
+        de modo que los umbrales (condición EO) tengan una única fuente de
+        verdad y no se desincronicen entre la interfaz, el PDF y el Excel.
+        """
         if not hasattr(self, "lbl_paf_global"):
             return
 
+        nombre_ratio = {
+            "Theta_Alfa": "Theta/Alfa",
+            "Delta_Alfa": "Delta/Alfa",
+            "Theta_Beta": "Theta/Beta",
+            "Lentificacion": "Lentificación",
+        }
+        color_semaforo = {
+            "green": "#1E6E32",
+            "yellow": "#966900",
+            "red": "#A01E1E",
+            "gray": TEXTO_SECUNDARIO,
+        }
+
         # Valores por defecto
-        self.lbl_paf_global.config(text="PAF Global: -- Hz")
-        self.lbl_paf_occipital.config(text="PAF Occipital: -- Hz")
-        self.lbl_gradiente_ap.config(text="Gradiente AP: --")
+        self.lbl_paf_global.config(text="PAF Global: -- Hz", foreground=TEXTO_PRINCIPAL)
+        self.lbl_paf_occipital.config(text="PAF Occipital: -- Hz", foreground=TEXTO_PRINCIPAL)
+        self.lbl_gradiente_ap.config(text="Gradiente AP: --", foreground=TEXTO_PRINCIPAL)
 
-        for clave in self.lbl_ratios_semaforo:
-            nombre = {
-                "Theta_Alfa": "Theta/Alfa",
-                "Delta_Alfa": "Delta/Alfa",
-                "Theta_Beta": "Theta/Beta",
-                "Lentificacion": "Lentificación",
-            }.get(clave, clave)
-            self.lbl_ratios_semaforo[clave].config(text=f"{nombre}: --")
+        for clave, lbl in self.lbl_ratios_semaforo.items():
+            lbl.config(text=f"{nombre_ratio.get(clave, clave)}: --", foreground=TEXTO_PRINCIPAL)
 
-        if self._resumen_welch is None:
-            return
+        if self._resumen_welch is not None:
+            # PAF Global y Occipital
+            paf_global = self._resumen_welch.get("paf_global_hz")
+            if paf_global is not None and np.isfinite(paf_global):
+                semaforo = clasificar_semaforo(paf_global, "PAF")
+                self.lbl_paf_global.config(
+                    text=f"PAF Global: {paf_global:.2f} Hz ({semaforo['estado']})",
+                    foreground=color_semaforo.get(semaforo["color"], TEXTO_PRINCIPAL),
+                )
 
-        # PAF Global
-        paf_global = self._resumen_welch.get("paf_global_hz")
-        if paf_global is not None and np.isfinite(paf_global):
-            estado = "Normal" if paf_global >= 9.50 else ("Borderline" if paf_global >= 9.00 else "Lentificado")
-            color = "#1E6E32" if estado == "Normal" else ("#966900" if estado == "Borderline" else "#A01E1E")
-            self.lbl_paf_global.config(text=f"PAF Global: {paf_global:.2f} Hz ({estado})", foreground=color)
+            paf_occipital = self._resumen_welch.get("paf_occipital_hz")
+            if paf_occipital is not None and np.isfinite(paf_occipital):
+                semaforo = clasificar_semaforo(paf_occipital, "PAF")
+                self.lbl_paf_occipital.config(
+                    text=f"PAF Occipital: {paf_occipital:.2f} Hz ({semaforo['estado']})",
+                    foreground=color_semaforo.get(semaforo["color"], TEXTO_PRINCIPAL),
+                )
 
-        # PAF Occipital
-        paf_occipital = self._resumen_welch.get("paf_occipital_hz")
-        if paf_occipital is not None and np.isfinite(paf_occipital):
-            estado = "Normal" if paf_occipital >= 9.50 else ("Borderline" if paf_occipital >= 9.00 else "Lentificado")
-            color = "#1E6E32" if estado == "Normal" else ("#966900" if estado == "Borderline" else "#A01E1E")
-            self.lbl_paf_occipital.config(text=f"PAF Occipital: {paf_occipital:.2f} Hz ({estado})", foreground=color)
-
-        # Gradiente AP
-        gradiente_ap = self._resumen_welch.get("gradiente_ap")
-        if gradiente_ap is not None and np.isfinite(gradiente_ap):
-            estado = "Normal" if gradiente_ap > 1.50 else ("Intermedio" if gradiente_ap >= 1.00 else "Anteriorizado")
-            color = "#1E6E32" if estado == "Normal" else ("#966900" if estado == "Intermedio" else "#A01E1E")
-            self.lbl_gradiente_ap.config(text=f"Gradiente AP: {gradiente_ap:.2f} ({estado})", foreground=color)
+            # Gradiente Antero-Posterior de Alfa
+            gradiente_ap = self._resumen_welch.get("gradiente_ap")
+            if gradiente_ap is not None and np.isfinite(gradiente_ap):
+                semaforo = clasificar_semaforo(gradiente_ap, "Gradiente_AP")
+                self.lbl_gradiente_ap.config(
+                    text=f"Gradiente AP: {gradiente_ap:.2f} ({semaforo['estado']})",
+                    foreground=color_semaforo.get(semaforo["color"], TEXTO_PRINCIPAL),
+                )
 
         # Ratios con semáforo
         if hasattr(self, "_resumen_ratios") and self._resumen_ratios:
-            semaforos = self._resumen_ratios.get("semaforos", {})
             promedios = self._resumen_ratios.get("promedios_globales", {})
 
             for clave, lbl in self.lbl_ratios_semaforo.items():
                 valor = promedios.get(clave)
-                semaforo = semaforos.get(clave, {})
-                estado = semaforo.get("estado", "N/D")
-
                 if valor is not None and np.isfinite(valor):
-                    color = "#1E6E32" if estado == "Normal" else ("#966900" if estado == "Borderline" else "#A01E1E")
-                    nombre = {
-                        "Theta_Alfa": "Theta/Alfa",
-                        "Delta_Alfa": "Delta/Alfa",
-                        "Theta_Beta": "Theta/Beta",
-                        "Lentificacion": "Lentificación",
-                    }.get(clave, clave)
-                    lbl.config(text=f"{nombre}: {valor:.2f} ({estado})", foreground=color)
+                    semaforo = clasificar_semaforo(valor, clave)
+                    lbl.config(
+                        text=f"{nombre_ratio.get(clave, clave)}: {valor:.2f} ({semaforo['estado']})",
+                        foreground=color_semaforo.get(semaforo["color"], TEXTO_PRINCIPAL),
+                    )
 
     def _nombre_simple(self, nombre_canal: str) -> str:
         """Convierte variantes visibles como 'FP1-avg' a 'FP1'."""

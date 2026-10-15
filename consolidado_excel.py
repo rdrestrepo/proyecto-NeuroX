@@ -167,6 +167,10 @@ def clasificar_semaforo_simple(valor, tipo):
     """
     Clasifica un valor según los rangos de referencia clínicos.
     Versión simplificada para el consolidado Excel.
+
+    Los umbrales de Gradiente AP corresponden a la condición de ojos abiertos
+    con fijación (EO). Deben mantenerse sincronizados con
+    GRADIENTE_AP_UMBRALES_EO y PAF_UMBRALES en pipeline_eeg_completo.py.
     """
     if valor is None or not isinstance(valor, (int, float)):
         return "N/D"
@@ -180,9 +184,9 @@ def clasificar_semaforo_simple(valor, tipo):
             return "Lentificado"
     
     elif tipo == "Gradiente_AP":
-        if valor > 1.50:
+        if valor > 1.20:
             return "Normal"
-        elif valor >= 1.00:
+        elif valor >= 0.95:
             return "Intermedio"
         else:
             return "Anteriorizado"
