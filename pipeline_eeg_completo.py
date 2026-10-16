@@ -343,6 +343,19 @@ PAF_UMBRALES = {
     # < 9.00 Hz: Lentificado (Sugestivo de DCL)
 }
 
+# Estado cuando NO existe un pico de Alfa medible. Con ojos abiertos y fijación
+# visual esto es un hallazgo fisiológico esperado (reactividad de Berger): el
+# informe debe describirlo como normal, nunca como Lentificado ni como fallo.
+ESTADO_PAF_SIN_PICO = "Bloqueo visual (Normal EO)"
+
+# Parámetros del detector de PAF para Ojos Abiertos (descuento de la pendiente
+# 1/f local + find_peaks). Calibrados sobre registros reales: rechazan rampas
+# 1/f y hombros no prominentes, pero conservan picos genuinos (incluido 8.5 Hz).
+PAF_EO_PARAMS = {
+    "prominencia_factor": 0.12,  # fracción del promedio de banda usada como prominencia mínima
+    "ratio_min": 1.18,           # la cresta debe superar este factor a la base 1/f local
+}
+
 # Canales fijos para cálculos específicos (montaje 10-20 estándar)
 CANALES_OCCIPITAL_PAF = ["O1", "O2", "OZ", "POZ"]
 CANALES_FRONTAL_GRADIENTE = ["FP1", "FP2", "F3", "F4", "F7", "F8", "FZ"]
@@ -1820,20 +1833,25 @@ def energia_relativa_por_region(pct_por_canal: dict, nombres_canales: list, band
 def calcular_paf_por_canal(freqs, psd, banda_alfa=(8.0, 13.0)):
     """
     Frecuencia Pico de Alfa (PAF) por canal: la frecuencia, dentro de la
-    banda Alfa, donde la densidad espectral de potencia (PSD) es maxima.
-    Metrica estandar en qEEG clinico -- se reporta consistentemente
-    desplazada hacia abajo (8-9 Hz en vez de 9.5-10.5 Hz) en poblaciones
-    con deterioro cognitivo, independientemente de si la potencia relativa
-    de Alfa esta alta o baja.
+    banda Alfa, donde la densidad espectral de potencia (PSD) forma una
+    cresta fisiológica real. Metrica estandar en qEEG clinico -- se reporta
+    desplazada hacia abajo en poblaciones con deterioro cognitivo.
 
-    Reutiliza el freqs/psd que ya calcula calcular_psd_welch_por_canal --
-    no vuelve a correr Welch.
+    Adaptada al paradigma de OJOS ABIERTOS con fijación visual: el bloqueo de
+    Berger puede atenuar o suprimir el pico de Alfa, dejando solo la rampa
+    descendente 1/f. Tomar el maximo absoluto (argmax) sobre esa rampa produce
+    falsos "Lentificado" cerca del borde inferior de la banda. Por eso aqui:
+
+    1. Se descuenta la pendiente 1/f local (recta que une los extremos 8-13 Hz).
+    2. Se exigen crestas locales reales con scipy.signal.find_peaks sobre el residuo.
+    3. Si no hay cresta prominente, el canal se marca valido=False (bloqueo
+       visual normal en ojos abiertos), en lugar de inventar una frecuencia.
+
+    Reutiliza el freqs/psd que ya calcula calcular_psd_welch_por_canal.
 
     Retorna (paf_hz, valido):
     - paf_hz: array (n_canales,) con la frecuencia del pico por canal.
-    - valido: array booleano -- False si el "pico" esta en el borde de la
-      banda o no se distingue lo suficiente del resto (espectro plano),
-      caso en el cual paf_hz no deberia interpretarse como un pico real.
+    - valido: array booleano -- False si no hay un pico real distinguible.
     """
     freqs = np.asarray(freqs, dtype=np.float64)
     psd = np.asarray(psd, dtype=np.float64)
@@ -1843,28 +1861,38 @@ def calcular_paf_por_canal(freqs, psd, banda_alfa=(8.0, 13.0)):
     paf_hz = np.full(n_canales, np.nan, dtype=np.float32)
     valido = np.zeros(n_canales, dtype=bool)
 
-    if not np.any(mask) or np.count_nonzero(mask) < 3:
+    if not np.any(mask) or np.count_nonzero(mask) < 4:
         return paf_hz, valido
 
     freqs_alfa = freqs[mask]
     psd_alfa = psd[:, mask]
+    prom_factor = float(PAF_EO_PARAMS["prominencia_factor"])
+    ratio_min = float(PAF_EO_PARAMS["ratio_min"])
 
     for c in range(n_canales):
         fila = psd_alfa[c]
         if not np.all(np.isfinite(fila)) or np.all(fila <= 0):
             continue
-        idx_max = int(np.argmax(fila))
-        paf_hz[c] = freqs_alfa[idx_max]
 
-        # Un "pico" en el primer o ultimo bin de la banda probablemente no
-        # es un pico real, sino el borde de una pendiente que sigue fuera
-        # de la banda Alfa. Tambien se exige que el maximo supere al
-        # promedio de la banda por un margen razonable (evita reportar un
-        # "pico" en un espectro esencialmente plano).
-        en_el_borde = idx_max == 0 or idx_max == len(fila) - 1
+        # 1. Modelar la rampa 1/f local con la recta que une los extremos.
+        pendiente = (fila[-1] - fila[0]) / max(freqs_alfa[-1] - freqs_alfa[0], 1e-6)
+        rampa_1f = fila[0] + pendiente * (freqs_alfa - freqs_alfa[0])
+        residuo = fila - rampa_1f
+
+        # 2. Crestas locales reales (subida y bajada) por encima de la rampa.
         promedio_banda = float(np.mean(fila))
-        supera_promedio = promedio_banda > 0 and (fila[idx_max] / promedio_banda) >= 1.2
-        valido[c] = (not en_el_borde) and supera_promedio
+        prominencia_min = max(promedio_banda * prom_factor, 1e-12)
+        peaks, props = find_peaks(residuo, prominence=prominencia_min)
+        if peaks.size == 0:
+            # Sin cresta local: bloqueo fisiológico de Alfa o espectro plano.
+            continue
+
+        # 3. Elegir la cresta más prominente y exigir que destaque sobre la 1/f.
+        idx_mejor = int(peaks[np.argmax(props["prominences"])])
+        base_local = max(float(rampa_1f[idx_mejor]), promedio_banda * 0.5, 1e-12)
+        if (fila[idx_mejor] / base_local) >= ratio_min:
+            paf_hz[c] = float(freqs_alfa[idx_mejor])
+            valido[c] = True
 
     return paf_hz, valido
 
@@ -1874,9 +1902,11 @@ def calcular_paf_occipital(freqs, psd, nombres_canales, banda_alfa=(8.0, 13.0)):
     Calcula el PAF (Frecuencia Pico de Alfa) promediado solo en canales occipitales.
     
     El ritmo Alfa espontáneo es un generador tálamo-cortical que se proyecta
-    con máxima potencia en la región occipital/parieto-occipital durante ojos
-    cerrados. Esta métrica es más específica que el PAF global para detectar
-    lentificación del ritmo posterior.
+    con máxima potencia en la región occipital/parieto-occipital. Con ojos
+    abiertos y fijación visual su amplitud puede atenuarse (reactividad de
+    Berger), por lo que se promedia solo sobre los canales donde persiste una
+    cresta real (ver calcular_paf_por_canal). Esta métrica es más específica
+    que el PAF global para detectar lentificación del ritmo posterior.
     
     Args:
         freqs: Array de frecuencias del PSD
@@ -1994,6 +2024,12 @@ def clasificar_semaforo(valor, tipo, condicion=None):
         dict con "estado" ("Normal", "Borderline", "Patologico") y 
         "color" ("green", "yellow", "red")
     """
+    if valor is None:
+        return {"estado": "N/D", "color": "gray"}
+    try:
+        valor = float(valor)
+    except (TypeError, ValueError):
+        return {"estado": "N/D", "color": "gray"}
     if not np.isfinite(valor):
         return {"estado": "N/D", "color": "gray"}
     
@@ -4585,78 +4621,82 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     alfa_occipital = resumen_welch.get("alfa_occipital") if isinstance(resumen_welch, dict) else None
     alfa_frontal = resumen_welch.get("alfa_frontal") if isinstance(resumen_welch, dict) else None
 
+    # Nota de paradigma: en Ojos Abiertos la ausencia de pico Alfa es esperable.
+    pdf.add_wrapped_text(
+        "Nota clínica (Paradigma Ojos Abiertos): durante la fijación visual, la "
+        "desincronización fisiológica (reactividad de Berger) atenúa o suprime el pico "
+        "de Alfa occipital en sujetos sanos. Por ello, la ausencia de un pico prominente "
+        "es un hallazgo normal de reactividad visual y no un fallo de adquisición. El PAF "
+        "solo se evalúa cuando persiste una cresta espectral real por encima de la "
+        "pendiente 1/f (ritmo Alfa residual o ritmo Mu sensoriomotor).",
+        font_size=9.0,
+    )
+
+    # Tabla de estratificación PAF (siempre presente; muestra el estado sin pico).
+    filas_paf = []
     if paf_global_hz is not None and np.isfinite(paf_global_hz):
         semaforo_paf_global = clasificar_semaforo(paf_global_hz, "PAF")
+        filas_paf.append([
+            f"PAF Global ({paf_canales_validos}/{paf_canales_totales} can.)",
+            f"{paf_global_hz:.2f} Hz",
+            semaforo_paf_global["estado"],
+        ])
+    else:
+        filas_paf.append([
+            f"PAF Global ({paf_canales_validos}/{paf_canales_totales} can.)",
+            "Sin pico prominente",
+            ESTADO_PAF_SIN_PICO,
+        ])
+
+    if paf_occipital_hz is not None and np.isfinite(paf_occipital_hz):
+        semaforo_paf_occipital = clasificar_semaforo(paf_occipital_hz, "PAF")
+        filas_paf.append([
+            f"PAF Occipital ({paf_occipital_canales}/4 can.)",
+            f"{paf_occipital_hz:.2f} Hz",
+            semaforo_paf_occipital["estado"],
+        ])
+    else:
+        filas_paf.append([
+            "PAF Occipital (O1, O2, Oz, POz)",
+            "Sin pico prominente",
+            ESTADO_PAF_SIN_PICO,
+        ])
+
+    pdf.add_visual_table(
+        headers=["Métrica", "Valor", "Interpretación (Ojos Abiertos)"],
+        rows=filas_paf,
+        col_widths=[62, 42, 54],
+        alignments=["L", "C", "C"],
+    )
+
+    # Gradiente Antero-Posterior (independiente de que exista PAF medible).
+    if gradiente_ap is not None and np.isfinite(gradiente_ap):
+        semaforo_ap = clasificar_semaforo(gradiente_ap, "Gradiente_AP")
+        umbrales_ap = _gradiente_ap_umbrales_activos()
         pdf.add_wrapped_text(
-            f"PAF global: {paf_global_hz:.2f} Hz (calculado sobre {paf_canales_validos} de "
-            f"{paf_canales_totales} canales, donde se identificó un pico distinguible dentro "
-            f"de la banda Alfa; en los demás el espectro no mostró un pico claro en esa banda).",
+            f"Gradiente Antero-Posterior de Alfa: {gradiente_ap:.2f} "
+            f"(Alfa Occipital: {alfa_occipital:.2f}% / Alfa Frontal: {alfa_frontal:.2f}%). "
+            f"Valores > {umbrales_ap['normal']:.2f} indican dominancia posterior conservada (normal); "
+            f"valores < {umbrales_ap['patologico']:.2f} sugieren anteriorización del ritmo Alfa.",
             font_size=9.0,
         )
-        
-        # PAF Occipital (métrica primaria)
-        if paf_occipital_hz is not None and np.isfinite(paf_occipital_hz):
-            semaforo_paf_occipital = clasificar_semaforo(paf_occipital_hz, "PAF")
-            pdf.add_wrapped_text(
-                f"PAF Occipital (O1, O2, Oz, POz): {paf_occipital_hz:.2f} Hz "
-                f"(calculado sobre {paf_occipital_canales} canales occipitales). "
-                f"Esta es la métrica primaria para evaluar el ritmo posterior.",
-                font_size=9.0,
-            )
-        
-        # Tabla de estratificación PAF
-        filas_paf = [
-            ["PAF Global", f"{paf_global_hz:.2f} Hz", semaforo_paf_global["estado"]],
-        ]
-        if paf_occipital_hz is not None and np.isfinite(paf_occipital_hz):
-            filas_paf.append([
-                "PAF Occipital", 
-                f"{paf_occipital_hz:.2f} Hz", 
-                semaforo_paf_occipital["estado"]
-            ])
-        
         pdf.add_visual_table(
             headers=["Métrica", "Valor", "Estado"],
-            rows=filas_paf,
+            rows=[["Gradiente AP", f"{gradiente_ap:.2f}", semaforo_ap["estado"]]],
             col_widths=[50, 40, 50],
             alignments=["L", "C", "C"],
         )
-        
-        # Gradiente Antero-Posterior
-        if gradiente_ap is not None and np.isfinite(gradiente_ap):
-            semaforo_ap = clasificar_semaforo(gradiente_ap, "Gradiente_AP")
-            umbrales_ap = _gradiente_ap_umbrales_activos()
-            pdf.add_wrapped_text(
-                f"Gradiente Antero-Posterior de Alfa: {gradiente_ap:.2f} "
-                f"(Alfa Occipital: {alfa_occipital:.2f}% / Alfa Frontal: {alfa_frontal:.2f}%). "
-                f"Valores > {umbrales_ap['normal']:.2f} indican dominancia posterior conservada (normal); "
-                f"valores < {umbrales_ap['patologico']:.2f} sugieren anteriorización del ritmo Alfa.",
-                font_size=9.0,
-            )
-            # Tabla con semáforo para Gradiente AP
-            pdf.add_visual_table(
-                headers=["Métrica", "Valor", "Estado"],
-                rows=[["Gradiente AP", f"{gradiente_ap:.2f}", semaforo_ap["estado"]]],
-                col_widths=[50, 40, 50],
-                alignments=["L", "C", "C"],
-            )
-        
-        if paf_regional_hz:
-            filas_paf_regional = [
-                [region, f"{valor:.2f} Hz" if np.isfinite(valor) else "sin pico claro"]
-                for region, valor in paf_regional_hz.items()
-            ]
-            pdf.add_visual_table(
-                headers=["Región", "PAF"],
-                rows=filas_paf_regional,
-                col_widths=[60, 50],
-                alignments=["L", "C"],
-            )
-    else:
-        pdf.add_wrapped_text(
-            "No se pudo calcular un PAF confiable para este registro (ningún canal mostró un "
-            "pico claramente distinguible dentro de la banda Alfa).",
-            font_size=9.0,
+
+    if paf_regional_hz:
+        filas_paf_regional = [
+            [region, f"{valor:.2f} Hz" if np.isfinite(valor) else "Bloqueo visual (sin pico)"]
+            for region, valor in paf_regional_hz.items()
+        ]
+        pdf.add_visual_table(
+            headers=["Región", "PAF"],
+            rows=filas_paf_regional,
+            col_widths=[60, 55],
+            alignments=["L", "C"],
         )
 
     # 2. Tabla regional: se reserva espacio antes del título

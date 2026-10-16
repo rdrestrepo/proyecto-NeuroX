@@ -47,6 +47,7 @@ from pipeline_eeg_completo import (
     clasificar_semaforo,
     CONDICION_REGISTRO,
     CONDICION_REGISTRO_DESCRIPCION,
+    ESTADO_PAF_SIN_PICO,
 )
 
 ## Generadores de consolidados (nuevo)
@@ -6243,13 +6244,20 @@ class AppEEG:
             lbl.config(text=f"{nombre_ratio.get(clave, clave)}: --", foreground=TEXTO_PRINCIPAL)
 
         if self._resumen_welch is not None:
-            # PAF Global y Occipital
+            # PAF Global y Occipital. Cuando no hay pico medible, se informa el
+            # bloqueo visual normal de Ojos Abiertos (no un estado patológico).
+            color_bloqueo = color_semaforo["green"]
             paf_global = self._resumen_welch.get("paf_global_hz")
             if paf_global is not None and np.isfinite(paf_global):
                 semaforo = clasificar_semaforo(paf_global, "PAF")
                 self.lbl_paf_global.config(
                     text=f"PAF Global: {paf_global:.2f} Hz ({semaforo['estado']})",
                     foreground=color_semaforo.get(semaforo["color"], TEXTO_PRINCIPAL),
+                )
+            else:
+                self.lbl_paf_global.config(
+                    text=f"PAF Global: {ESTADO_PAF_SIN_PICO}",
+                    foreground=color_bloqueo,
                 )
 
             paf_occipital = self._resumen_welch.get("paf_occipital_hz")
@@ -6258,6 +6266,11 @@ class AppEEG:
                 self.lbl_paf_occipital.config(
                     text=f"PAF Occipital: {paf_occipital:.2f} Hz ({semaforo['estado']})",
                     foreground=color_semaforo.get(semaforo["color"], TEXTO_PRINCIPAL),
+                )
+            else:
+                self.lbl_paf_occipital.config(
+                    text=f"PAF Occipital: {ESTADO_PAF_SIN_PICO}",
+                    foreground=color_bloqueo,
                 )
 
             # Gradiente Antero-Posterior de Alfa

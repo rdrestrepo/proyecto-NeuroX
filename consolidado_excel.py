@@ -2,6 +2,7 @@
 
 import os
 import json
+import math
 
 from openpyxl import Workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -15,6 +16,11 @@ BLANCO = "FFFFFF"
 REGIONES = ["Frontal", "Central", "Temporal", "Parietal", "Occipital"]
 BANDAS = ["Delta", "Theta", "Alfa", "Beta"]
 ESTADOS_DETALLE = ["Aceptable", "Comprometida", "Deficiente"]  # igual que la plantilla (sin "Buena")
+
+# Debe mantenerse sincronizado con ESTADO_PAF_SIN_PICO en pipeline_eeg_completo.py.
+# En Ojos Abiertos (fijación visual) la ausencia de pico Alfa es un hallazgo normal
+# de reactividad de Berger, NO un estado patológico ni un fallo de adquisición.
+ESTADO_PAF_SIN_PICO = "Bloqueo visual (Normal EO)"
 
 ENCABEZADOS = [
     "Archivo procesado", "Estado calidad", "Duración (s)", "Fs (Hz)",
@@ -109,11 +115,11 @@ def recolectar_datos_archivo(nombre_archivo, carpeta_cache):
         "dar_estado": semaforos.get("Delta_Alfa", {}).get("estado", "N/D"),
         "tbr_estado": semaforos.get("Theta_Beta", {}).get("estado", "N/D"),
         "slow_estado": semaforos.get("Lentificacion", {}).get("estado", "N/D"),
-        "paf_global": resumen_welch.get("paf_global_hz"),
+        "paf_global": _valor_o_none(resumen_welch.get("paf_global_hz")),
         "paf_global_estado": clasificar_semaforo_simple(resumen_welch.get("paf_global_hz"), "PAF"),
-        "paf_occipital": resumen_welch.get("paf_occipital_hz"),
+        "paf_occipital": _valor_o_none(resumen_welch.get("paf_occipital_hz")),
         "paf_occipital_estado": clasificar_semaforo_simple(resumen_welch.get("paf_occipital_hz"), "PAF"),
-        "gradiente_ap": resumen_welch.get("gradiente_ap"),
+        "gradiente_ap": _valor_o_none(resumen_welch.get("gradiente_ap")),
         "gradiente_ap_estado": clasificar_semaforo_simple(resumen_welch.get("gradiente_ap"), "Gradiente_AP"),
         "atipicos": resumen_calidad.get("porcentaje_atipicos"),
         "sospechosos": resumen_calidad.get("porcentaje_sospechosos"),
@@ -171,10 +177,19 @@ def clasificar_semaforo_simple(valor, tipo):
     Los umbrales de Gradiente AP corresponden a la condición de ojos abiertos
     con fijación (EO). Deben mantenerse sincronizados con
     GRADIENTE_AP_UMBRALES_EO y PAF_UMBRALES en pipeline_eeg_completo.py.
+
+    Un PAF no finito (NaN) significa que no se halló un pico de Alfa medible:
+    en Ojos Abiertos corresponde a bloqueo visual normal, no a "Lentificado".
     """
-    if valor is None or not isinstance(valor, (int, float)):
+    if valor is None:
+        return ESTADO_PAF_SIN_PICO if tipo == "PAF" else "N/D"
+    try:
+        valor = float(valor)
+    except (TypeError, ValueError):
         return "N/D"
-    
+    if not math.isfinite(valor):
+        return ESTADO_PAF_SIN_PICO if tipo == "PAF" else "N/D"
+
     if tipo == "PAF":
         if valor >= 9.50:
             return "Normal"
@@ -192,6 +207,15 @@ def clasificar_semaforo_simple(valor, tipo):
             return "Anteriorizado"
     
     return "N/D"
+
+
+def _valor_o_none(valor):
+    """Devuelve el número si es finito, o None para evitar escribir NaN en Excel."""
+    try:
+        valor = float(valor)
+    except (TypeError, ValueError):
+        return None
+    return valor if math.isfinite(valor) else None
 
 
 def _fila_a_lista(fila):
@@ -330,12 +354,16 @@ def _hoja_resumen(wb, filas):
                 celda.fill = PatternFill("solid", fgColor="F8CDCD")
                 celda.font = Font(color="A01E1E")
         
-        # Formato condicional para PAF (columnas S-T) y Gradiente AP (columnas V-W)
-        for col_letter in ["S", "T", "V", "W"]:
+        # Formato condicional para PAF (columnas S-U) y Gradiente AP (columnas V-W)
+        for col_letter in ["S", "T", "U", "V", "W"]:
             celda = ws[f"{col_letter}{r}"]
             if celda.value == "Normal":
                 celda.fill = PatternFill("solid", fgColor="D3F0D8")
                 celda.font = Font(color="1E6E32")
+            elif celda.value == ESTADO_PAF_SIN_PICO:
+                # Ausencia de pico Alfa en Ojos Abiertos: hallazgo fisiológico normal.
+                celda.fill = PatternFill("solid", fgColor="D3F0D8")
+                celda.font = Font(color="1E6E32", italic=True)
             elif celda.value == "Borderline":
                 celda.fill = PatternFill("solid", fgColor="FFECB3")
                 celda.font = Font(color="966900")
