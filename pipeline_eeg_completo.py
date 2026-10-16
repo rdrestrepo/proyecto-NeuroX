@@ -44,6 +44,104 @@ from fpdf import FPDF
 from scipy.signal import butter, sosfiltfilt
 
 from matplotlib.patches import Patch
+from matplotlib.ticker import FuncFormatter
+
+
+# =========================
+# ESTILO DE GRAFICOS (fuente unica para la interfaz y el informe PDF)
+# =========================
+# Colores fijos por banda (paleta Okabe-Ito: distinguibles con daltonismo y
+# en impresion). Se usan iguales en espectros, bandas, barras y PDF.
+COLORES_BANDAS = {
+    "Delta": "#0072B2",
+    "Theta": "#009E73",
+    "Alfa": "#E69F00",
+    "Beta": "#CC79A7",
+}
+COLOR_TINTA = "#1C2033"          # trazos y textos principales
+COLOR_TINTA_SUAVE = "#3F4456"    # etiquetas de ejes
+COLOR_EJE = "#9AA0B0"            # ejes y marcas
+COLOR_REJILLA = "#ECEDF2"        # rejilla muy tenue
+COLOR_ACENTO = "#3730A3"         # indigo NeuroX (mismo que la interfaz)
+# Semaforo de calidad tecnica (reservado: no se usa para nada mas).
+COLORES_ESTADO_CALIDAD = {
+    "Normal": "#1F7A4A",
+    "Sospechoso": "#C98A0B",
+    "Atípico": "#B42D2D",
+}
+CMAP_MAPAS = "turbo"             # mapa de color de topomapas y espectrogramas
+
+
+def aplicar_tema_graficos():
+    """
+    Estilo cientifico comun: sin marco superior/derecho, marcas hacia afuera,
+    rejilla solida muy tenue, tinta oscura y unidades en los ejes. Lo usan la
+    interfaz (al iniciar) y el informe PDF (al importar este modulo), para
+    que las figuras se vean iguales en pantalla y en papel.
+    """
+    try:
+        from cycler import cycler
+        ciclo = {"axes.prop_cycle": cycler(color=[COLOR_TINTA] + list(COLORES_BANDAS.values()))}
+    except Exception:
+        ciclo = {}
+    try:
+        plt.rcParams.update({
+            "font.family": ["Segoe UI", "Arial", "DejaVu Sans"],
+            "font.size": 9,
+            "text.color": COLOR_TINTA,
+            "axes.facecolor": "white",
+            "axes.edgecolor": COLOR_EJE,
+            "axes.linewidth": 0.8,
+            "axes.labelcolor": COLOR_TINTA_SUAVE,
+            "axes.labelsize": 9,
+            "axes.titlecolor": COLOR_TINTA,
+            "axes.titlesize": 10.5,
+            "axes.titleweight": "bold",
+            "axes.titlepad": 8,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": True,
+            "axes.axisbelow": True,
+            "grid.color": COLOR_REJILLA,
+            "grid.linestyle": "-",
+            "grid.linewidth": 0.6,
+            "grid.alpha": 1.0,
+            "xtick.direction": "out",
+            "ytick.direction": "out",
+            "xtick.color": COLOR_EJE,
+            "ytick.color": COLOR_EJE,
+            "xtick.labelcolor": COLOR_TINTA_SUAVE,
+            "ytick.labelcolor": COLOR_TINTA_SUAVE,
+            "xtick.labelsize": 8.5,
+            "ytick.labelsize": 8.5,
+            "xtick.major.size": 3.5,
+            "ytick.major.size": 3.5,
+            "lines.linewidth": 1.2,
+            "legend.frameon": False,
+            "legend.fontsize": 8,
+            "image.cmap": CMAP_MAPAS,
+            "figure.facecolor": "white",
+            "savefig.facecolor": "white",
+            **ciclo,
+        })
+    except Exception:
+        pass
+
+
+def formato_tiempo_mmss(valor, _pos=None):
+    """Formatea segundos como mm:ss para ejes de tiempo largos."""
+    try:
+        total = int(round(float(valor)))
+    except Exception:
+        return ""
+    signo = "-" if total < 0 else ""
+    total = abs(total)
+    return f"{signo}{total // 60:02d}:{total % 60:02d}"
+
+
+FORMATO_MMSS = FuncFormatter(formato_tiempo_mmss)
+
+aplicar_tema_graficos()
 
 
 def _trapz(y, x=None, axis=-1):
@@ -450,6 +548,37 @@ def crear_carpetas_trabajo(rutas):
 # =========================
 # FILTROS / LECTURA
 # =========================
+def _np_save_seguro(ruta, arr, *args, **kwargs):
+    """
+    np.save tolerante al bloqueo de archivos de Windows.
+
+    Windows no permite truncar un .npy que siga mapeado en memoria (np.load con
+    mmap_mode) por la interfaz o por un informe anterior: np.save falla con
+    "[Errno 22] Invalid argument". Se fuerza la recoleccion de basura para
+    liberar mapeos huerfanos (ciclos de referencias, p. ej. figuras de
+    matplotlib) y se reintenta. Si sigue bloqueado, se lanza un error claro.
+    """
+    try:
+        np.save(ruta, arr, *args, **kwargs)
+        return
+    except OSError as e:
+        primer_error = e
+
+    gc.collect()
+    try:
+        np.save(ruta, arr, *args, **kwargs)
+        return
+    except OSError:
+        pass
+
+    raise OSError(
+        primer_error.errno,
+        f"No se pudo sobrescribir '{ruta}': el archivo esta en uso (abierto por la "
+        f"vista de NeuroX u otro programa). Cierre y vuelva a abrir NeuroX e "
+        f"intente de nuevo. Detalle: {primer_error.strerror}",
+    ) from primer_error
+
+
 @functools.lru_cache(maxsize=16)
 def _get_butter_sos(fs, lowcut, highcut, order):
     """Genera y cachea los coeficientes del filtro para no recalcularlos."""
@@ -607,8 +736,8 @@ def guardar_crudo_y_tiempo(datos_eeg, tiempo, fs_real, carpeta_crudo, logger=Non
 
     os.makedirs(carpeta_crudo, exist_ok=True)
 
-    np.save(os.path.join(carpeta_crudo, "eeg_crudo.npy"), datos_eeg.astype(np.float32, copy=False))
-    np.save(os.path.join(carpeta_crudo, "tiempo.npy"), tiempo.astype(np.float32, copy=False))
+    _np_save_seguro(os.path.join(carpeta_crudo, "eeg_crudo.npy"), datos_eeg.astype(np.float32, copy=False))
+    _np_save_seguro(os.path.join(carpeta_crudo, "tiempo.npy"), tiempo.astype(np.float32, copy=False))
 
 
     log(f"Crudo y tiempo guardados en: {carpeta_crudo}")
@@ -654,9 +783,9 @@ def analizar_frecuencia_fft(datos, fs_real, carpeta_fft, sufijo="crudo", logger=
     # dBµV ref 1 µV — conservado por compatibilidad con la interfaz existente
     fft_db = (20.0 * np.log10(np.maximum(fft_amp, 1e-12))).astype(np.float32)
 
-    np.save(os.path.join(carpeta_fft, f"freqs_{sufijo}.npy"), freqs)
-    np.save(os.path.join(carpeta_fft, f"fft_amp_{sufijo}.npy"), fft_amp)
-    np.save(os.path.join(carpeta_fft, f"fft_db_{sufijo}.npy"), fft_db)
+    _np_save_seguro(os.path.join(carpeta_fft, f"freqs_{sufijo}.npy"), freqs)
+    _np_save_seguro(os.path.join(carpeta_fft, f"fft_amp_{sufijo}.npy"), fft_amp)
+    _np_save_seguro(os.path.join(carpeta_fft, f"fft_db_{sufijo}.npy"), fft_db)
 
     log(f"FFT {sufijo} guardada.")
 
@@ -771,8 +900,8 @@ def calcular_espectrograma_resumen(datos, fs_real, carpeta_salida, sufijo="filtr
         "resumen_por_canal": resumen_por_canal,
     }
 
-    np.save(os.path.join(carpeta_salida, f"freqs_{sufijo}.npy"), freqs_guardar)
-    np.save(os.path.join(carpeta_salida, f"times_{sufijo}.npy"), times_guardar)
+    _np_save_seguro(os.path.join(carpeta_salida, f"freqs_{sufijo}.npy"), freqs_guardar)
+    _np_save_seguro(os.path.join(carpeta_salida, f"times_{sufijo}.npy"), times_guardar)
 
     ruta_json = os.path.join(carpeta_salida, f"resumen_espectrograma_{sufijo}.json")
     with open(ruta_json, "w", encoding="utf-8") as f:
@@ -1082,24 +1211,24 @@ def guardar_reporte_canales_atipicos(
     log = _mklogger(logger)
     os.makedirs(carpeta_salida, exist_ok=True)
 
-    np.save(os.path.join(carpeta_salida, "score_canales.npy"), detalle["score"])
-    np.save(os.path.join(carpeta_salida, "std_canales.npy"), detalle["std"])
-    np.save(os.path.join(carpeta_salida, "rms_canales.npy"), detalle["rms"])
-    np.save(os.path.join(carpeta_salida, "ptp_canales.npy"), detalle["ptp"])
-    np.save(os.path.join(carpeta_salida, "ratio_hf_canales.npy"), detalle["ratio_hf"])
-    np.save(os.path.join(carpeta_salida, "ratio_delta_canales.npy"), detalle["ratio_delta"])
-    np.save(os.path.join(carpeta_salida, "z_delta_canales.npy"), detalle["z_delta"])
+    _np_save_seguro(os.path.join(carpeta_salida, "score_canales.npy"), detalle["score"])
+    _np_save_seguro(os.path.join(carpeta_salida, "std_canales.npy"), detalle["std"])
+    _np_save_seguro(os.path.join(carpeta_salida, "rms_canales.npy"), detalle["rms"])
+    _np_save_seguro(os.path.join(carpeta_salida, "ptp_canales.npy"), detalle["ptp"])
+    _np_save_seguro(os.path.join(carpeta_salida, "ratio_hf_canales.npy"), detalle["ratio_hf"])
+    _np_save_seguro(os.path.join(carpeta_salida, "ratio_delta_canales.npy"), detalle["ratio_delta"])
+    _np_save_seguro(os.path.join(carpeta_salida, "z_delta_canales.npy"), detalle["z_delta"])
 
-    np.save(os.path.join(carpeta_salida, "canales_atipicos_fuertes_idx0.npy"), detalle["canales_fuertes_idx0"])
-    np.save(os.path.join(carpeta_salida, "canales_atipicos_fuertes_idx1.npy"), detalle["canales_fuertes_idx1"])
+    _np_save_seguro(os.path.join(carpeta_salida, "canales_atipicos_fuertes_idx0.npy"), detalle["canales_fuertes_idx0"])
+    _np_save_seguro(os.path.join(carpeta_salida, "canales_atipicos_fuertes_idx1.npy"), detalle["canales_fuertes_idx1"])
 
-    np.save(os.path.join(carpeta_salida, "canales_sospechosos_idx0.npy"), detalle["canales_sospechosos_idx0"])
-    np.save(os.path.join(carpeta_salida, "canales_sospechosos_idx1.npy"), detalle["canales_sospechosos_idx1"])
+    _np_save_seguro(os.path.join(carpeta_salida, "canales_sospechosos_idx0.npy"), detalle["canales_sospechosos_idx0"])
+    _np_save_seguro(os.path.join(carpeta_salida, "canales_sospechosos_idx1.npy"), detalle["canales_sospechosos_idx1"])
 
-    np.save(os.path.join(carpeta_salida, "ratio_alpha_dom_canales.npy"), detalle["ratio_alpha_dom"])
-    np.save(os.path.join(carpeta_salida, "dist_espectral_canales.npy"), detalle["dist_espectral"])
-    np.save(os.path.join(carpeta_salida, "z_alpha_canales.npy"), detalle["z_alpha"])
-    np.save(os.path.join(carpeta_salida, "z_dist_canales.npy"), detalle["z_dist"])
+    _np_save_seguro(os.path.join(carpeta_salida, "ratio_alpha_dom_canales.npy"), detalle["ratio_alpha_dom"])
+    _np_save_seguro(os.path.join(carpeta_salida, "dist_espectral_canales.npy"), detalle["dist_espectral"])
+    _np_save_seguro(os.path.join(carpeta_salida, "z_alpha_canales.npy"), detalle["z_alpha"])
+    _np_save_seguro(os.path.join(carpeta_salida, "z_dist_canales.npy"), detalle["z_dist"])
 
     ruta_txt = os.path.join(carpeta_salida, "reporte_canales_atipicos.txt")
     with open(ruta_txt, "w", encoding="utf-8") as f:
@@ -2256,6 +2385,27 @@ def _integrar_psd_por_banda(freqs, psd, fmin, fmax):
     return np.zeros(psd.shape[0], dtype=np.float32)
 
 
+# Electrodos perifericos no cerebrales: ICA los trata como 'misc' y no los
+# limpia, por lo que se excluyen de los promedios GLOBALES (bandas y ratios).
+CANALES_EXCLUIDOS_GLOBAL = ("M1", "M2", "CB1", "CB2")
+
+
+def indices_canales_corticales(n_canales, nombres_canales=None, idx_excluir=None):
+    """
+    Devuelve los indices de canales que entran en los promedios globales:
+    todos menos CANALES_EXCLUIDOS_GLOBAL y los de idx_excluir. Si la exclusion
+    dejara la lista vacia, se devuelven todos los canales.
+    """
+    n_can = int(n_canales)
+    excluir_set = set(int(i) for i in (idx_excluir or []))
+    if nombres_canales is not None:
+        for i, nom in enumerate(list(nombres_canales)[:n_can]):
+            if limpiar_nombre_canal(nom) in CANALES_EXCLUIDOS_GLOBAL:
+                excluir_set.add(i)
+    idx_validos = [i for i in range(n_can) if i not in excluir_set]
+    return idx_validos if idx_validos else list(range(n_can))
+
+
 def calcular_potencia_relativa_welch(
     datos,
     fs_real,
@@ -2293,15 +2443,7 @@ def calcular_potencia_relativa_welch(
         pot_rel[banda] = ((abs_banda / pot_total_safe) * 100.0).astype(np.float32)
 
     # Índices válidos para el resumen cortical global.
-    n_can = int(psd.shape[0])
-    excluir_set = set(int(i) for i in idx_excluir)
-    if nombres_canales is not None:
-        for i, nom in enumerate(nombres_canales[:n_can]):
-            if limpiar_nombre_canal(nom) in ("M1", "M2", "CB1", "CB2"):
-                excluir_set.add(i)
-    idx_validos = [i for i in range(n_can) if i not in excluir_set]
-    if not idx_validos:
-        idx_validos = list(range(n_can))
+    idx_validos = indices_canales_corticales(psd.shape[0], nombres_canales, idx_excluir)
 
     promedios_globales = {
         b: float(np.nanmean(np.asarray(pot_rel[b][idx_validos], dtype=np.float64)))
@@ -2344,9 +2486,9 @@ def guardar_potencia_relativa_welch(
 
     os.makedirs(carpeta_salida, exist_ok=True)
 
-    np.save(os.path.join(carpeta_salida, "welch_freqs.npy"), resultado_welch["freqs"])
-    np.save(os.path.join(carpeta_salida, "welch_psd.npy"), resultado_welch["psd"])
-    np.save(os.path.join(carpeta_salida, "pot_total_welch.npy"), resultado_welch["pot_total"])
+    _np_save_seguro(os.path.join(carpeta_salida, "welch_freqs.npy"), resultado_welch["freqs"])
+    _np_save_seguro(os.path.join(carpeta_salida, "welch_psd.npy"), resultado_welch["psd"])
+    _np_save_seguro(os.path.join(carpeta_salida, "pot_total_welch.npy"), resultado_welch["pot_total"])
     np.savez(
         os.path.join(carpeta_salida, "pot_abs_welch.npz"),
         **{b: resultado_welch["pot_abs"][b].astype(np.float32, copy=False) for b in bandas_def.keys()}
@@ -2374,8 +2516,8 @@ def guardar_potencia_relativa_welch(
     paf_global = float("nan")
     paf_region = {}
     if paf_hz is not None and paf_valido is not None:
-        np.save(os.path.join(carpeta_salida, "paf_alfa_hz.npy"), paf_hz)
-        np.save(os.path.join(carpeta_salida, "paf_alfa_valido.npy"), paf_valido)
+        _np_save_seguro(os.path.join(carpeta_salida, "paf_alfa_hz.npy"), paf_hz)
+        _np_save_seguro(os.path.join(carpeta_salida, "paf_alfa_valido.npy"), paf_valido)
 
         idx_excluir_set = set(int(i) for i in idx_excluir)
         idx_validos_paf = [
@@ -2449,13 +2591,21 @@ def _sumar_bandas_para_ratio(pot_rel, bandas_ratio):
     return total
 
 
-def calcular_ratios_welch_principales(pot_rel, ratios_def=None, eps=1e-12):
+def calcular_ratios_welch_principales(pot_rel, ratios_def=None, eps=1e-12,
+                                      nombres_canales=None, idx_excluir=None):
     """
     Calcula proporciones principales desde potencia relativa ya calculada.
     No recalcula PSD ni bandas.
+
+    Los promedios GLOBALES (y el cociente de medias de auditoria) usan los
+    mismos canales corticales que calcular_potencia_relativa_welch: se excluyen
+    M1/M2/CB1/CB2 y los de idx_excluir. Los ratios por canal se conservan todos.
     """
     if ratios_def is None:
         ratios_def = RATIOS_WELCH_PRINCIPALES
+
+    n_can = len(np.asarray(next(iter(pot_rel.values()))).ravel()) if pot_rel else 0
+    idx_validos = indices_canales_corticales(n_can, nombres_canales, idx_excluir)
 
     ratios = {}
     # Cociente de medias (E[num]/E[den]) conservado solo con fines de auditoría:
@@ -2468,12 +2618,12 @@ def calcular_ratios_welch_principales(pot_rel, ratios_def=None, eps=1e-12):
         den_safe = np.where(np.abs(den) <= eps, eps, den)
         ratios[nombre] = (num / den_safe).astype(np.float32)
 
-        num_media = float(np.nanmean(np.asarray(num, dtype=np.float64)))
-        den_media = float(np.nanmean(np.asarray(den, dtype=np.float64)))
+        num_media = float(np.nanmean(np.asarray(num, dtype=np.float64)[idx_validos]))
+        den_media = float(np.nanmean(np.asarray(den, dtype=np.float64)[idx_validos]))
         cociente_medias[nombre] = (num_media / den_media) if abs(den_media) > eps else float("nan")
 
     promedios_globales = {
-        nombre: float(np.nanmean(np.asarray(valores, dtype=np.float64)))
+        nombre: float(np.nanmean(np.asarray(valores, dtype=np.float64)[idx_validos]))
         for nombre, valores in ratios.items()
     }
 
@@ -2854,7 +3004,13 @@ def crear_grafico_circular_calidad(resumen, ruta_salida):
             valores,
             labels=etiquetas,
             autopct="%1.1f%%",
-            startangle=90
+            startangle=90,
+            colors=[
+                COLORES_ESTADO_CALIDAD["Normal"],
+                COLORES_ESTADO_CALIDAD["Sospechoso"],
+                COLORES_ESTADO_CALIDAD["Atípico"],
+            ],
+            wedgeprops={"edgecolor": "white", "linewidth": 1.5},
         )
         ax.set_title("Distribución de calidad por canal")
 
@@ -3026,7 +3182,7 @@ def calcular_resumen_calidad_senal(
     with open(ruta_json, "w", encoding="utf-8") as f:
         json.dump(resumen, f, indent=4, ensure_ascii=False)
 
-    np.save(ruta_snr, np.asarray(snr_db, dtype=np.float32))
+    _np_save_seguro(ruta_snr, np.asarray(snr_db, dtype=np.float32))
     crear_grafico_circular_calidad(resumen, ruta_png)
 
     log(f"Resumen de calidad guardado en: {ruta_json}")
@@ -3326,12 +3482,12 @@ def _posiciones_topograficas_por_canal(nombres_canales):
 
 
 def _dibujar_cabeza_topomap(ax, linewidth=1.5, zorder=10):
-    cabeza = plt.Circle((0, 0), 0.985, fill=False, color="black", linewidth=linewidth, zorder=zorder)
+    cabeza = plt.Circle((0, 0), 0.985, fill=False, color=COLOR_TINTA, linewidth=linewidth, zorder=zorder)
     ax.add_patch(cabeza)
     ax.plot(
         [-0.09, 0.0, 0.09],
         [0.985, 1.10, 0.985],
-        color="black",
+        color=COLOR_TINTA,
         lw=max(1.1, linewidth - 0.15),
         clip_on=False,
         zorder=zorder,
@@ -3341,7 +3497,7 @@ def _dibujar_cabeza_topomap(ax, linewidth=1.5, zorder=10):
     ax.plot(
         -1.01 - 0.015 * np.cos(t),
         0.22 * np.sin(t),
-        color="black",
+        color=COLOR_TINTA,
         lw=max(1.1, linewidth - 0.15),
         clip_on=False,
         zorder=zorder,
@@ -3349,7 +3505,7 @@ def _dibujar_cabeza_topomap(ax, linewidth=1.5, zorder=10):
     ax.plot(
         1.01 + 0.015 * np.cos(t),
         0.22 * np.sin(t),
-        color="black",
+        color=COLOR_TINTA,
         lw=max(1.1, linewidth - 0.15),
         clip_on=False,
         zorder=zorder,
@@ -3474,30 +3630,45 @@ def crear_espectrograma_promedio_informe(datos, fs_real, ruta_salida, bandas_def
 
     fig, ax = plt.subplots(figsize=(9.6, 4.2), dpi=190)
     try:
-        malla = ax.pcolormesh(times, freqs_sel, promedio_db, shading="gouraud", cmap="turbo")
-        ax.set_xlabel("Tiempo (s)")
+        malla = ax.pcolormesh(times, freqs_sel, promedio_db, shading="gouraud", cmap=CMAP_MAPAS)
+        ax.set_xlabel("Tiempo (mm:ss)")
         ax.set_ylabel("Frecuencia (Hz)")
-        ax.set_title("Espectrograma promedio (todos los canales)")
+        ax.set_title("Espectrograma promedio · todos los canales", loc="left")
+        ax.xaxis.set_major_formatter(FORMATO_MMSS)
+        ax.grid(False)
+        ax.spines["top"].set_visible(True)
+        ax.spines["right"].set_visible(True)
 
+        # Limites de banda punteados y, al margen, una marca con el color
+        # fijo de cada banda y su nombre.
         for nombre_banda, (low, high) in bandas_def.items():
-            ax.axhline(low, color="white", linewidth=0.5, alpha=0.35, linestyle="--")
+            ax.axhline(low, color="white", linewidth=0.7, alpha=0.7, linestyle=(0, (3, 3)))
+            ax.annotate(
+                "",
+                xy=(1.012, low), xytext=(1.012, high),
+                xycoords=("axes fraction", "data"),
+                arrowprops=dict(arrowstyle="-", color=COLORES_BANDAS.get(nombre_banda, COLOR_EJE),
+                                lw=2.6, shrinkA=1.5, shrinkB=1.5),
+                annotation_clip=False,
+            )
             ax.annotate(
                 nombre_banda,
                 xy=(1.0, (low + high) / 2.0),
                 xycoords=("axes fraction", "data"),
-                xytext=(4, 0),
+                xytext=(9, 0),
                 textcoords="offset points",
                 fontsize=7.5,
-                color="#1F2937",
+                color=COLOR_TINTA_SUAVE,
                 va="center",
                 ha="left",
                 annotation_clip=False,
             )
-        ax.axhline(list(bandas_def.values())[-1][1], color="white", linewidth=0.5, alpha=0.35, linestyle="--")
+        ax.axhline(list(bandas_def.values())[-1][1], color="white", linewidth=0.7, alpha=0.7, linestyle=(0, (3, 3)))
 
-        cbar = fig.colorbar(malla, ax=ax, pad=0.14)
-        cbar.set_label("Potencia (dB)", fontsize=8)
+        cbar = fig.colorbar(malla, ax=ax, pad=0.12)
+        cbar.set_label("Potencia (dB re 1 µV²/Hz)", fontsize=8)
         cbar.ax.tick_params(labelsize=7)
+        cbar.outline.set_linewidth(0.6)
 
         fig.tight_layout()
         fig.savefig(ruta_salida, dpi=190, bbox_inches="tight", pad_inches=0.05)
@@ -3525,25 +3696,25 @@ def crear_mapa_calidad_1010(resumen_calidad, nombres_canales, ruta_salida):
                 continue
             x, y = posicion
             if simple in atipicos:
-                color = "#DC2626"
+                color = COLORES_ESTADO_CALIDAD["Atípico"]
                 size = 42
             elif simple in sospechosos:
-                color = "#F59E0B"
+                color = COLORES_ESTADO_CALIDAD["Sospechoso"]
                 size = 32
             else:
-                color = "#22C55E"
-                size = 28
+                color = COLORES_ESTADO_CALIDAD["Normal"]
+                size = 26
 
-            ax.scatter([x], [y], s=size, c=color, edgecolors="black", linewidths=0.55, zorder=9)
+            ax.scatter([x], [y], s=size, c=color, edgecolors="white", linewidths=0.7, zorder=9)
             dibujados.append((simple, x, y))
 
         for simple, x, y in dibujados:
-            ax.text(x, y + 0.021, simple, fontsize=4.6, ha="center", va="bottom", color="#1F2937")
+            ax.text(x, y + 0.021, simple, fontsize=4.6, ha="center", va="bottom", color=COLOR_TINTA_SUAVE)
 
         legend_handles = [
-            Patch(facecolor="#22C55E", edgecolor="black", label="Normal"),
-            Patch(facecolor="#F59E0B", edgecolor="black", label="Sospechoso"),
-            Patch(facecolor="#DC2626", edgecolor="black", label="Atípico"),
+            Patch(facecolor=COLORES_ESTADO_CALIDAD["Normal"], edgecolor="none", label="Normal"),
+            Patch(facecolor=COLORES_ESTADO_CALIDAD["Sospechoso"], edgecolor="none", label="Sospechoso"),
+            Patch(facecolor=COLORES_ESTADO_CALIDAD["Atípico"], edgecolor="none", label="Atípico"),
         ]
         ax.legend(
             handles=legend_handles,
@@ -3777,15 +3948,23 @@ def crear_grafico_circular_calidad_informe(resumen, ruta_salida):
             ax.pie(
                 valores,
                 labels=etiquetas,
-                colors=["#22C55E", "#F59E0B", "#DC2626"],
+                colors=[
+                    COLORES_ESTADO_CALIDAD["Normal"],
+                    COLORES_ESTADO_CALIDAD["Sospechoso"],
+                    COLORES_ESTADO_CALIDAD["Atípico"],
+                ],
                 startangle=90,
+                counterclock=False,
                 autopct=None,
-                labeldistance=1.08,
+                labeldistance=1.10,
                 radius=0.84,
-                wedgeprops={"width": 0.38, "edgecolor": "white"},
-                textprops={"fontsize": 8},
+                wedgeprops={"width": 0.30, "edgecolor": "white", "linewidth": 2},
+                textprops={"fontsize": 8, "color": COLOR_TINTA_SUAVE},
             )
-            ax.text(0, 0, "Calidad\nEEG", ha="center", va="center", fontsize=10, weight="bold")
+            ax.text(0, 0.07, f"{float(resumen.get('porcentaje_normales', 0.0)):.0f}%",
+                    ha="center", va="center", fontsize=15, weight="bold", color=COLOR_TINTA)
+            ax.text(0, -0.16, "canales normales", ha="center", va="center", fontsize=7.5,
+                    color=COLOR_TINTA_SUAVE)
 
         fig.tight_layout(pad=0.35)
         fig.savefig(ruta_salida, bbox_inches="tight", pad_inches=0.04)
@@ -3863,7 +4042,9 @@ def crear_topomaps_2x2_informe(
 
                 niveles = np.linspace(vmin, vmax, 24)
                 mappable = ax.contourf(xi, yi, zi, levels=niveles, cmap=cmap)
-                ax.contour(xi, yi, zi, levels=10, colors="k", linewidths=0.18, alpha=0.18)
+                # Curvas de nivel discretas: ayudan a leer gradientes sin
+                # depender solo del color.
+                ax.contour(xi, yi, zi, levels=8, colors=COLOR_TINTA, linewidths=0.35, alpha=0.35)
             except Exception:
                 vmin = float(np.nanmin(datos["zs"]))
                 vmax = float(np.nanmax(datos["zs"]))
@@ -3881,18 +4062,20 @@ def crear_topomaps_2x2_informe(
                     zorder=2,
                 )
 
-            ax.scatter(datos["xs"], datos["ys"], s=12, c="black", edgecolors="white", linewidths=0.18, zorder=11)
-            _dibujar_cabeza_topomap(ax, linewidth=1.55, zorder=10)
-            ax.set_title(str(titulo), fontsize=10)
+            ax.scatter(datos["xs"], datos["ys"], s=9, c=COLOR_TINTA, edgecolors="white", linewidths=0.3, zorder=11)
+            _dibujar_cabeza_topomap(ax, linewidth=1.4, zorder=10)
+            ax.set_title(str(titulo), fontsize=10.5, fontweight="bold", color=COLOR_TINTA)
             ax.set_xlim(-1.08, 1.08)
             ax.set_ylim(-1.08, 1.16)
             ax.set_aspect("equal", adjustable="box")
             ax.axis("off")
 
             cbar = fig.colorbar(mappable, cax=cax)
-            cbar.ax.tick_params(labelsize=6, length=2)
-            cbar.set_label(cbar_label, fontsize=7)
-            cbar.outline.set_linewidth(0.6)
+            cbar.ax.tick_params(labelsize=6.5, length=2, color=COLOR_EJE, labelcolor=COLOR_TINTA_SUAVE)
+            cbar.set_label(cbar_label, fontsize=7.5, color=COLOR_TINTA_SUAVE)
+            cbar.outline.set_linewidth(0.5)
+            cbar.outline.set_edgecolor(COLOR_EJE)
+            cbar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _p: f"{v:.1f}"))
             exito = True
 
         for j in range(min(len(orden), 4), 4):
@@ -4031,14 +4214,14 @@ class InformeEEG(FPDF):
         self.set_font("Helvetica", "", 8.4)
         self.set_text_color(92, 102, 116)
         self.cell(0, 4.5, "NeuroX | Informe qEEG", ln=True, align="R")
-        self.set_draw_color(33, 63, 104)
+        self.set_draw_color(55, 48, 163)
         self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
         self.ln(3.2)
         self.set_text_color(28, 32, 38)
 
     def footer(self):
         self.set_y(-10)
-        self.set_draw_color(205, 212, 220)
+        self.set_draw_color(217, 219, 230)
         self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
         self.ln(1.5)
         self.set_font("Helvetica", "", 8.5)
@@ -4056,9 +4239,9 @@ class InformeEEG(FPDF):
         if self.get_y() > (self.t_margin + 6):
             self.ln(3.5)
         self.set_font("Helvetica", "B", 14)
-        self.set_text_color(33, 63, 104)
+        self.set_text_color(55, 48, 163)
         self.cell(0, 7, str(titulo), ln=True)
-        self.set_draw_color(33, 63, 104)
+        self.set_draw_color(55, 48, 163)
         self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
         self.ln(3.2)
         self.set_text_color(28, 32, 38)
@@ -4068,7 +4251,7 @@ class InformeEEG(FPDF):
         """Título breve para tablas o figuras dentro de una sección."""
         self.ensure_space(12)
         self.set_font("Helvetica", "B", 10.8)
-        self.set_text_color(33, 63, 104)
+        self.set_text_color(55, 48, 163)
         self.cell(0, 5.8, str(titulo), ln=True)
         self.set_text_color(28, 32, 38)
         self.ln(1.0)
@@ -4106,9 +4289,9 @@ class InformeEEG(FPDF):
         else:
             x_start = self.l_margin
 
-        self.set_fill_color(229, 236, 245)
-        self.set_draw_color(173, 183, 197)
-        self.set_text_color(33, 63, 104)
+        self.set_fill_color(236, 235, 250)
+        self.set_draw_color(217, 219, 230)
+        self.set_text_color(55, 48, 163)
         self.set_font("Helvetica", "B", 10)
 
         self.set_x(x_start)
@@ -4163,9 +4346,9 @@ class InformeEEG(FPDF):
 
         self.ensure_space(18 + row_height * (len(filas_evaluacion) + 1))
 
-        self.set_fill_color(229, 236, 245)
-        self.set_draw_color(173, 183, 197)
-        self.set_text_color(33, 63, 104)
+        self.set_fill_color(236, 235, 250)
+        self.set_draw_color(217, 219, 230)
+        self.set_text_color(55, 48, 163)
         self.set_font("Helvetica", "B", 10)
         self.set_x(x_start)
         for header, width in zip(headers, col_widths):
@@ -4426,9 +4609,9 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
             os.makedirs(carpeta_energia, exist_ok=True)
 
             for banda in bandas.keys():
-                np.save(os.path.join(carpeta_er_fil, f"{banda}.npy"), pct_fil[banda].astype(np.float32, copy=False))
-                np.save(os.path.join(carpeta_er_ica, f"{banda}.npy"), pct_final[banda].astype(np.float32, copy=False))
-                np.save(os.path.join(carpeta_energia, f"{banda}.npy"), pct_final[banda].astype(np.float32, copy=False))
+                _np_save_seguro(os.path.join(carpeta_er_fil, f"{banda}.npy"), pct_fil[banda].astype(np.float32, copy=False))
+                _np_save_seguro(os.path.join(carpeta_er_ica, f"{banda}.npy"), pct_final[banda].astype(np.float32, copy=False))
+                _np_save_seguro(os.path.join(carpeta_energia, f"{banda}.npy"), pct_final[banda].astype(np.float32, copy=False))
     except Exception as e:
         log(f"No pude actualizar los caches de energía relativa para el informe: {e}")
 
@@ -4585,7 +4768,7 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
             log(f"[Aviso] El logo se encontró en '{logo_path_bruto}' pero no se pudo insertar en el PDF: {e}")
 
     pdf.set_font("Helvetica", "B", 19)
-    pdf.set_text_color(33, 63, 104)
+    pdf.set_text_color(55, 48, 163)
     pdf.cell(0, 8, "INFORME DESCRIPTIVO DE ANÁLISIS qEEG", ln=True, align="C")
     pdf.set_font("Helvetica", "", 10.3)
     pdf.set_text_color(220, 122, 40)
@@ -4633,7 +4816,7 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
         if pdf.get_y() > (pdf.page_break_trigger - 70):
             pdf.add_page()
             pdf.set_font("Helvetica", "B", 10.8)
-            pdf.set_text_color(33, 63, 104)
+            pdf.set_text_color(55, 48, 163)
             pdf.cell(0, 5.5, "Visualización de calidad técnica", ln=True, align="C")
             pdf.set_text_color(28, 32, 38)
             pdf.ln(1.4)
@@ -5163,7 +5346,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     log("[Proceso] Aplicando filtros de frecuencia...")
     # Ahora pasamos la señal ESTABILIZADA (datos_eeg_detrend) al filtro pasa-banda
     datos_pb = filtrar_banda(datos_eeg_detrend, fs_real, lowcut, highcut, order)
-    np.save(
+    _np_save_seguro(
         os.path.join(rutas["filtrado"], "eeg_pasabanda.npy"),
         datos_pb.astype(np.float32, copy=False)
     )
@@ -5310,7 +5493,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # =========================
     # GUARDADO Y GRÁFICAS POST-CAR
     # =========================
-    np.save(
+    _np_save_seguro(
         os.path.join(rutas["filtrado"], "eeg_filtrado.npy"),
         np.asarray(datos_fn, dtype=np.float32)
     )
@@ -5362,7 +5545,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # Bandas PRE-ICA (desde filtrado)
     for nombre_banda, (low, high) in bandas.items():
         datos_b_pre = filtrar_banda(datos_fn, fs_real, low, high, order)
-        np.save(
+        _np_save_seguro(
             os.path.join(rutas["bandas_filtrado"], f"{nombre_banda}.npy"),
             datos_b_pre.astype(np.float32, copy=False)
         )
@@ -5394,7 +5577,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         datos_fn, fs_real, nombres_canales_archivo,
         datos_fit=datos_ica_fit, logger=log
     )
-    np.save(
+    _np_save_seguro(
         os.path.join(rutas["ica"], "eeg_ica.npy"),
         datos_ica.astype(np.float32, copy=False)
     )
@@ -5411,7 +5594,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # 7) WAVELET POST-ICA
     # =========================
     datos_wavelet = aplicar_wavelet_por_canales(datos_ica, logger=silent_logger)
-    np.save(
+    _np_save_seguro(
         os.path.join(rutas["wavelet"], "eeg_wavelet.npy"),
         datos_wavelet.astype(np.float32, copy=False)
     )
@@ -5505,7 +5688,9 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     progress(65, "Calculando proporciones de bandas...")
     resultado_ratios_welch = calcular_ratios_welch_principales(
         resultado_welch["pot_rel"],
-        ratios_def=RATIOS_WELCH_PRINCIPALES
+        ratios_def=RATIOS_WELCH_PRINCIPALES,
+        nombres_canales=nombres_canales_welch,
+        idx_excluir=[],
     )
     guardar_ratios_welch_principales(
         rutas["analisis_welch"],
@@ -5535,7 +5720,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # =========================
     for nombre_banda, (low, high) in bandas.items():
         datos_b_post = filtrar_banda(datos_wavelet, fs_real, low, high, order)
-        np.save(
+        _np_save_seguro(
             os.path.join(rutas["bandas"], f"{nombre_banda}.npy"),
             datos_b_post.astype(np.float32, copy=False)
         )

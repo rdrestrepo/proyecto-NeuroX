@@ -45,9 +45,19 @@ from pipeline_eeg_completo import (
     obtener_nombres_canales_64,
     buscar_logo_neurox,
     clasificar_semaforo,
+    indices_canales_corticales,
     CONDICION_REGISTRO,
     CONDICION_REGISTRO_DESCRIPCION,
     ESTADO_PAF_SIN_PICO,
+    aplicar_tema_graficos,
+    COLORES_BANDAS,
+    COLOR_TINTA,
+    COLOR_TINTA_SUAVE,
+    COLOR_EJE,
+    COLOR_REJILLA,
+    CMAP_MAPAS,
+    FORMATO_MMSS,
+    bandas as BANDAS_CLINICAS,
 )
 
 ## Generadores de consolidados (nuevo)
@@ -87,6 +97,16 @@ FUENTE_UI_CANDIDATOS = (
     "Segoe UI Variable Text", "Segoe UI", "Inter",
     "SF Pro Text", "Helvetica Neue", FUENTE_UI_FALLBACK,
 )
+
+## Distribución en tres columnas (Opción A)
+ANCHO_COLUMNA_REGISTROS = 250    # px: lista de archivos y progreso
+ANCHO_COLUMNA_INSPECTOR = 330    # px: resumen clínico / paneles de análisis
+## Pestañas unificadas: 6 vistas de señal | 3 vistas de análisis. El orden
+## debe coincidir con modos_grafica_tabs y con tabs_analisis.
+ETIQUETAS_TABS_PRINCIPALES = [
+    "Multicanal", "Canal", "FFT", "Espectro PSD", "Bandas", "Espectrograma",
+    "Potencia relativa", "Proporciones", "Calidad",
+]
 
 
 ## Utilidades de DPI / pantalla
@@ -174,14 +194,24 @@ class _TabBar(tk.Frame):
     C_HOVER_BG   = FONDO_HOVER
     C_HOVER_FG   = AZUL_NEUROX
 
+    SEP_GAP = 22  # espacio extra donde hay un separador de grupo
+
     def __init__(self, parent, labels, on_select, fuente=FUENTE_UI,
                  fill_width=False, active_fill=FONDO_PANEL, active_fg=AZUL_NEUROX,
-                 **kw):
+                 separadores=(), alto=None, pad_x=None, **kw):
+        # separadores: índices de pestaña antes de los cuales se dibuja una
+        # línea vertical (separa, p. ej., vistas de señal y de análisis).
+        if alto is not None:
+            self.H = int(alto)
+            self.RADIO = int(alto) // 2
+        if pad_x is not None:
+            self.PAD_X = int(pad_x)
         kw.setdefault("bg", FONDO_APP)
         kw.setdefault("height", self.H)
         super().__init__(parent, **kw)
         self.pack_propagate(False)
 
+        self._separadores = set(int(i) for i in separadores)
         self._labels      = list(labels)
         self._on_select   = on_select
         self._activo      = 0
@@ -223,21 +253,34 @@ class _TabBar(tk.Frame):
         n   = len(self._labels)
 
         # Calcular anchos
+        extra_sep = self.SEP_GAP * len(self._separadores)
         if self._fill_width:
             total_gap = gap * (n - 1)
             tab_w = max(48, (W - total_gap) // n)
             widths = [tab_w] * n
         else:
-            widths = [self._font_b.measure(lbl) + self.PAD_X * 2 for lbl in self._labels]
+            textos = [self._font_b.measure(lbl) for lbl in self._labels]
+            pad = self.PAD_X
+            # Si no caben, se reduce el relleno lateral antes de recortar.
+            while pad > 6 and sum(textos) + 2 * pad * n + gap * (n - 1) + extra_sep > W:
+                pad -= 1
+            widths = [t + pad * 2 for t in textos]
 
         # Posiciones (centradas verticalmente, todas a altura H)
         xs = []
         x  = 0
-        for w in widths:
+        lineas_sep = []
+        for i, w in enumerate(widths):
+            if i in self._separadores:
+                lineas_sep.append(x + self.SEP_GAP // 2 - gap // 2)
+                x += self.SEP_GAP
             xs.append(x)
             x += w + gap
 
         self._rects = [(xs[i], xs[i] + widths[i]) for i in range(n)]
+
+        for xl in lineas_sep:
+            cv.create_line(xl, H * 0.22, xl, H * 0.78, fill=BORDE_SUAVE, width=1)
 
         for i, (lbl, xi, wi) in enumerate(zip(self._labels, xs, widths)):
             if i == self._activo:
@@ -566,7 +609,13 @@ class AppEEG:
 
         except Exception:
             pass
-        self.raiz.geometry("1280x760")
+        self.raiz.geometry("1440x860")
+        self.raiz.minsize(1180, 700)
+        try:
+            # Tres columnas necesitan ancho: en Windows se abre maximizada.
+            self.raiz.state("zoomed")
+        except Exception:
+            pass
         self.raiz.configure(bg=FONDO_APP)
         self.fuente_ui = self._resolver_fuente_ui()
         self.configurar_estilos_neurox()
@@ -687,6 +736,9 @@ class AppEEG:
         self.var_fmax = tk.DoubleVar(value=40.0)
         self.var_ventana_espectrograma = tk.DoubleVar(value=2.0)
         self.var_solapamiento_espectrograma = tk.DoubleVar(value=50.0)
+        self.var_psd_log = tk.BooleanVar(value=True)
+        self._nombres_atipicos_set = set()
+        self._barra_calibracion = []
         self._fmt_cbar_pct = FuncFormatter(lambda valor, _pos: f"{valor:.1f}".replace(".", ","))
 
         ## Estado persistente de las vistas
@@ -708,104 +760,114 @@ class AppEEG:
         #self._ico_copy   = self._cargar_icono_btn("assets/icon_copy.png",   18)
         #self._ico_folder = self._cargar_icono_btn("assets/icon_folder.png",  18)
 
-        ## Layout raíz: columna izquierda + columna derecha (sin barra global superior)
-        frame_body = ttk.Frame(raiz, padding=(10, 10, 10, 10), style="NeuroX.TFrame")
-        frame_body.pack(fill=tk.BOTH, expand=True)
-        
-        ## Panel izquierdo con scroll
-        cont_izq = ttk.Frame(frame_body, width=320, style="NeuroX.TFrame")
-        cont_izq.pack(side=tk.LEFT, fill=tk.Y)
-        cont_izq.pack_propagate(False)
-        self._cont_izq = cont_izq
-        
-        self.canvas_izq = tk.Canvas(
-            cont_izq,
-            bg=FONDO_APP,
-            bd=0,
-            relief="flat",
-            highlightthickness=0
-        )
-        self.scroll_izq = ttk.Scrollbar(
-            cont_izq,
-            orient="vertical",
-            command=self.canvas_izq.yview,
-            style="NeuroX.Vertical.TScrollbar"
-        )
-        def _auto_scroll_izq(lo, hi):
-            if float(lo) <= 0.0 and float(hi) >= 1.0:
-                self.scroll_izq.grid_remove()
-            else:
-                self.scroll_izq.grid()
-            self.scroll_izq.set(lo, hi)
+        ## =========================================================
+        ## Layout raíz (Opción A): barra superior + tres columnas
+        ##   [ marca · registro actual · calidad ·············· acciones ]
+        ##   [ Registros | pestañas + controles + gráfico | Inspector    ]
+        ## Los widgets conservan sus nombres de siempre: solo cambia dónde
+        ## viven, así que la lógica que los usa no se modifica.
+        ## =========================================================
+        self.nombres_canales = self._cargar_canales_64()
 
-        self.canvas_izq.configure(yscrollcommand=_auto_scroll_izq)
-        cont_izq.grid_rowconfigure(0, weight=1)
-        cont_izq.grid_columnconfigure(0, weight=1)
-        self.canvas_izq.grid(row=0, column=0, sticky="nsew")
-        self.scroll_izq.grid(row=0, column=1, sticky="ns")
-        
-        # Frame interno que contiene todo lo de la izquierda.
-        self.frame_izq = ttk.Frame(self.canvas_izq, style="NeuroX.TFrame")
-        self._win_izq = self.canvas_izq.create_window((0, 0), window=self.frame_izq, anchor="nw")
-        
-        self.panel_izq_fijo_sup = ttk.Frame(self.frame_izq, style="Sidebar.TFrame")
-        self.panel_izq_fijo_sup.pack(fill=tk.X)
-        
-        self.panel_izq_contextual = ttk.Frame(self.frame_izq, style="Sidebar.TFrame")
-        self.panel_izq_contextual.pack(fill=tk.X, pady=(8, 0))
-        
-        self.panel_izq_grafica = ttk.Frame(self.panel_izq_contextual, style="Sidebar.TFrame")
-        self.panel_izq_analisis = ttk.Frame(self.panel_izq_contextual, style="Sidebar.TFrame")
-        
-        self.panel_izq_fijo_inf = ttk.Frame(self.frame_izq, style="Sidebar.TFrame")
-        self.panel_izq_fijo_inf.pack(fill=tk.X, pady=(8, 0))
-        self._crear_encabezado_neurox()
-        
-        def _ajustar_scroll(_evt=None):
-            self._actualizar_scrollregion_izquierda()
-        
-        def _ajustar_ancho(_evt):
-            # hace que el frame interno tenga el mismo ancho que el canvas
-            self.canvas_izq.itemconfig(self._win_izq, width=max(1, _evt.width))
-            self.canvas_izq.coords(self._win_izq, 0, 0)
-            self._actualizar_scrollregion_izquierda()
-        
-        self.frame_izq.bind("<Configure>", _ajustar_scroll)
-        self.canvas_izq.bind("<Configure>", _ajustar_ancho)
-        
-        # Scroll con rueda del mouse
-        def _scroll_rueda(event):
-            if not self._puede_scroll_panel_izquierdo():
-                return "break"
-
-            delta = int(-1 * (event.delta / 120))
-            if delta != 0:
-                self.canvas_izq.yview_scroll(delta, "units")
-                self._actualizar_scrollregion_izquierda()
-            return "break"
-        
-        self.canvas_izq.bind("<Enter>", lambda e: self.canvas_izq.bind_all("<MouseWheel>", _scroll_rueda))
-        self.canvas_izq.bind("<Leave>", lambda e: self.canvas_izq.unbind_all("<MouseWheel>"))
-        
-        cont_der = ttk.Frame(frame_body, style="NeuroX.TFrame")
-        cont_der.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._cont_der = cont_der
-
-        ## Barra superior del panel derecho: toggle sidebar + tabs globales
-        barra = ttk.Frame(cont_der, style="NeuroX.TFrame")
-        barra.pack(side=tk.TOP, fill=tk.X)
+        ## Barra superior
+        self.barra_superior = ttk.Frame(raiz, style="Topbar.TFrame", padding=(12, 8, 14, 8))
+        self.barra_superior.pack(side=tk.TOP, fill=tk.X)
+        ttk.Separator(raiz, orient="horizontal").pack(side=tk.TOP, fill=tk.X)
 
         self._sidebar_visible = True
         self._btn_toggle_sidebar = ttk.Button(
-            barra,
+            self.barra_superior,
             text="◀",
             width=2,
             command=self._toggle_sidebar,
-            style="Secondary.TButton",
+            style="Icon.TButton",
         )
-        self._btn_toggle_sidebar.pack(side=tk.LEFT, padx=(0, 6))
+        self._btn_toggle_sidebar.pack(side=tk.LEFT, padx=(0, 10))
+        self._crear_encabezado_neurox()
 
-        ## Área desplazable del panel derecho con scrollbar propio
+        self.var_registro_actual = tk.StringVar(value="Ningún registro seleccionado")
+        self.var_registro_meta = tk.StringVar(value="")
+        frame_registro = ttk.Frame(self.barra_superior, style="Topbar.TFrame")
+        frame_registro.pack(side=tk.LEFT, padx=(18, 0))
+        ttk.Label(
+            frame_registro, textvariable=self.var_registro_actual, style="TopbarTitulo.TLabel"
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            frame_registro, textvariable=self.var_registro_meta, style="TopbarMeta.TLabel"
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        self.lbl_chip_calidad = tk.Label(
+            frame_registro, text="", font=(self.fuente_ui, 8, "bold"),
+            padx=9, pady=2, bd=0, bg=FONDO_PANEL, fg=TEXTO_SECUNDARIO,
+        )
+
+
+        ## Cuerpo en tres columnas
+        frame_body = ttk.Frame(raiz, padding=(10, 10, 10, 10), style="NeuroX.TFrame")
+        frame_body.pack(fill=tk.BOTH, expand=True)
+        frame_body.grid_rowconfigure(0, weight=1)
+        frame_body.grid_columnconfigure(1, weight=1)
+
+        ## Columna izquierda: registros (con scroll propio)
+        cont_izq = ttk.Frame(frame_body, width=ANCHO_COLUMNA_REGISTROS, style="NeuroX.TFrame")
+        cont_izq.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        cont_izq.grid_propagate(False)
+        cont_izq.pack_propagate(False)
+        self._cont_izq = cont_izq
+
+        self.canvas_izq, self.scroll_izq, self.frame_izq, self._win_izq = self._crear_columna_desplazable(cont_izq)
+
+        self.panel_izq_fijo_sup = ttk.Frame(self.frame_izq, style="Sidebar.TFrame")
+        self.panel_izq_fijo_sup.pack(fill=tk.X)
+        self.panel_izq_fijo_inf = ttk.Frame(self.frame_izq, style="Sidebar.TFrame")
+        self.panel_izq_fijo_inf.pack(fill=tk.X, pady=(8, 0))
+
+        ## Columna central: pestañas + visor / análisis
+        cont_der = ttk.Frame(frame_body, style="NeuroX.TFrame")
+        cont_der.grid(row=0, column=1, sticky="nsew")
+        self._cont_der = cont_der
+
+        ## Columna derecha: inspector contextual (con scroll propio)
+        cont_insp = ttk.Frame(frame_body, width=ANCHO_COLUMNA_INSPECTOR, style="NeuroX.TFrame")
+        cont_insp.grid(row=0, column=2, sticky="ns", padx=(10, 0))
+        cont_insp.grid_propagate(False)
+        cont_insp.pack_propagate(False)
+        self._cont_insp = cont_insp
+
+        self.canvas_insp, self.scroll_insp, self.frame_insp, self._win_insp = self._crear_columna_desplazable(cont_insp)
+
+        self.panel_izq_contextual = ttk.Frame(self.frame_insp, style="Sidebar.TFrame")
+        self.panel_izq_contextual.pack(fill=tk.X)
+        self.panel_izq_grafica = ttk.Frame(self.panel_izq_contextual, style="Sidebar.TFrame")
+        self.panel_izq_analisis = ttk.Frame(self.panel_izq_contextual, style="Sidebar.TFrame")
+
+        ## Pestañas principales: vistas de señal | vistas de análisis
+        self.tabbar_principal = _TabBar(
+            cont_der,
+            ETIQUETAS_TABS_PRINCIPALES,
+            on_select=self._on_tabbar_principal_click,
+            fuente=self.fuente_ui,
+            fill_width=False,
+            active_fill=AZUL_NEUROX,
+            active_fg="#FFFFFF",
+            separadores=(6,),
+            alto=34,
+            pad_x=14,
+        )
+        self.tabbar_principal.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+
+        ## Tabbar global legado (Gráficas / Análisis): se mantiene el objeto
+        ## porque el código llama a .seleccionar(), pero ya no se muestra.
+        self.tabbar_global = _TabBar(
+            cont_der,
+            ["Gráficas", "Análisis"],
+            on_select=lambda i: self._activar_tab_global("grafica" if i == 0 else "analisis"),
+            fuente=self.fuente_ui,
+            fill_width=True,
+            active_fill=AZUL_NEUROX,
+            active_fg="#FFFFFF",
+        )
+
+        ## Área del panel derecho (visor o análisis)
         cont_der_scroll = ttk.Frame(cont_der, style="NeuroX.TFrame")
         cont_der_scroll.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         cont_der_scroll.grid_rowconfigure(0, weight=1)
@@ -836,54 +898,12 @@ class AppEEG:
         self._canvas_der.grid(row=0, column=0, sticky="nsew")
         self._scroll_der.grid(row=0, column=1, sticky="ns")
 
-        ## Tab bar global redondeada: Gráficas / Análisis
-        self.tabbar_global = _TabBar(
-            barra,
-            ["Gráficas", "Análisis"],
-            on_select=lambda i: self._activar_tab_global("grafica" if i == 0 else "analisis"),
-            fuente=self.fuente_ui,
-            fill_width=True,
-            active_fill=AZUL_NEUROX,
-            active_fg="#FFFFFF",
-        )
-        self.tabbar_global.pack(fill=tk.X)
-
-        ## Widgets en la columna izquierda (creados aquí para estar listos al montar el sidebar)
+        ## Columna de registros: carpeta, lista de archivos y progreso
         self.btn_sel = ttk.Button(
             self.panel_izq_fijo_sup,
             text="Seleccionar carpeta",
             command=self.seleccionar_carpeta,
             style="Secondary.TButton",
-        )
-        self.btn_proc = _GlassButton(
-            self.panel_izq_fijo_sup,
-            text="Procesar seleccionados",
-            command=self._reprocesar_forzado,
-            color_hex=TURQUESA_NEUROX,
-            fuente=self.fuente_ui,
-            state="disabled",
-        )
-        self.btn_pdf = _GlassButton(
-            self.panel_izq_fijo_sup,
-            text="Vista previa",
-            command=self.abrir_informe,
-            color_hex=AZUL_MEDIO,
-            fuente=self.fuente_ui,
-            state="disabled",
-        )
-        self.btn_consolidado = _GlassButton(
-            self.panel_izq_fijo_sup,
-            text="Descargar consolidado Excel",
-            command=self.abrir_ventana_consolidado,
-            color_hex=TURQUESA_NEUROX,
-            fuente=self.fuente_ui,
-        )
-        self.btn_consolidado_pdf = _GlassButton(
-            self.panel_izq_fijo_sup,
-            text="Descargar consolidado PDF",
-            command=self.abrir_ventana_consolidado_pdf,
-            color_hex=TURQUESA_NEUROX,
-            fuente=self.fuente_ui,
         )
         self.btn_limpiar = ttk.Button(
             self.panel_izq_fijo_inf,
@@ -897,13 +917,12 @@ class AppEEG:
         self.btn_analisis     = self.tabbar_global
         self.btn_grafica      = self.tabbar_global
 
-        ## Botón seleccionar carpeta (columna izquierda)
         ttk.Label(
-            self.panel_izq_fijo_sup, text="DATOS DE ENTRADA", style="Subtle.TLabel"
-        ).pack(anchor="w", pady=(0, 4))
-        self.btn_sel.pack(fill=tk.X, pady=(0, 4))
+            self.panel_izq_fijo_sup, text="REGISTROS", style="Seccion.TLabel"
+        ).pack(anchor="w", pady=(0, 6))
+        self.btn_sel.pack(fill=tk.X, pady=(0, 6))
 
-        ## Estado + progreso
+        ## Estado + progreso (se muestra bajo la lista mientras se procesa)
         self.marco_estado_trabajo = ttk.Frame(
             self.panel_izq_fijo_sup,
             style="Sidebar.TFrame",
@@ -917,7 +936,7 @@ class AppEEG:
             textvariable=self.var_estado_trabajo,
             anchor="w",
             justify="left",
-            wraplength=296,
+            wraplength=ANCHO_COLUMNA_REGISTROS - 40,
             style="Sidebar.TLabel"
         )
         self.lbl_estado_trabajo.pack(fill=tk.X)
@@ -931,7 +950,7 @@ class AppEEG:
         )
         self.progreso.pack(fill=tk.X, pady=(6, 0))
 
-        ## Carpeta actual: label + botones copiar/abrir
+        ## Carpeta actual
         frame_carpeta = ttk.Frame(self.panel_izq_fijo_sup, style="Sidebar.TFrame")
         frame_carpeta.pack(fill=tk.X, pady=(0, 0))
 
@@ -940,24 +959,19 @@ class AppEEG:
             text="Carpeta actual:\n(no seleccionada)",
             anchor="w",
             justify="left",
-            wraplength=220,
+            wraplength=ANCHO_COLUMNA_REGISTROS - 40,
             style="Sidebar.TLabel",
         )
         self.lbl_carpeta.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        frame_carpeta_btns = ttk.Frame(frame_carpeta, style="Sidebar.TFrame")
-        frame_carpeta_btns.pack(side=tk.RIGHT, anchor="n", padx=(4, 0))
-
-        
-
         ## Lista de archivos .dat
         self.marco_lista = ttk.LabelFrame(
             self.panel_izq_fijo_sup,
-            text="Archivos .dat  (Ctrl/Shift + clic para elegir varios)",
-            padding=10,
+            text="Archivos .dat",
+            padding=8,
             style="Card.TLabelframe"
         )
-        self.marco_lista.pack(fill=tk.BOTH, expand=False, pady=(6, 6))
+        self.marco_lista.pack(fill=tk.BOTH, expand=False, pady=(8, 6))
 
         self._lista_archivos_expandida = True
         self.var_resumen_lista = tk.StringVar(value="Sin archivos cargados.")
@@ -970,16 +984,17 @@ class AppEEG:
             textvariable=self.var_resumen_lista,
             style="Sidebar.TLabel",
             anchor="w",
-            justify="left"
+            justify="left",
+            wraplength=ANCHO_COLUMNA_REGISTROS - 110,
         )
         self.lbl_resumen_lista.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.btn_toggle_lista = ttk.Button(
             self.frame_lista_header,
             text="Ocultar",
-            width=8,
+            width=7,
             command=self._toggle_panel_lista_archivos,
-            style="Secondary.TButton"
+            style="Icon.TButton"
         )
         self.btn_toggle_lista.pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -993,22 +1008,28 @@ class AppEEG:
             fieldbackground=FONDO_PANEL,
             borderwidth=0,
             relief="flat",
-            rowheight=22,
+            rowheight=26,
             indent=0,
         )
         self.style.map(
             "Lista.Treeview",
-            background=[("selected", AZUL_MEDIO)],
-            foreground=[("selected", "#FFFFFF")],
+            background=[("selected", FONDO_HOVER)],
+            foreground=[("selected", AZUL_NEUROX)],
         )
         self.style.layout("Lista.Treeview", [
             ("Treeview.treearea", {"sticky": "nsew"})
         ])
 
+        ## Puntos de estado por archivo (procesado / sin procesar)
+        self._iconos_estado_lista = {
+            "procesado": self._crear_icono_punto("#1F7A4A"),
+            "noprocesado": self._crear_icono_punto("#C4C7D2"),
+        }
+
         self.lista = ttk.Treeview(
             self.frame_lista_body,
             show="tree",
-            height=10,
+            height=8,
             selectmode="extended",
             style="Lista.Treeview",
         )
@@ -1017,11 +1038,13 @@ class AppEEG:
             "procesado",
             font=(self.fuente_ui, 9, "bold"),
             foreground=TEXTO_PRINCIPAL,
+            image=self._iconos_estado_lista["procesado"],
         )
         self.lista.tag_configure(
             "noprocesado",
             font=(self.fuente_ui, 9),
-            foreground=TEXTO_TERCIARIO,
+            foreground=TEXTO_SECUNDARIO,
+            image=self._iconos_estado_lista["noprocesado"],
         )
         self.lista.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -1044,17 +1067,50 @@ class AppEEG:
 
         self.lista.bind("<Button-1>", _evitar_seleccion_vacia)
 
-        ## Botones de archivo debajo de la lista
-        ttk.Separator(self.panel_izq_fijo_sup, orient="horizontal").pack(fill=tk.X, pady=(8, 8))
         ttk.Label(
-            self.panel_izq_fijo_sup, text="PROCESAMIENTO", style="Subtle.TLabel"
-        ).pack(anchor="w", pady=(0, 4))
-        self.btn_proc.pack(fill=tk.X, pady=(0, 2))
-        self.btn_pdf.pack(fill=tk.X, pady=(6, 2))
-        self.btn_consolidado.pack(fill=tk.X, pady=(2, 2))
-        self.btn_consolidado_pdf.pack(fill=tk.X, pady=(2, 0))
+            self.marco_lista,
+            text="Ctrl/Shift + clic para elegir varios.",
+            style="Subtle.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
 
-        ## Controles del visor
+        ## Acciones sobre los registros cargados (debajo de la lista)
+        self.frame_acciones = ttk.Frame(self.panel_izq_fijo_sup, style="Sidebar.TFrame")
+        self.frame_acciones.pack(fill=tk.X, pady=(0, 6))
+        self.btn_proc = _GlassButton(
+            self.frame_acciones,
+            text="Procesar seleccionados",
+            command=self._reprocesar_forzado,
+            color_hex=AZUL_NEUROX,
+            fuente=self.fuente_ui,
+            state="disabled",
+        )
+        self.btn_proc.pack(fill=tk.X, pady=(0, 6))
+        self.btn_pdf = _GlassButton(
+            self.frame_acciones,
+            text="Ver informe PDF",
+            command=self.abrir_informe,
+            color_hex=TURQUESA_NEUROX,
+            fuente=self.fuente_ui,
+            state="disabled",
+        )
+        self.btn_pdf.pack(fill=tk.X, pady=(0, 6))
+        self.btn_consolidados = ttk.Menubutton(
+            self.frame_acciones, text="Consolidados", style="Secondary.TMenubutton"
+        )
+        menu_consolidados = tk.Menu(
+            self.btn_consolidados, tearoff=0, font=(self.fuente_ui, 9),
+            bg=FONDO_PANEL, fg=TEXTO_PRINCIPAL, activebackground=FONDO_HOVER,
+            activeforeground=AZUL_NEUROX, bd=0,
+        )
+        menu_consolidados.add_command(label="Consolidado Excel…", command=self.abrir_ventana_consolidado)
+        menu_consolidados.add_command(label="Consolidado PDF…", command=self.abrir_ventana_consolidado_pdf)
+        self.btn_consolidados["menu"] = menu_consolidados
+        self.btn_consolidados.pack(fill=tk.X)
+        ## Alias legacy: antes eran dos botones separados en la barra lateral.
+        self.btn_consolidado = self.btn_consolidados
+        self.btn_consolidado_pdf = self.btn_consolidados
+
+        ## Inspector en modo visor: resumen clínico, calidad y mapa regional
         self.lbl_atipicos_grafica = ttk.Label(
             self.panel_izq_grafica,
             textvariable=self.var_atipicos,
@@ -1063,7 +1119,7 @@ class AppEEG:
             wraplength=280
         )
         self.lbl_atipicos_grafica.pack(fill=tk.X, pady=(0, 4))
-        
+
         self.lbl_sospechosos_grafica = ttk.Label(
             self.panel_izq_grafica,
             textvariable=self.var_sospechosos,
@@ -1074,199 +1130,30 @@ class AppEEG:
         self.lbl_sospechosos_grafica.pack(fill=tk.X, pady=(0, 8))
         self.lbl_atipicos_grafica.pack_forget()
         self.lbl_sospechosos_grafica.pack_forget()
-        ## Sección Calidad técnica — LabelFrame con toggle interno (vía _crear_bloque_resumen_calidad)
-        ttk.Label(
-            self.panel_izq_grafica, text="RESULTADOS", style="Subtle.TLabel"
-        ).pack(anchor="w", pady=(4, 4))
+
+        self._crear_resumen_clinico_inspector(self.panel_izq_grafica)
+
         self._calidad_wrapper_grafica = ttk.Frame(self.panel_izq_grafica, style="Sidebar.TFrame")
-        self._calidad_wrapper_grafica.pack(fill=tk.X, pady=(0, 4))
+        self._calidad_wrapper_grafica.pack(fill=tk.X, pady=(0, 8))
         self.frm_resumen_calidad_grafica = self._crear_bloque_resumen_calidad(
             self._calidad_wrapper_grafica,
             "grafica"
         )
         self.frm_resumen_calidad_grafica.pack(fill=tk.X)
-        self.marco_visor = ttk.LabelFrame(
-            self.panel_izq_grafica,
-            text="Visor",
-            padding=10,
-            style="Card.TLabelframe"
-        )
-        self.marco_visor.pack(fill=tk.X)
-        _visor_body = self._hacer_colapsable(self.marco_visor)
 
-        self.var_ventana = tk.DoubleVar(value=5.0)
-
-        self.frame_ventana = ttk.Frame(_visor_body, style="Sidebar.TFrame")
-        
-        self.lbl_ventana = ttk.Label(self.frame_ventana, text="Ventana de tiempo (s):")
-        self.lbl_ventana.pack(anchor="w", pady=(6, 0))
-        
-        self.spin_ventana = ttk.Spinbox(
-            self.frame_ventana,
-            from_=5.0,
-            to=30.0,
-            increment=1.0,
-            textvariable=self.var_ventana
-        )
-        self.spin_ventana.pack(fill=tk.X, pady=4)
-        
-        self.frame_fft = ttk.Frame(_visor_body, style="Sidebar.TFrame")
-        
-        self.lbl_fmax = ttk.Label(self.frame_fft, text="FFT hasta (Hz):")
-        self.lbl_fmax.pack(anchor="w", pady=(6, 0))
-        
-        self.spin_fmax = ttk.Spinbox(
-            self.frame_fft,
-            from_=20.0,
-            to=100.0,
-            increment=5.0,
-            textvariable=self.var_fmax
-        )
-        self.spin_fmax.pack(fill=tk.X, pady=4)
-
-        self.frame_espectrograma = ttk.LabelFrame(
-            _visor_body,
-            text="Espectrograma",
-            padding=8,
-            style="Card.TLabelframe"
-        )
-
-        self.lbl_ventana_espectrograma = ttk.Label(self.frame_espectrograma, text="Ventana (s):")
-        self.lbl_ventana_espectrograma.pack(anchor="w", pady=(0, 0))
-
-        self.spin_ventana_espectrograma = ttk.Spinbox(
-            self.frame_espectrograma,
-            from_=0.5,
-            to=10.0,
-            increment=0.5,
-            textvariable=self.var_ventana_espectrograma
-        )
-        self.spin_ventana_espectrograma.pack(fill=tk.X, pady=4)
-
-        self.lbl_solapamiento_espectrograma = ttk.Label(self.frame_espectrograma, text="Solapamiento (%):")
-        self.lbl_solapamiento_espectrograma.pack(anchor="w", pady=(6, 0))
-
-        self.spin_solapamiento_espectrograma = ttk.Spinbox(
-            self.frame_espectrograma,
-            from_=0.0,
-            to=95.0,
-            increment=5.0,
-            textvariable=self.var_solapamiento_espectrograma
-        )
-        self.spin_solapamiento_espectrograma.pack(fill=tk.X, pady=4)
-
-        self.lbl_escala_espectrograma = ttk.Label(
-            self.frame_espectrograma,
-            text="Escala: dB",
-            anchor="w",
-            justify="left"
-        )
-        self.lbl_escala_espectrograma.pack(fill=tk.X, pady=(6, 0))
-
-        self.lbl_info_espectrograma = ttk.Label(
-            self.frame_espectrograma,
-            text=(
-                "El espectrograma muestra cómo cambia la potencia de cada "
-                "frecuencia a lo largo del tiempo. La escala dB mejora el "
-                "contraste visual. No corresponde a la magnitud FFT en µV."
-            ),
-            anchor="w",
-            justify="left",
-            wraplength=280
-        )
-        self.lbl_info_espectrograma.pack(fill=tk.X, pady=(6, 0))
-
-        self.frame_canal = ttk.Frame(_visor_body, style="Sidebar.TFrame")
-        
-       
-        self.lbl_canal = ttk.Label(self.frame_canal, text="Canal EEG (64):")
-        self.lbl_canal.pack(anchor="w", pady=(6, 0))
-        
-        self.nombres_canales = self._cargar_canales_64()
-        self.var_canal_nombre = tk.StringVar(value=self.nombres_canales[0])
-        
-        self.combo_canal = ttk.Combobox(
-            self.frame_canal,
-            textvariable=self.var_canal_nombre,
-            state="readonly",
-            values=self.nombres_canales
-        )
-        self.combo_canal.current(0)
-        self.combo_canal.pack(fill=tk.X, pady=4)
-        self.combo_canal.bind("<<ComboboxSelected>>", self._on_combo_canal_change)
-        self.var_canal_nombre.trace_add("write", self.actualizar_nav_canal)
-        
-        self.frame_canal.pack(fill=tk.X)
-        
-        self.frame_ganancia = ttk.Frame(_visor_body, style="Sidebar.TFrame")
-        self.lbl_ganancia = ttk.Label(self.frame_ganancia, text="Ganancia visor multicanal:")
-        self.lbl_ganancia.pack(anchor="w", pady=(6, 0))
-        
-        self.spin_ganancia = ttk.Spinbox(
-            self.frame_ganancia,
-            from_=0.2,
-            to=10.0,
-            increment=0.2,
-            textvariable=self.var_ganancia
-        )
-        self.spin_ganancia.pack(fill=tk.X, pady=4)
-        
-        ## Actualización automática al modificar spinboxes
-        self.var_ganancia.trace_add("write", self._programar_autografico)
-        self.var_ventana.trace_add("write", self._programar_autografico)
-        self.var_fmax.trace_add("write", self._programar_autografico)
-        self.var_ventana_espectrograma.trace_add("write", self._programar_autografico)
-        self.var_solapamiento_espectrograma.trace_add("write", self._programar_autografico)
-
-        ## Actualización automática al escribir con teclado
-        self.spin_ganancia.bind("<KeyRelease>", self._programar_autografico)
-        self.spin_ganancia.bind("<<Increment>>", self._programar_autografico)
-        self.spin_ganancia.bind("<<Decrement>>", self._programar_autografico)
-        
-        self.spin_ventana.bind("<KeyRelease>", self._programar_autografico)
-        self.spin_ventana.bind("<<Increment>>", self._programar_autografico)
-        self.spin_ventana.bind("<<Decrement>>", self._programar_autografico)
-        
-        self.spin_fmax.bind("<KeyRelease>", self._programar_autografico)
-        self.spin_fmax.bind("<<Increment>>", self._programar_autografico)
-        self.spin_fmax.bind("<<Decrement>>", self._programar_autografico)
-
-        self.spin_ventana_espectrograma.bind("<KeyRelease>", self._programar_autografico)
-        self.spin_ventana_espectrograma.bind("<<Increment>>", self._programar_autografico)
-        self.spin_ventana_espectrograma.bind("<<Decrement>>", self._programar_autografico)
-
-        self.spin_solapamiento_espectrograma.bind("<KeyRelease>", self._programar_autografico)
-        self.spin_solapamiento_espectrograma.bind("<<Increment>>", self._programar_autografico)
-        self.spin_solapamiento_espectrograma.bind("<<Decrement>>", self._programar_autografico)
-
-        ## Controles de bandas
-        self.frame_bandas = ttk.LabelFrame(_visor_body, text="Bandas a mostrar (máx 4)", padding=8)
-        self.frame_bandas.pack(fill=tk.X, pady=(8, 0))
-
-        self.frame_bandas.configure(style="Card.TLabelframe", text="Bandas a mostrar (máx 4)")
-        grid = ttk.Frame(self.frame_bandas, style="Sidebar.TFrame")
-        grid.pack(fill=tk.X)
-
-        for i, b in enumerate(self.bandas):
-            chk = ttk.Checkbutton(grid, text=b, variable=self.band_vars[b], command=self._limitar_bandas)
-            r = i // 2
-            c = i % 2
-            chk.grid(row=r, column=c, sticky="w", padx=6, pady=2)
-            
-            
         self.frame_mapa = ttk.LabelFrame(
-            _visor_body,
+            self.panel_izq_grafica,
             text="Mapa regional",
             padding=8,
             style="Card.TLabelframe"
         )
-        
+
         ## Mapa regional pequeño (con toggle)
         _mapa_body = self._hacer_colapsable(self.frame_mapa)
         self.canvas_mapa = tk.Canvas(
             _mapa_body,
-            width=300,
-            height=280,
+            width=290,
+            height=270,
             bg=FONDO_PANEL,
             highlightthickness=1,
             highlightbackground=BORDE_SUAVE,
@@ -1285,39 +1172,25 @@ class AppEEG:
 
         ## Leyenda del mapa regional
         self._dibujar_leyenda_mapa(_mapa_body)
-        
+
         # Primer dibujo cuando Tk ya haya terminado de montar la UI.
         self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
-        
 
-        
-        self.btn_graficar = _GlassButton(
-            _visor_body,
-            text="Graficar",
-            command=self.graficar,
-            color_hex=TURQUESA_NEUROX,
-            fuente=self.fuente_ui,
-        )
-        self.btn_graficar.pack(fill=tk.X, pady=(10, 0))
-        self._marco_visor_visible = True
-        self.marco_visor.pack_forget()
-        self._marco_visor_visible = False
-
-        ## Log y barra de estado inferior izquierda
+        ## Log y barra de estado (columna de registros, parte inferior)
         marco_log = ttk.LabelFrame(
             self.panel_izq_fijo_inf,
             text="Estado del procesamiento",
             padding=10,
             style="Card.TLabelframe"
         )
-        marco_log.pack(fill=tk.X, expand=False, pady=(10, 0))
+        marco_log.pack(fill=tk.X, expand=False, pady=(6, 0))
         _log_body = self._hacer_colapsable(marco_log, {"fill": "both", "expand": True})
 
         self.txt_log = tk.Text(
             _log_body,
             height=7,
             wrap="word",
-            font=(self.fuente_ui, 9),
+            font=(self.fuente_ui, 8),
             relief="flat",
             borderwidth=0,
             bg=FONDO_PANEL_SUAVE,
@@ -1347,13 +1220,14 @@ class AppEEG:
 
         marco_estado_inf = ttk.Frame(self.panel_izq_fijo_inf, style="Sidebar.TFrame")
         marco_estado_inf.pack(fill=tk.X, pady=(8, 0))
-        
+
         self.lbl_barra = ttk.Label(
             marco_estado_inf,
             textvariable=self.var_barra,
             anchor="w",
             justify="left",
-            wraplength=280
+            wraplength=ANCHO_COLUMNA_REGISTROS - 40,
+            style="Sidebar.TLabel",
         )
         self.lbl_barra.pack(fill=tk.X)
 
@@ -1398,7 +1272,8 @@ class AppEEG:
             active_fill=AZUL_NEUROX,
             active_fg="#FFFFFF",
         )
-        self.tabbar_grafica.pack(fill=tk.X)
+        # La barra visible es ahora self.tabbar_principal (columna central);
+        # esta se conserva sin mostrar para no romper referencias existentes.
 
         self.tabs_grafica = ttk.Notebook(
             self._frame_tabs_grafica, height=1, style="Headless.TNotebook"
@@ -1410,7 +1285,10 @@ class AppEEG:
             self.frames_tabs_grafica[texto_tab] = frame_tab
         self.tabs_grafica.bind("<<NotebookTabChanged>>", self._on_tab_grafica)
 
-        self.frame_nav_canal = ttk.Frame(self.panel_grafica, style="Card.TFrame", padding=(8, 4, 8, 4))
+        ## Barra horizontal de controles del visor (sobre el gráfico)
+        self._crear_controles_visor()
+
+        self.frame_nav_canal = ttk.Frame(self.panel_grafica, style="Toolbar.TFrame", padding=(8, 2, 8, 2))
         self.btn_canal_prev = ttk.Button(
             self.frame_nav_canal,
             text="<",
@@ -1425,8 +1303,9 @@ class AppEEG:
             text="Canal actual: --",
             anchor="center",
             justify="center",
-            font=(self.fuente_ui, 11, "bold"),
-            foreground=AZUL_NEUROX
+            font=(self.fuente_ui, 10, "bold"),
+            foreground=TEXTO_PRINCIPAL,
+            background=FONDO_PANEL,
         )
         self.lbl_titulo_canal_nav.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
 
@@ -1440,7 +1319,7 @@ class AppEEG:
         self.btn_canal_next.pack(side=tk.RIGHT)
         self._nav_canal_visible = False
         
-        self.frame_visor_plot = ttk.Frame(self.panel_grafica, style="Card.TFrame", padding=(8, 8, 8, 6))
+        self.frame_visor_plot = ttk.Frame(self.panel_grafica, style="Plot.TFrame", padding=(8, 8, 8, 6))
         self.frame_visor_plot.pack(fill=tk.BOTH, expand=True)
         
         ## Layout interno del visor
@@ -1480,7 +1359,7 @@ class AppEEG:
             active_fill=AZUL_NEUROX,
             active_fg="#FFFFFF",
         )
-        self.tabbar_analisis.pack(fill=tk.X)
+        # Igual que en gráficas: la selección se hace desde tabbar_principal.
 
         self.tabs_analisis = ttk.Notebook(self.panel_analisis, height=1, style="Headless.TNotebook")
         self.tabs_analisis.pack(fill=tk.BOTH, expand=True)
@@ -1510,6 +1389,9 @@ class AppEEG:
         self._mostrar_panel_izquierdo("grafica")
         self._mostrar_placeholder_visor()
         self.cargar_config()
+        self._sincronizar_tabbar_principal()
+        self._actualizar_barra_superior()
+        self._actualizar_resumen_inspector()
 
     def _resolver_fuente_ui(self):
         try:
@@ -1827,85 +1709,88 @@ class AppEEG:
         self.style.configure("Treeview", rowheight=24, font=(fuente_ui, 8.5))
         self.style.configure("Treeview.Heading", font=(fuente_ui, 8.5, "bold"))
 
+        # ---- Distribución en tres columnas (Opción A) ---------------------
+        # Barra superior: fondo blanco, nombre del registro y metadatos.
+        self.style.configure("Topbar.TFrame", background=FONDO_PANEL)
+        self.style.configure(
+            "TopbarTitulo.TLabel", background=FONDO_PANEL, foreground=TEXTO_PRINCIPAL,
+            font=(fuente_ui, 11, "bold"),
+        )
+        self.style.configure(
+            "TopbarMeta.TLabel", background=FONDO_PANEL, foreground=TEXTO_SECUNDARIO,
+            font=fuente_base,
+        )
+        # Etiqueta de sección en mayúsculas (REGISTROS, POTENCIA RELATIVA…).
+        self.style.configure(
+            "Seccion.TLabel", background=FONDO_PANEL, foreground=TEXTO_SECUNDARIO,
+            font=(fuente_ui, 8, "bold"),
+        )
+        # Barra de controles del visor y su contenedor de gráfico.
+        self.style.configure("Toolbar.TFrame", background=FONDO_PANEL)
+        self.style.configure("Plot.TFrame", background=FONDO_PANEL)
+        self.style.configure(
+            "Toolbar.TLabel", background=FONDO_PANEL, foreground=TEXTO_SECUNDARIO, font=fuente_base,
+        )
+        self.style.configure(
+            "Toolbar.TCheckbutton", background=FONDO_PANEL, foreground=TEXTO_PRINCIPAL,
+            font=fuente_base, focuscolor=FONDO_PANEL,
+        )
+        self.style.map(
+            "Toolbar.TCheckbutton",
+            indicatorcolor=[("selected", AZUL_MEDIO), ("!selected", FONDO_PANEL)],
+            background=[("active", FONDO_PANEL)],
+        )
+        # Casillas de banda con el color fijo de cada banda.
+        for banda, color in COLORES_BANDAS.items():
+            nombre_estilo = f"Banda{banda}.TCheckbutton"
+            self.style.configure(
+                nombre_estilo, background=FONDO_PANEL, foreground=color,
+                font=fuente_bold, focuscolor=FONDO_PANEL,
+            )
+            self.style.map(
+                nombre_estilo,
+                indicatorcolor=[("selected", color), ("!selected", FONDO_PANEL)],
+                background=[("active", FONDO_PANEL)],
+                foreground=[("disabled", TEXTO_TERCIARIO)],
+            )
+        # Botón de icono (mostrar/ocultar columna de registros).
+        self.style.configure(
+            "Icon.TButton", font=fuente_bold, padding=(6, 4),
+            background=FONDO_PANEL, foreground=TEXTO_SECUNDARIO,
+            borderwidth=1, relief="solid", bordercolor=BORDE_SUAVE, focusthickness=0,
+        )
+        self.style.map(
+            "Icon.TButton",
+            background=[("pressed", "#E0E1FB"), ("active", FONDO_HOVER)],
+            foreground=[("active", AZUL_NEUROX)],
+            bordercolor=[("active", AZUL_MEDIO)],
+        )
+        # Menú desplegable "Consolidados".
+        self.style.configure(
+            "Secondary.TMenubutton", font=fuente_bold, padding=(12, 6),
+            background=FONDO_PANEL, foreground=TEXTO_PRINCIPAL,
+            borderwidth=1, relief="solid", bordercolor=BORDE_SUAVE,
+            arrowcolor=TEXTO_SECUNDARIO,
+        )
+        self.style.map(
+            "Secondary.TMenubutton",
+            background=[("pressed", "#E0E1FB"), ("active", FONDO_HOVER)],
+            foreground=[("active", AZUL_NEUROX)],
+            bordercolor=[("active", AZUL_MEDIO)],
+        )
+
         # ---- Tema de Matplotlib embebido (coherente con la UI) ------------
         self._aplicar_tema_matplotlib()
 
     def _aplicar_tema_matplotlib(self):
         """
-        Ajusta rcParams globales de Matplotlib para que ejes, títulos,
-        rejillas y leyendas de TODAS las gráficas embebidas usen la misma
-        paleta y tipografía que el resto de la interfaz. Es puramente
-        visual (rcParams), así que no toca ninguna lógica de cálculo ni de
-        graficación existente: cada gráfica sigue calculando y dibujando
-        exactamente lo mismo, solo cambia su apariencia por defecto.
+        Aplica el tema científico compartido con el informe PDF (definido en
+        pipeline_eeg_completo.aplicar_tema_graficos): sin marco superior ni
+        derecho, marcas hacia afuera, rejilla tenue, tinta oscura y unidades
+        en los ejes. Así las figuras se ven iguales en pantalla y en papel.
+        Es puramente visual: no toca ningún cálculo.
         """
-        fuente_ui = getattr(self, "fuente_ui", FUENTE_UI)
-        # NOTA: aquí se usa una lista de fuentes "seguras" para Matplotlib,
-        # NO el nombre resuelto por Tkinter (self.fuente_ui). Tkinter y
-        # Matplotlib detectan fuentes instaladas de formas distintas e
-        # independientes: Tkinter puede reportar como "disponible" una
-        # fuente (p. ej. "Segoe UI Variable Text") que Matplotlib no logra
-        # localizar como archivo real, lo que genera el aviso repetido
-        # "findfont: Font family '...' not found." en la consola. Esta
-        # lista evita ese cruce: Matplotlib prueba cada una en orden y usa
-        # la primera que sí encuentra; "DejaVu Sans" viene empaquetada con
-        # Matplotlib, así que siempre hay una opción válida sin avisos.
-        # Lista de fuentes reales para Windows (evita el aviso repetido
-        # "findfont: Font family 'Helvetica Neue' not found." -- esa es una
-        # fuente de macOS que nunca existe en Windows, así que no tiene
-        # sentido dejarla en la lista de opciones a probar).
-        fuentes_matplotlib = ["Segoe UI", "Arial", "DejaVu Sans"]
-        # Paleta de líneas acorde al tema índigo/turquesa de la app, en vez
-        # del ciclo por defecto de Matplotlib (azul/naranja/verde/rojo/café/
-        # oliva...). Se usan 8 tonos distinguibles entre sí pero todos
-        # dentro de la misma familia fría índigo→violeta→turquesa, para que
-        # canales adyacentes en la vista multicanal sigan siendo fáciles de
-        # diferenciar sin salirse de la paleta de marca.
-        ciclo_colores_neurox = [
-            "#4F46E5",  # índigo
-            "#0D9488",  # turquesa
-            "#7C3AED",  # violeta
-            "#0891B2",  # cian
-            "#6366F1",  # índigo claro
-            "#059669",  # verde azulado
-            "#4338CA",  # índigo oscuro
-            "#14B8A6",  # turquesa claro
-        ]
-        try:
-            from cycler import cycler
-            ciclo = cycler(color=ciclo_colores_neurox)
-        except Exception:
-            ciclo = None
-        try:
-            plt.rcParams.update({
-                "font.family": fuentes_matplotlib,
-                "font.size": 9,
-                "text.color": TEXTO_PRINCIPAL,
-                "axes.facecolor": "white",
-                "axes.edgecolor": BORDE_SUAVE,
-                "axes.labelcolor": TEXTO_SECUNDARIO,
-                "axes.titlecolor": AZUL_NEUROX,
-                "axes.titleweight": "bold",
-                "axes.titlesize": 11,
-                "axes.labelsize": 9,
-                "axes.linewidth": 0.9,
-                **({"axes.prop_cycle": ciclo} if ciclo is not None else {}),
-                "axes.grid": True,
-                "grid.color": BORDE_SUAVE,
-                "grid.linestyle": "--",
-                "grid.linewidth": 0.7,
-                "grid.alpha": 0.55,
-                "xtick.color": TEXTO_SECUNDARIO,
-                "ytick.color": TEXTO_SECUNDARIO,
-                "xtick.labelsize": 8,
-                "ytick.labelsize": 8,
-                "legend.frameon": False,
-                "legend.fontsize": 8,
-                "figure.facecolor": "white",
-                "savefig.facecolor": "white",
-            })
-        except Exception:
-            pass
+        aplicar_tema_graficos()
 
     def _restilizar_toolbar_matplotlib(self, toolbar):
         """
@@ -1958,9 +1843,531 @@ class AppEEG:
 
         _restilizar(toolbar)
 
+    def _crear_columna_desplazable(self, contenedor):
+        """
+        Crea una columna lateral con scroll vertical propio (canvas + frame
+        interno a todo el ancho). Se usa para la columna de registros y para
+        el inspector. Devuelve (canvas, scrollbar, frame_interno, id_ventana).
+        """
+        canvas = tk.Canvas(
+            contenedor,
+            bg=FONDO_PANEL,
+            bd=0,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDE_SUAVE,
+            highlightcolor=BORDE_SUAVE,
+        )
+        barra = ttk.Scrollbar(
+            contenedor,
+            orient="vertical",
+            command=canvas.yview,
+            style="NeuroX.Vertical.TScrollbar"
+        )
+
+        def _auto_scroll(lo, hi):
+            if float(lo) <= 0.0 and float(hi) >= 1.0:
+                barra.grid_remove()
+            else:
+                barra.grid()
+            barra.set(lo, hi)
+
+        canvas.configure(yscrollcommand=_auto_scroll)
+        contenedor.grid_rowconfigure(0, weight=1)
+        contenedor.grid_columnconfigure(0, weight=1)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        barra.grid(row=0, column=1, sticky="ns")
+
+        interno = ttk.Frame(canvas, style="Sidebar.TFrame", padding=(12, 12, 12, 12))
+        id_ventana = canvas.create_window((0, 0), window=interno, anchor="nw")
+
+        def _ajustar_ancho(evt):
+            canvas.itemconfig(id_ventana, width=max(1, evt.width))
+            canvas.coords(id_ventana, 0, 0)
+            self._actualizar_scrollregion_izquierda()
+
+        interno.bind("<Configure>", lambda _e: self._actualizar_scrollregion_izquierda())
+        canvas.bind("<Configure>", _ajustar_ancho)
+
+        def _scroll_rueda(event):
+            if not self._puede_scroll_canvas(canvas):
+                return "break"
+            delta = int(-1 * (event.delta / 120))
+            if delta != 0:
+                canvas.yview_scroll(delta, "units")
+                self._actualizar_scrollregion_izquierda()
+            return "break"
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _scroll_rueda))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        return canvas, barra, interno, id_ventana
+
+    def _crear_icono_punto(self, color_hex, diametro=8, lienzo=16):
+        """Punto de color antialiasado para marcar el estado de cada archivo."""
+        escala = 4
+        img = Image.new("RGBA", (lienzo * escala, lienzo * escala), (0, 0, 0, 0))
+        dibujo = ImageDraw.Draw(img)
+        margen = (lienzo - diametro) * escala // 2
+        dibujo.ellipse(
+            [margen, margen, lienzo * escala - margen - 1, lienzo * escala - margen - 1],
+            fill=ImageColor.getrgb(color_hex) + (255,),
+        )
+        img = img.resize((lienzo, lienzo), Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+
+    def _crear_controles_visor(self):
+        """
+        Barra horizontal de controles sobre el gráfico. Cada grupo (canal,
+        ventana, ganancia, espectro, espectrograma, bandas) se muestra u
+        oculta según la pestaña activa en _refrescar_ui_modo().
+        """
+        self.marco_visor = ttk.Frame(self.panel_grafica, style="Toolbar.TFrame", padding=(10, 6, 10, 6))
+        _visor_body = self.marco_visor
+
+        def _grupo(texto=None):
+            frame = ttk.Frame(_visor_body, style="Toolbar.TFrame")
+            lbl = None
+            if texto:
+                lbl = ttk.Label(frame, text=texto, style="Toolbar.TLabel")
+                lbl.pack(side=tk.LEFT, padx=(0, 6))
+            return frame, lbl
+
+        self.var_ventana = tk.DoubleVar(value=5.0)
+
+        self.frame_ventana, self.lbl_ventana = _grupo("Ventana (s)")
+        self.spin_ventana = ttk.Spinbox(
+            self.frame_ventana,
+            from_=5.0,
+            to=30.0,
+            increment=1.0,
+            width=5,
+            textvariable=self.var_ventana
+        )
+        self.spin_ventana.pack(side=tk.LEFT)
+
+        self.frame_fft, self.lbl_fmax = _grupo("Hasta (Hz)")
+        self.spin_fmax = ttk.Spinbox(
+            self.frame_fft,
+            from_=20.0,
+            to=100.0,
+            increment=5.0,
+            width=5,
+            textvariable=self.var_fmax
+        )
+        self.spin_fmax.pack(side=tk.LEFT)
+
+        ## Escala del espectro PSD (log por defecto: muestra la pendiente 1/f
+        ## y el pico alfa sin que Delta aplaste el resto de bandas).
+        self.frame_psd_opciones, _ = _grupo()
+        self.chk_psd_log = ttk.Checkbutton(
+            self.frame_psd_opciones,
+            text="Eje Y logarítmico",
+            variable=self.var_psd_log,
+            command=self._programar_autografico,
+            style="Toolbar.TCheckbutton",
+        )
+        self.chk_psd_log.pack(side=tk.LEFT)
+
+        self.frame_espectrograma, self.lbl_ventana_espectrograma = _grupo("Ventana (s)")
+        self.spin_ventana_espectrograma = ttk.Spinbox(
+            self.frame_espectrograma,
+            from_=0.5,
+            to=10.0,
+            increment=0.5,
+            width=5,
+            textvariable=self.var_ventana_espectrograma
+        )
+        self.spin_ventana_espectrograma.pack(side=tk.LEFT, padx=(0, 14))
+
+        self.lbl_solapamiento_espectrograma = ttk.Label(
+            self.frame_espectrograma, text="Solapamiento (%)", style="Toolbar.TLabel"
+        )
+        self.lbl_solapamiento_espectrograma.pack(side=tk.LEFT, padx=(0, 6))
+        self.spin_solapamiento_espectrograma = ttk.Spinbox(
+            self.frame_espectrograma,
+            from_=0.0,
+            to=95.0,
+            increment=5.0,
+            width=5,
+            textvariable=self.var_solapamiento_espectrograma
+        )
+        self.spin_solapamiento_espectrograma.pack(side=tk.LEFT, padx=(0, 14))
+
+        self.lbl_escala_espectrograma = ttk.Label(
+            self.frame_espectrograma,
+            text="Escala: dB",
+            style="Toolbar.TLabel",
+        )
+        self.lbl_escala_espectrograma.pack(side=tk.LEFT)
+
+        # Texto explicativo: se conserva el widget (lo usan otras rutas), pero
+        # en la barra horizontal no se muestra para no romper la fila.
+        self.lbl_info_espectrograma = ttk.Label(
+            self.frame_espectrograma,
+            text=(
+                "El espectrograma muestra cómo cambia la potencia de cada "
+                "frecuencia a lo largo del tiempo. La escala dB mejora el "
+                "contraste visual. No corresponde a la magnitud FFT en µV."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=280
+        )
+
+        self.frame_canal, self.lbl_canal = _grupo("Canal")
+        self.var_canal_nombre = tk.StringVar(value=self.nombres_canales[0])
+
+        self.combo_canal = ttk.Combobox(
+            self.frame_canal,
+            textvariable=self.var_canal_nombre,
+            state="readonly",
+            width=9,
+            values=self.nombres_canales
+        )
+        self.combo_canal.current(0)
+        self.combo_canal.pack(side=tk.LEFT)
+        self.combo_canal.bind("<<ComboboxSelected>>", self._on_combo_canal_change)
+        self.var_canal_nombre.trace_add("write", self.actualizar_nav_canal)
+
+        self.frame_ganancia, self.lbl_ganancia = _grupo("Ganancia")
+        self.spin_ganancia = ttk.Spinbox(
+            self.frame_ganancia,
+            from_=0.2,
+            to=10.0,
+            increment=0.2,
+            width=5,
+            textvariable=self.var_ganancia
+        )
+        self.spin_ganancia.pack(side=tk.LEFT)
+
+        ## Actualización automática al modificar spinboxes
+        self.var_ganancia.trace_add("write", self._programar_autografico)
+        self.var_ventana.trace_add("write", self._programar_autografico)
+        self.var_fmax.trace_add("write", self._programar_autografico)
+        self.var_ventana_espectrograma.trace_add("write", self._programar_autografico)
+        self.var_solapamiento_espectrograma.trace_add("write", self._programar_autografico)
+
+        ## Actualización automática al escribir con teclado
+        for spin in (
+            self.spin_ganancia,
+            self.spin_ventana,
+            self.spin_fmax,
+            self.spin_ventana_espectrograma,
+            self.spin_solapamiento_espectrograma,
+        ):
+            spin.bind("<KeyRelease>", self._programar_autografico)
+            spin.bind("<<Increment>>", self._programar_autografico)
+            spin.bind("<<Decrement>>", self._programar_autografico)
+
+        ## Bandas a mostrar: cada casilla con el color fijo de su banda
+        self.frame_bandas, _ = _grupo("Bandas")
+        for b in self.bandas:
+            chk = ttk.Checkbutton(
+                self.frame_bandas,
+                text=b,
+                variable=self.band_vars[b],
+                command=self._limitar_bandas,
+                style=f"Banda{b}.TCheckbutton",
+            )
+            chk.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.btn_graficar = _GlassButton(
+            _visor_body,
+            text="Graficar",
+            command=self.graficar,
+            color_hex=TURQUESA_NEUROX,
+            fuente=self.fuente_ui,
+            width=150,
+            bg=FONDO_PANEL,
+        )
+        self.btn_graficar.pack(side=tk.RIGHT)
+        self._marco_visor_visible = False
+
+    def _crear_resumen_clinico_inspector(self, parent):
+        """
+        Bloque superior del inspector en modo visor: biomarcadores con
+        semáforo (texto + color) y la distribución global de bandas como
+        barra apilada. Lee los mismos datos de cache que la pestaña de
+        análisis; no recalcula nada.
+        """
+        frame = ttk.LabelFrame(parent, text="Biomarcadores · referencia EO", padding=10, style="Card.TLabelframe")
+        frame.pack(fill=tk.X, pady=(0, 8))
+        body = self._hacer_colapsable(frame)
+
+        tabla = ttk.Frame(body, style="Sidebar.TFrame")
+        tabla.pack(fill=tk.X)
+        tabla.columnconfigure(0, weight=1)
+
+        self._insp_biomarcadores = {}
+        filas = [
+            ("paf_occipital", "PAF occipital"),
+            ("paf_global", "PAF global"),
+            ("gradiente_ap", "Gradiente AP alfa"),
+            ("Theta_Alfa", "Theta / Alfa"),
+            ("Delta_Alfa", "Delta / Alfa"),
+            ("Theta_Beta", "Theta / Beta"),
+            ("Lentificacion", "Lentificación"),
+        ]
+        for fila, (clave, texto) in enumerate(filas):
+            ttk.Label(tabla, text=texto, style="Sidebar.TLabel").grid(row=fila, column=0, sticky="w", pady=2)
+            lbl_valor = ttk.Label(tabla, text="--", font=(self.fuente_ui, 9, "bold"))
+            lbl_valor.grid(row=fila, column=1, sticky="e", padx=(8, 8))
+            chip = tk.Label(
+                tabla, text="", font=(self.fuente_ui, 8, "bold"),
+                padx=7, pady=1, bd=0, bg=FONDO_PANEL, fg=TEXTO_SECUNDARIO,
+            )
+            chip.grid(row=fila, column=2, sticky="e")
+            self._insp_biomarcadores[clave] = (lbl_valor, chip)
+
+        ttk.Label(
+            body, text="POTENCIA RELATIVA GLOBAL · 1–30 Hz", style="Seccion.TLabel"
+        ).pack(anchor="w", pady=(12, 6))
+        self.canvas_barra_bandas = tk.Canvas(
+            body, height=16, bg=FONDO_PANEL, highlightthickness=0, bd=0
+        )
+        self.canvas_barra_bandas.pack(fill=tk.X)
+        self.canvas_barra_bandas.bind("<Configure>", lambda _e: self._dibujar_barra_bandas())
+
+        leyenda = ttk.Frame(body, style="Sidebar.TFrame")
+        leyenda.pack(fill=tk.X, pady=(6, 0))
+        self._insp_lbl_bandas = {}
+        for i, b in enumerate(["Delta", "Theta", "Alfa", "Beta"]):
+            celda = ttk.Frame(leyenda, style="Sidebar.TFrame")
+            celda.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 14), pady=1)
+            tk.Label(celda, text="■", fg=COLORES_BANDAS[b], bg=FONDO_PANEL,
+                     font=(self.fuente_ui, 9), bd=0).pack(side=tk.LEFT, padx=(0, 4))
+            lbl = ttk.Label(celda, text=f"{b} --%", style="Sidebar.TLabel")
+            lbl.pack(side=tk.LEFT)
+            self._insp_lbl_bandas[b] = lbl
+
+    def _aplicar_chip_semaforo(self, chip, color_semaforo, texto):
+        estilos = {
+            "green": ("#1F7A4A", "#E5F4EC"),
+            "yellow": ("#9A6400", "#FDF1DC"),
+            "red": ("#B42D2D", "#FBE6E6"),
+            "gray": ("#4B5563", "#EEF0F4"),
+        }
+        fg, bg = estilos.get(color_semaforo, (TEXTO_SECUNDARIO, FONDO_PANEL))
+        if not texto:
+            fg, bg = TEXTO_SECUNDARIO, FONDO_PANEL
+        chip.config(text=texto, fg=fg, bg=bg)
+
+    def _actualizar_resumen_inspector(self):
+        """Refresca biomarcadores y barra de bandas del inspector desde el cache."""
+        if not hasattr(self, "_insp_biomarcadores"):
+            return
+
+        for lbl_valor, chip in self._insp_biomarcadores.values():
+            lbl_valor.config(text="--", foreground=TEXTO_PRINCIPAL)
+            self._aplicar_chip_semaforo(chip, None, "")
+
+        resumen_welch = None
+        promedios_ratios = {}
+        if self.cache_ultimo:
+            carpeta_welch = os.path.join(self.cache_ultimo, "analisis_welch")
+            if os.path.exists(os.path.join(carpeta_welch, "pot_rel_welch.npz")):
+                if self._pot_rel_welch is None or self._resumen_welch is None:
+                    try:
+                        self.cargar_potencia_relativa_desde_cache()
+                    except Exception:
+                        pass
+                if isinstance(self._resumen_welch, dict):
+                    resumen_welch = self._resumen_welch
+            try:
+                self._cargar_ratios_desde_cache()
+                if isinstance(self._resumen_ratios, dict):
+                    promedios_ratios = self._resumen_ratios.get("promedios_globales", {}) or {}
+            except Exception:
+                promedios_ratios = {}
+
+        def _es_numero(valor):
+            try:
+                return valor is not None and np.isfinite(float(valor))
+            except Exception:
+                return False
+
+        if resumen_welch is not None:
+            for clave, campo in (("paf_occipital", "paf_occipital_hz"), ("paf_global", "paf_global_hz")):
+                lbl_valor, chip = self._insp_biomarcadores[clave]
+                valor = resumen_welch.get(campo)
+                if _es_numero(valor):
+                    semaforo = clasificar_semaforo(float(valor), "PAF")
+                    lbl_valor.config(text=f"{float(valor):.2f} Hz")
+                    self._aplicar_chip_semaforo(chip, semaforo.get("color"), semaforo.get("estado", ""))
+                else:
+                    # Sin pico alfa medible en ojos abiertos: hallazgo normal.
+                    lbl_valor.config(text="—")
+                    self._aplicar_chip_semaforo(chip, "green", "Bloqueo visual")
+
+            valor = resumen_welch.get("gradiente_ap")
+            if _es_numero(valor):
+                lbl_valor, chip = self._insp_biomarcadores["gradiente_ap"]
+                semaforo = clasificar_semaforo(float(valor), "Gradiente_AP")
+                lbl_valor.config(text=f"{float(valor):.2f}")
+                self._aplicar_chip_semaforo(chip, semaforo.get("color"), semaforo.get("estado", ""))
+
+        for clave in ("Theta_Alfa", "Delta_Alfa", "Theta_Beta", "Lentificacion"):
+            valor = promedios_ratios.get(clave)
+            if _es_numero(valor):
+                lbl_valor, chip = self._insp_biomarcadores[clave]
+                semaforo = clasificar_semaforo(float(valor), clave)
+                lbl_valor.config(text=f"{float(valor):.2f}")
+                self._aplicar_chip_semaforo(chip, semaforo.get("color"), semaforo.get("estado", ""))
+
+        self._dibujar_barra_bandas()
+
+    def _dibujar_barra_bandas(self):
+        """Barra apilada Delta/Theta/Alfa/Beta con la potencia relativa global."""
+        canvas = getattr(self, "canvas_barra_bandas", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        ancho = max(1, canvas.winfo_width())
+        alto = max(1, canvas.winfo_height())
+
+        proms = {}
+        if self.cache_ultimo and self._pot_rel_welch is not None:
+            try:
+                proms = self._promedios_globales_potencia_welch() or {}
+            except Exception:
+                proms = {}
+
+        valores = []
+        for b in ["Delta", "Theta", "Alfa", "Beta"]:
+            try:
+                v = float(proms.get(b))
+                v = v if np.isfinite(v) and v > 0 else 0.0
+            except Exception:
+                v = 0.0
+            valores.append(v)
+            if b in getattr(self, "_insp_lbl_bandas", {}):
+                texto = f"{b} {self._formatear_pct(v)}" if v > 0 else f"{b} --%"
+                self._insp_lbl_bandas[b].config(text=texto)
+
+        total = sum(valores)
+        if total <= 0:
+            canvas.create_rectangle(0, 0, ancho, alto, fill=FONDO_PANEL_SUAVE, outline="")
+            return
+
+        hueco = 2
+        disponible = max(1, ancho - hueco * 3)
+        x = 0.0
+        for b, v in zip(["Delta", "Theta", "Alfa", "Beta"], valores):
+            w = disponible * (v / total)
+            if w > 0:
+                canvas.create_rectangle(x, 0, x + w, alto, fill=COLORES_BANDAS[b], outline="")
+            x += w + hueco
+
+    def _actualizar_barra_superior(self, resumen_calidad=None):
+        """Nombre del registro, condición, fs, canales, duración y estado de calidad."""
+        if not hasattr(self, "var_registro_actual"):
+            return
+
+        nombre = self.nombre_ultimo
+        if not nombre:
+            self.var_registro_actual.set("Ningún registro seleccionado")
+            self.var_registro_meta.set("Elige un archivo .dat en Registros")
+            self.lbl_chip_calidad.pack_forget()
+            return
+
+        self.var_registro_actual.set(os.path.splitext(os.path.basename(str(nombre)))[0])
+        condicion = {"EO": "Ojos abiertos", "EC": "Ojos cerrados"}.get(CONDICION_REGISTRO, CONDICION_REGISTRO)
+
+        if not self.cache_ultimo:
+            self.var_registro_meta.set(f"{condicion} · sin procesar")
+            self.lbl_chip_calidad.pack_forget()
+            return
+
+        meta = {}
+        ruta_meta = os.path.join(self.cache_ultimo, "meta.txt")
+        try:
+            with open(ruta_meta, "r", encoding="utf-8") as f:
+                for linea in f:
+                    if "=" in linea:
+                        k, v = linea.split("=", 1)
+                        meta[k.strip()] = v.strip()
+        except Exception:
+            meta = {}
+
+        partes = [condicion]
+        try:
+            partes.append(f"{float(meta['fs']):.0f} Hz")
+        except Exception:
+            pass
+        if meta.get("n_canales"):
+            partes.append(f"{meta['n_canales']} canales")
+        try:
+            dur = float(meta["duracion_s"])
+            mins, segs = divmod(int(round(dur)), 60)
+            partes.append(f"{mins} min {segs:02d} s")
+        except Exception:
+            pass
+        self.var_registro_meta.set(" · ".join(partes))
+
+        if resumen_calidad is None:
+            self.lbl_chip_calidad.pack_forget()
+            return
+        try:
+            estado = self._metricas_calidad_resumen(resumen_calidad).get("estado")
+        except Exception:
+            estado = None
+        estilos = {
+            "Buena": ("#1F7A4A", "#E5F4EC"),
+            "Aceptable": ("#9A6400", "#FDF1DC"),
+            "Comprometida": ("#B45309", "#FDEBD9"),
+            "Deficiente": ("#B42D2D", "#FBE6E6"),
+        }
+        if not estado:
+            self.lbl_chip_calidad.pack_forget()
+            return
+        fg, bg = estilos.get(str(estado).strip(), ("#4B5563", "#EEF0F4"))
+        self.lbl_chip_calidad.config(text=f"● Calidad {str(estado).lower()}", fg=fg, bg=bg)
+        if not self.lbl_chip_calidad.winfo_ismapped():
+            self.lbl_chip_calidad.pack(side=tk.LEFT, padx=(12, 0))
+
+    def _on_tabbar_principal_click(self, idx):
+        """Pestañas unificadas: las 6 primeras son vistas de señal, el resto de análisis."""
+        n_graf = len(self.modos_grafica_tabs)
+        try:
+            en_analisis = bool(self.panel_analisis.winfo_manager())
+        except Exception:
+            en_analisis = False
+
+        if idx < n_graf:
+            if en_analisis:
+                self._activar_tab_global("grafica")
+            self._on_tabbar_grafica_click(idx)
+        else:
+            if not en_analisis:
+                self._activar_tab_global("analisis")
+            self._on_tabbar_analisis_click(idx - n_graf)
+        self._sincronizar_tabbar_principal()
+
+    def _sincronizar_tabbar_principal(self):
+        bar = getattr(self, "tabbar_principal", None)
+        if bar is None or not hasattr(self, "modos_grafica_tabs"):
+            return
+        n_graf = len(self.modos_grafica_tabs)
+        try:
+            en_analisis = bool(self.panel_analisis.winfo_manager())
+        except Exception:
+            en_analisis = False
+
+        if en_analisis:
+            orden = {"welch": 0, "ratios": 1, "calidad": 2}
+            idx = n_graf + orden.get(self._tab_analisis_actual(), 0)
+        else:
+            etiquetas = list(self.modos_grafica_tabs.keys())
+            texto = self._tab_desde_modo(self.var_modo.get())
+            idx = etiquetas.index(texto) if texto in etiquetas else 0
+
+        if bar._activo != idx:
+            bar.seleccionar(idx)
+
     def _crear_encabezado_neurox(self):
-        self.frame_marca = ttk.Frame(self.panel_izq_fijo_sup, style="Sidebar.TFrame", padding=(2, 0, 2, 6))
-        self.frame_marca.pack(fill=tk.X)
+        """Logo de NeuroX a la izquierda de la barra superior."""
+        self.frame_marca = ttk.Frame(self.barra_superior, style="Topbar.TFrame")
+        self.frame_marca.pack(side=tk.LEFT)
 
         self.logo_neurox_tk = None
         logo_path = buscar_logo_neurox()
@@ -1969,51 +2376,17 @@ class AppEEG:
                 with Image.open(logo_path) as imagen:
                     resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
                     imagen = imagen.copy()
-                    imagen.thumbnail((300, 100), resample)
+                    imagen.thumbnail((150, 30), resample)
                     self.logo_neurox_tk = ImageTk.PhotoImage(imagen)
             except Exception:
                 self.logo_neurox_tk = None
 
         if self.logo_neurox_tk is not None:
-            ttk.Label(self.frame_marca, image=self.logo_neurox_tk, style="Sidebar.TLabel").pack(anchor="center")
+            ttk.Label(self.frame_marca, image=self.logo_neurox_tk, style="TopbarMeta.TLabel").pack(side=tk.LEFT)
         else:
-            ttk.Label(self.frame_marca, text="NeuroX", style="Logo.TLabel").pack(anchor="center")
-        return
-
-        self.frame_marca = ttk.Frame(self.panel_izq_fijo_sup, style="Sidebar.TFrame", padding=(2, 0, 2, 6))
-        self.frame_marca.pack(fill=tk.X)
-
-        logo_path = buscar_logo_neurox()
-        if logo_path:
-            try:
-                imagen = Image.open(logo_path)
-                nombre_logo = os.path.basename(logo_path).lower()
-                if "icono" in nombre_logo:
-                    ancho_objetivo = 50
-                elif "nombre_neurox" in nombre_logo:
-                    ancho_objetivo = 190
-                else:
-                    ancho_objetivo = 220
-
-                ancho_original, alto_original = imagen.size
-                if ancho_original > 0 and alto_original > 0:
-                    alto_objetivo = max(1, int(round((alto_original / ancho_original) * ancho_objetivo)))
-                    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
-                    imagen = imagen.resize((ancho_objetivo, alto_objetivo), resample)
-                    self.logo_neurox_tk = ImageTk.PhotoImage(imagen)
-            except Exception:
-                self.logo_neurox_tk = None
-
-        if self.logo_neurox_tk is not None:
-            ttk.Label(self.frame_marca, image=self.logo_neurox_tk, style="Sidebar.TLabel").pack(anchor="w")
-        else:
-            ttk.Label(self.frame_marca, text="NeuroX", style="Logo.TLabel").pack(anchor="w")
-
-        ttk.Label(
-            self.frame_marca,
-            text="Procesamiento y análisis de señales EEG",
-            style="Subtle.TLabel"
-        ).pack(anchor="w", pady=(3, 0))
+            ttk.Label(
+                self.frame_marca, text="NeuroX", style="Logo.TLabel", font=(self.fuente_ui, 14, "bold")
+            ).pack(side=tk.LEFT)
 
     ## =========================================================
     ## Cierre, log y estado de trabajo
@@ -2176,7 +2549,7 @@ class AppEEG:
                 pass
             self._after_ocultar_progreso = None
         if not self.marco_estado_trabajo.winfo_ismapped():
-            self.marco_estado_trabajo.pack(fill=tk.X, pady=(0, 6), before=self.lbl_carpeta)
+            self.marco_estado_trabajo.pack(fill=tk.X, pady=(2, 8), after=self.frame_acciones)
         if not self.progreso.winfo_ismapped():
             self.progreso.pack(fill=tk.X, pady=(6, 0))
 
@@ -2358,7 +2731,7 @@ class AppEEG:
             return
 
         if visible:
-            self.frame_nav_canal.pack(fill=tk.X, pady=(6, 6), before=self.frame_visor_plot)
+            self.frame_nav_canal.pack(fill=tk.X, pady=(0, 6), before=self.frame_visor_plot)
         else:
             self.frame_nav_canal.pack_forget()
 
@@ -2504,6 +2877,9 @@ class AppEEG:
             labels["atipicos"].config(text=atipicos)
             labels["sospechosos"].config(text=sospechosos)
 
+        # Barra superior (registro + chip de calidad) e inspector clínico.
+        self._actualizar_barra_superior(resumen)
+        self._actualizar_resumen_inspector()
         self._actualizar_scrollregion_izquierda()
 
     def _actualizar_visibilidad_alertas_analisis(self):
@@ -2583,47 +2959,55 @@ class AppEEG:
                 pass
         self._actualizar_scrollregion_izquierda()
 
-    def _puede_scroll_panel_izquierdo(self):
-        if not hasattr(self, "canvas_izq") or self.canvas_izq is None:
+    def _puede_scroll_canvas(self, canvas):
+        if canvas is None:
             return False
         try:
-            bbox = self.canvas_izq.bbox("all")
+            bbox = canvas.bbox("all")
             if not bbox:
                 return False
             alto_contenido = max(0, int(bbox[3] - bbox[1]))
-            alto_canvas = max(1, int(self.canvas_izq.winfo_height()))
+            alto_canvas = max(1, int(canvas.winfo_height()))
             return alto_contenido > (alto_canvas + 2)
         except Exception:
             return False
 
-    def _actualizar_scrollregion_izquierda(self):
-        if not hasattr(self, "canvas_izq") or self.canvas_izq is None or not hasattr(self, "_win_izq"):
-            return
+    def _puede_scroll_panel_izquierdo(self):
+        return self._puede_scroll_canvas(getattr(self, "canvas_izq", None))
 
+    def _ajustar_scrollregion_canvas(self, canvas, id_ventana):
         try:
-            self.canvas_izq.update_idletasks()
-            self.canvas_izq.coords(self._win_izq, 0, 0)
-            bbox = self.canvas_izq.bbox("all")
+            canvas.update_idletasks()
+            canvas.coords(id_ventana, 0, 0)
+            bbox = canvas.bbox("all")
             if not bbox:
                 return
 
-            self.canvas_izq.configure(scrollregion=bbox)
+            canvas.configure(scrollregion=bbox)
 
-            alto_canvas = max(1, int(self.canvas_izq.winfo_height()))
+            alto_canvas = max(1, int(canvas.winfo_height()))
             alto_contenido = max(1, int(bbox[3] - bbox[1]))
 
             if alto_contenido <= (alto_canvas + 2):
-                self.canvas_izq.yview_moveto(0.0)
+                canvas.yview_moveto(0.0)
                 return
 
-            first, _last = self.canvas_izq.yview()
+            first, _last = canvas.yview()
             max_first = max(0.0, 1.0 - (alto_canvas / float(alto_contenido)))
             if first < 0.0:
-                self.canvas_izq.yview_moveto(0.0)
+                canvas.yview_moveto(0.0)
             elif first > max_first:
-                self.canvas_izq.yview_moveto(max_first)
+                canvas.yview_moveto(max_first)
         except Exception:
             pass
+
+    def _actualizar_scrollregion_izquierda(self):
+        """Ajusta el scroll de las dos columnas laterales (registros e inspector)."""
+        for nombre_canvas, nombre_ventana in (("canvas_izq", "_win_izq"), ("canvas_insp", "_win_insp")):
+            canvas = getattr(self, nombre_canvas, None)
+            id_ventana = getattr(self, nombre_ventana, None)
+            if canvas is not None and id_ventana is not None:
+                self._ajustar_scrollregion_canvas(canvas, id_ventana)
 
     def _hacer_colapsable(self, labelframe, pack_kwargs_body=None):
         """
@@ -2974,6 +3358,7 @@ class AppEEG:
     def _actualizar_canales_alerta(self):
         self.var_atipicos.set("Canales atípicos: --")
         self.var_sospechosos.set("Canales sospechosos: --")
+        self._nombres_atipicos_set = set()
     
         if not self.cache_ultimo:
             self._actualizar_bloques_resumen_calidad()
@@ -3027,6 +3412,12 @@ class AppEEG:
             "sospech"
         )
     
+        # Conjunto de nombres simples para marcar en rojo su etiqueta en el
+        # visor multicanal.
+        self._nombres_atipicos_set = {
+            self._nombre_simple(n) for n in (nombres_atipicos or [])
+        }
+
         if nombres_atipicos is None:
             self.var_atipicos.set("Canales atípicos: --")
         elif nombres_atipicos:
@@ -3063,9 +3454,11 @@ class AppEEG:
             return
 
         if visible:
-            after_widget = getattr(self, "_calidad_wrapper_grafica",
-                           getattr(self, "frm_resumen_calidad_grafica", self.lbl_sospechosos_grafica))
-            self.marco_visor.pack(fill=tk.X, after=after_widget)
+            # La barra de controles va justo encima del gráfico (o de la
+            # navegación de canal, si está visible).
+            nav = getattr(self, "frame_nav_canal", None)
+            antes = nav if (nav is not None and nav.winfo_manager()) else self.frame_visor_plot
+            self.marco_visor.pack(fill=tk.X, pady=(0, 6), before=antes)
         else:
             self.marco_visor.pack_forget()
 
@@ -3158,57 +3551,53 @@ class AppEEG:
         self._redibujar_modo_actual()
 
     def _refrescar_ui_modo(self, _evt=None):
+        """
+        Muestra en la barra horizontal solo los controles de la pestaña
+        activa y, en el inspector, el mapa regional cuando hay un canal
+        seleccionado (vistas de un solo canal).
+        """
         modo = self._normalizar_modo_grafica(self.var_modo.get())
         if modo != self.var_modo.get():
             self.var_modo.set(modo)
         self._sincronizar_tab_grafica()
-    
-        self.frame_canal.pack_forget()
-        self.frame_ganancia.pack_forget()
-        self.frame_ventana.pack_forget()
-        self.frame_fft.pack_forget()
-        self.frame_espectrograma.pack_forget()
-        self.frame_bandas.pack_forget()
+
+        for frame in (
+            self.frame_canal,
+            self.frame_ganancia,
+            self.frame_ventana,
+            self.frame_fft,
+            self.frame_psd_opciones,
+            self.frame_espectrograma,
+            self.frame_bandas,
+        ):
+            frame.pack_forget()
         self.frame_mapa.pack_forget()
 
-        self.lbl_fmax.config(text="Límite Espectro (Hz):")
+        self.lbl_fmax.config(text="Hasta (Hz)")
         self.spin_fmax.configure(from_=20.0, to=100.0, increment=5.0)
         self.btn_graficar.config(text="Graficar")
-    
+
+        def _mostrar(*frames):
+            for frame in frames:
+                frame.pack(side=tk.LEFT, padx=(0, 18))
+
         if modo == "Filtrado multicanal":
-            self.frame_ganancia.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
-            self.frame_ventana.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
-    
+            _mostrar(self.frame_ventana, self.frame_ganancia)
+
         elif modo == "FFT filtrada":
-            self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
-            self.frame_fft.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
-            self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
-            self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
-    
+            _mostrar(self.frame_canal, self.frame_fft)
+
         elif modo == "FFT final":
-            self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
-            self.frame_fft.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
-            self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
-            self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
+            _mostrar(self.frame_canal, self.frame_fft)
 
         elif modo == "Canal filtrado":
-            self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
-            self.frame_ventana.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
-            self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
-            self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
-    
+            _mostrar(self.frame_canal, self.frame_ventana)
+
         elif modo == "Bandas":
-            self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
-            self.frame_ventana.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
-            self.frame_bandas.pack(fill=tk.X, pady=(0, 0))
-            self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
-            self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
+            _mostrar(self.frame_canal, self.frame_ventana, self.frame_bandas)
 
         elif modo == "Espectrograma":
-            self.frame_canal.pack(fill=tk.X, before=self.btn_graficar)
-            self.frame_fft.pack(fill=tk.X, pady=(0, 0), before=self.btn_graficar)
-            self.frame_mapa.pack(fill=tk.X, pady=(8, 0))
-            self.lbl_fmax.config(text="Frecuencia máxima (Hz):")
+            _mostrar(self.frame_canal, self.frame_fft, self.frame_espectrograma)
             self.spin_fmax.configure(from_=1.0, to=40.0, increment=1.0)
             try:
                 if float(self.var_fmax.get()) > 40.0:
@@ -3216,9 +3605,15 @@ class AppEEG:
             except Exception:
                 self.var_fmax.set(40.0)
             self.btn_graficar.config(text="Graficar espectrograma")
+
+        if modo != "Filtrado multicanal":
+            self.frame_mapa.pack(fill=tk.X, pady=(0, 8))
             self.raiz.after_idle(self._dibujar_mapa_regional_resumen)
+
         self.actualizar_nav_canal()
-            
+        self._sincronizar_tabbar_principal()
+        self.raiz.after_idle(self._actualizar_scrollregion_izquierda)
+
     def _programar_autografico(self, *_args):
         """
         Programa una actualización automática 1 segundo después
@@ -4310,11 +4705,11 @@ class AppEEG:
 
     def _toggle_sidebar(self):
         if self._sidebar_visible:
-            self._cont_izq.pack_forget()
+            self._cont_izq.grid_remove()
             self._btn_toggle_sidebar.config(text="▶")
             self._sidebar_visible = False
         else:
-            self._cont_izq.pack(side=tk.LEFT, fill=tk.Y, before=self._cont_der)
+            self._cont_izq.grid()
             self._btn_toggle_sidebar.config(text="◀")
             self._sidebar_visible = True
         self.raiz.after_idle(self._actualizar_scrollregion_izquierda)
@@ -4646,11 +5041,11 @@ class AppEEG:
                 self.log("[OK] Resultados actualizados en la interfaz.")
 
                 # Ya NO se abre el PDF automáticamente. Solo se avisa que
-                # terminó bien; para verlo, el usuario usa "Vista previa".
+                # terminó bien; para verlo, el usuario usa "Ver informe PDF".
                 messagebox.showinfo(
                     "Procesado con éxito",
                     f"El archivo se procesó correctamente y el informe está listo.\n\n"
-                    f"Usa 'Vista previa' para verlo cuando quieras."
+                    f"Usa 'Ver informe PDF' para verlo cuando quieras."
                 )
             else:
                 self.ruta_pdf_ultimo = self._buscar_pdf_preferido(self.nombre_ultimo, self.cache_ultimo)
@@ -5141,6 +5536,7 @@ class AppEEG:
             if getattr(self, "hay_grafico_activo", False) and self.canal_activo_simple:
                 self._click_canal_analisis(self.canal_activo_simple)
             self._actualizar_barra_modo_analisis("welch")
+        self._sincronizar_tabbar_principal()
 
     def _reprocesar_forzado(self):
         if not self.carpeta_dcl or not os.path.isdir(self.carpeta_dcl):
@@ -5337,7 +5733,7 @@ class AppEEG:
                     f"Se procesaron {len(exitosos)} de {total} archivo(s) correctamente.\n"
                     f"Tiempo total: {texto_tiempo}.\n\n"
                     f"Con errores ({len(fallidos)}):\n{detalle}\n\n"
-                    f"Usa 'Vista previa' para ver el último informe generado con éxito."
+                    f"Usa 'Ver informe PDF' para ver el último informe generado con éxito."
                 )
             else:
                 self._set_barra(f"Lote terminado: {len(exitosos)}/{total} procesado(s) con éxito. ({texto_tiempo})")
@@ -5349,7 +5745,7 @@ class AppEEG:
                 messagebox.showinfo(
                     "Procesado con éxito",
                     f"{mensaje}\nTiempo total: {texto_tiempo}.\n\n"
-                    f"Usa 'Vista previa' para ver el último informe generado."
+                    f"Usa 'Ver informe PDF' para ver el último informe generado."
                 )
 
         try:
@@ -5430,6 +5826,13 @@ class AppEEG:
             # El notebook dispara <<NotebookTabChanged>> → _on_tab_analisis
 
     def _on_tab_analisis(self, _evt=None):
+        # El notebook oculto dispara este evento al construirse; si el panel
+        # de análisis no está visible no hay nada que cargar ni dibujar.
+        try:
+            if not self.panel_analisis.winfo_manager():
+                return
+        except Exception:
+            return
         tab = self._tab_analisis_actual()
         self._actualizar_barra_modo_analisis(tab)
         self._mostrar_panel_izq_analisis_actual()
@@ -5444,6 +5847,7 @@ class AppEEG:
             self._programar_redibujo_ratios()
         elif tab == "calidad":
             self.mostrar_dashboard_calidad_senal(seleccionar_tab=False)
+        self._sincronizar_tabbar_principal()
 
     def mostrar_analisis_potencia_relativa(self):
         """
@@ -5468,6 +5872,7 @@ class AppEEG:
         self._mostrar_panel_izq_analisis_actual()
         self.actualizar_panel_izquierdo_potencia_relativa()
         self._programar_redibujo_welch()
+        self._sincronizar_tabbar_principal()
 
     def mostrar_analisis_ratios_bandas(self):
         """
@@ -5492,6 +5897,7 @@ class AppEEG:
         self._mostrar_panel_izq_analisis_actual()
         self.actualizar_panel_izquierdo_ratios()
         self._programar_redibujo_ratios()
+        self._sincronizar_tabbar_principal()
 
     def _mostrar_panel_izq_analisis_actual(self):
         if not hasattr(self, "frm_energia_relativa_izq"):
@@ -6485,10 +6891,13 @@ class AppEEG:
             if proms:
                 return proms
 
-        return {
-            key: float(np.nanmean(np.asarray(valores, dtype=np.float64)))
-            for key, valores in self._ratios_principales.items()
-        }
+        # Respaldo sin cache: mismos canales corticales que el pipeline.
+        proms = {}
+        for key, valores in self._ratios_principales.items():
+            arr = np.asarray(valores, dtype=np.float64)
+            idx = indices_canales_corticales(arr.size, self.nombres_canales)
+            proms[key] = float(np.nanmean(arr[idx]))
+        return proms
 
     def _promedios_regionales_ratios(self):
         regiones_objetivo = ["Frontal", "Central", "Temporal", "Parietal", "Occipital"]
@@ -7052,11 +7461,15 @@ class AppEEG:
             if proms:
                 return proms
 
-        return {
-            b: float(np.nanmean(np.asarray(self._pot_rel_welch[b], dtype=np.float64)))
-            for b in ["Delta", "Theta", "Alfa", "Beta"]
-            if b in self._pot_rel_welch
-        }
+        # Respaldo sin cache: mismos canales corticales que el pipeline.
+        proms = {}
+        for b in ["Delta", "Theta", "Alfa", "Beta"]:
+            if b not in self._pot_rel_welch:
+                continue
+            arr = np.asarray(self._pot_rel_welch[b], dtype=np.float64)
+            idx = indices_canales_corticales(arr.size, self.nombres_canales)
+            proms[b] = float(np.nanmean(arr[idx]))
+        return proms
 
     def _promedios_regionales_potencia_welch(self):
         regiones_objetivo = ["Frontal", "Central", "Temporal", "Parietal", "Occipital"]
@@ -9032,23 +9445,26 @@ class AppEEG:
         self._lines_multicanal = []
         self._offsets_multicanal = offsets
 
+        # Trazado clínico: tinta oscura y fina en todos los canales; los
+        # canales atípicos se atenúan y su etiqueta se marca en rojo.
         for ch in range(seg.shape[0]):
             y = seg[ch] * ganancia + offsets[ch]
-            (linea,) = self._ax_main.plot(x, y, linewidth=0.7)
+            nombre = self.nombres_canales[ch] if ch < len(self.nombres_canales) else ""
+            atipico = self._nombre_simple(nombre) in self._nombres_atipicos_set
+            (linea,) = self._ax_main.plot(
+                x, y, linewidth=0.6, color="#9AA0B0" if atipico else COLOR_TINTA
+            )
             self._lines_multicanal.append(linea)
 
-        self._ax_main.set_title("Señal EEG Multicanal")
+        self._ax_main.set_title("Señal filtrada · multicanal", loc="left")
         self._ax_main.set_xlabel("Tiempo (s)")
-        self._ax_main.set_ylabel("Canales")
-        self._ax_main.set_yticks(offsets)
-        self._ax_main.set_yticklabels(self.nombres_canales, fontsize=6)
+        self._ax_main.set_ylabel("")
         self._ax_main.invert_yaxis()
-        # linestyle="-" explícito: con ~64 canales apilados muy juntos, la
-        # cuadrícula punteada global (más vistosa en gráficas con pocas
-        # líneas) generaba un efecto de "ruido" visual sobre las señales.
-        # Aquí se necesita una referencia horizontal sólida y discreta.
-        self._ax_main.grid(True, alpha=0.2, linestyle="-", linewidth=0.6)
+        self._ax_main.set_ylim(offsets[-1] + separacion, offsets[0] - separacion)
+        self._ax_main.spines["left"].set_visible(False)
         self._ax_main.set_xlim(float(x[0]), float(x[-1]))
+        self._barra_calibracion = []
+        self._decorar_multicanal(self._ax_main, offsets, separacion, ganancia, dt)
 
         self._vista_actual = "multicanal"
         self._line_canal = None
@@ -9056,7 +9472,7 @@ class AppEEG:
         self._lines_bandas = []
 
         self._limpiar_controles_tiempo()
-        self.fig.subplots_adjust(left=0.07, right=0.99, top=0.96, bottom=0.07)
+        self.fig.subplots_adjust(left=0.06, right=0.955, top=0.95, bottom=0.07)
         self.canvas.draw_idle()
         self._activar_hover_multicanal()
         self._actualizar_barra_modo_grafica("Filtrado multicanal")
@@ -9119,18 +9535,82 @@ class AppEEG:
             y = seg[ch] * ganancia + offsets[ch]
             linea.set_data(x, y)
 
-        self._ax_main.set_yticks(offsets)
-        self._ax_main.set_yticklabels(self.nombres_canales, fontsize=6)
         self._ax_main.set_xlim(float(x[0]), float(x[-1]))
 
         ymin = offsets[0] - separacion
         ymax = offsets[-1] + separacion
         self._ax_main.set_ylim(ymax, ymin)
+        self._decorar_multicanal(self._ax_main, offsets, separacion, ganancia, dt)
 
         self.canvas.draw_idle()
         #self._activar_hover_multicanal()
         
         
+    def _decorar_multicanal(self, ax, offsets, separacion, ganancia, dt):
+        """
+        Elementos de lectura del EEG multicanal: etiquetas monoespaciadas
+        (atípicos en rojo), divisores entre regiones, rejilla temporal y
+        barra de calibración en µV en el margen derecho. Se redibuja cada
+        vez que cambian la ganancia o la ventana.
+        """
+        from matplotlib.ticker import MultipleLocator
+        import matplotlib.transforms as mtransforms
+
+        for artista in getattr(self, "_barra_calibracion", []) or []:
+            try:
+                artista.remove()
+            except Exception:
+                pass
+        self._barra_calibracion = []
+
+        n = len(offsets)
+        nombres = list(self.nombres_canales)[:n]
+        ax.set_yticks(offsets[:len(nombres)])
+        ax.set_yticklabels(nombres, fontsize=6.5, family="monospace")
+        for etiqueta, nombre in zip(ax.get_yticklabels(), nombres):
+            if self._nombre_simple(nombre) in self._nombres_atipicos_set:
+                etiqueta.set_color("#B42D2D")
+                etiqueta.set_fontweight("bold")
+            else:
+                etiqueta.set_color(COLOR_TINTA_SUAVE)
+        ax.tick_params(axis="y", length=0, pad=4)
+        ax.grid(False, axis="y")
+        ax.grid(True, axis="x", color=COLOR_REJILLA, linewidth=0.7)
+        paso = 1 if dt <= 12 else (2 if dt <= 20 else 5)
+        ax.xaxis.set_major_locator(MultipleLocator(paso))
+
+        region_previa = None
+        for i, nombre in enumerate(nombres):
+            try:
+                region = self._region_de_canal_ui(self._nombre_simple(nombre))
+            except Exception:
+                region = None
+            if i > 0 and region != region_previa:
+                y = 0.5 * (offsets[i - 1] + offsets[i])
+                self._barra_calibracion.append(
+                    ax.axhline(y, color="#D9DBE6", linewidth=0.6, zorder=0)
+                )
+            region_previa = region
+
+        if separacion > 0 and ganancia > 0:
+            uv_entre_canales = separacion / ganancia
+            valor = 5
+            for candidato in (5, 10, 20, 50, 100, 200, 500, 1000, 2000):
+                if candidato <= 0.8 * uv_entre_canales:
+                    valor = candidato
+            alto = valor * ganancia
+            trans = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
+            y0 = offsets[-1] + 0.5 * separacion
+            (linea,) = ax.plot(
+                [1.012, 1.012], [y0, y0 - alto], transform=trans, color=COLOR_TINTA,
+                linewidth=2.4, clip_on=False, solid_capstyle="butt",
+            )
+            texto = ax.text(
+                1.026, y0 - alto / 2.0, f"{valor} µV", transform=trans, rotation=90,
+                va="center", ha="left", fontsize=7.5, color=COLOR_TINTA, clip_on=False,
+            )
+            self._barra_calibracion += [linea, texto]
+
     def _graficar_canal_filtrado(self, idx, canal, nombre):
         try:
             datos, tiempo = self._cargar_filtrado_y_tiempo()
@@ -9173,12 +9653,12 @@ class AppEEG:
 
         self.fig.clear()
         self._ax_main = self.fig.add_subplot(111)
-        (self._line_canal,) = self._ax_main.plot(x, y, linewidth=0.9)
+        (self._line_canal,) = self._ax_main.plot(x, y, linewidth=0.8, color=COLOR_TINTA)
 
-        self._ax_main.set_title(f"Canal filtrado: {nombre} (#{canal})")
+        self._ax_main.set_title(f"Canal {nombre} (#{canal}) · señal filtrada", loc="left")
         self._ax_main.set_xlabel("Tiempo (s)")
-        self._ax_main.set_ylabel("μV")
-        self._ax_main.grid(True, alpha=0.3)
+        self._ax_main.set_ylabel("Amplitud (µV)")
+        self._ax_main.axhline(0.0, color=COLOR_EJE, linewidth=0.6, zorder=1)
 
         if len(x) > 1:
             self._ax_main.set_xlim(float(x[0]), float(x[-1]))
@@ -9485,8 +9965,8 @@ class AppEEG:
                 fmax = 40.0
             mask = freqs <= fmax
     
-            x = np.asarray(freqs[mask], dtype=np.float64)
-            y_cruda = np.asarray(amps[idx, mask], dtype=np.float64)
+            x = np.array(freqs[mask], dtype=np.float64)
+            y_cruda = np.array(amps[idx, mask], dtype=np.float64)
     
             # 1. SUAVIZADO VISUAL: Filtro Gaussiano para eliminar la varianza extrema (código de barras)
             # Mantiene la morfología exacta de los picos reales pero hace la curva legible.
@@ -9503,20 +9983,21 @@ class AppEEG:
             self.fig.clear()
             ax = self.fig.add_subplot(111)
     
-            # 2. LÍMITES IFCN ACTUALIZADOS
-            bandas_fft = [
-                ("Delta (1-4 Hz)", 1.0, 4.0, "#7EC8E3"),
-                ("Theta (4-8 Hz)", 4.0, 8.0, "#8BC34A"),
-                ("Alfa (8-13 Hz)", 8.0, 13.0, "#FFD54F"),
-                ("Beta (13-30 Hz)", 13.0, 30.0, "#FF8A65"),
-            ]
-    
-            handles = []
-            for nombre_banda, f0, f1, col in bandas_fft:
+            # 2. Bandas clínicas (IFCN) con los colores fijos de la app
+            import matplotlib.transforms as mtransforms
+            trans_banda = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+            for nombre_banda, (f0, f1) in BANDAS_CLINICAS.items():
                 if f0 >= fmax:
                     continue
-                ax.axvspan(f0, min(f1, fmax), alpha=0.12, color=col)
-                handles.append(Patch(facecolor=col, edgecolor="gray", label=nombre_banda, alpha=0.8))
+                f1 = min(f1, fmax)
+                col = COLORES_BANDAS.get(nombre_banda, COLOR_EJE)
+                ax.axvspan(f0, f1, alpha=0.08, color=col, linewidth=0, zorder=0)
+                ax.plot([f0 + 0.15, f1 - 0.15], [0.995, 0.995], transform=trans_banda,
+                        color=col, linewidth=3, solid_capstyle="butt", clip_on=False)
+                ax.text(0.5 * (f0 + f1), 0.975, nombre_banda, transform=trans_banda,
+                        ha="center", va="top", fontsize=8.5, fontweight="bold",
+                        color=COLOR_TINTA_SUAVE, clip_on=False)
+            handles = []
     
             # 3. ESCALA INTELIGENTE (Adiós a la caja roja de alerta)
             # Calculamos el techo basándonos estrictamente en las frecuencias cognitivas (>1.0 Hz).
@@ -9533,16 +10014,14 @@ class AppEEG:
                 ax.set_ylim(0, techo)
     
             # Dibujo de la señal limpia y suavizada
-            ax.plot(x, y, color="#2c3e50", linewidth=1.1)
-    
-            if handles:
-                ax.legend(handles=handles, loc="upper right", title="Bandas Clínicas",
-                           fontsize=8, title_fontsize=9, frameon=True)
-    
-            ax.set_title(f"FFT final (post-limpieza) - Canal {nombre_canal} (#{canal})")
+            ax.plot(x, y, color=COLOR_TINTA, linewidth=1.3)
+
+            ax.set_title(f"FFT final (post-limpieza) · canal {nombre_canal} (#{canal})", loc="left")
             ax.set_xlabel("Frecuencia (Hz)")
             ax.set_ylabel(ylabel)
-            ax.grid(True, alpha=0.3)
+            ax.grid(True, axis="y")
+            ax.grid(False, axis="x")
+            ax.set_xticks([f for f in (1, 4, 8, 13, 20, 30, 40, 50, 60, 80, 100) if f <= fmax])
             if len(x) > 1:
                 ax.set_xlim(0, fmax)
     
@@ -9582,7 +10061,7 @@ class AppEEG:
     
             fs = self._leer_fs_desde_meta_cache(fs_defecto=500.0)
             
-            x = np.asarray(datos[idx], dtype=np.float32)
+            x = np.array(datos[idx], dtype=np.float32)  # copia: suelta el mapeo del .npy
             if x.size < 2:
                 messagebox.showwarning("Espectrograma", "No hay muestras suficientes para calcular el espectrograma.")
                 return
@@ -9667,68 +10146,58 @@ class AppEEG:
             # 4. Renderizado idéntico al PDF (gouraud + turbo)
             mesh = ax.pcolormesh(t, f, sxx_db, shading="gouraud", cmap="turbo", vmin=vmin, vmax=vmax)
     
-            for yref in (4.0, 8.0, 12.0, 30.0):
-                if yref <= fmax:
-                    ax.axhline(yref, color="#F3F4F6", linewidth=0.8, alpha=0.75, zorder=3)
-    
+            # Límites de banda clínicos (mismos que Welch y el informe) punteados.
+            limites = sorted({f for rango in BANDAS_CLINICAS.values() for f in rango})
+            for yref in limites:
+                if 1.0 < yref <= fmax:
+                    ax.axhline(yref, color="white", linewidth=0.7, alpha=0.75,
+                               linestyle=(0, (3, 3)), zorder=3)
+
             colorbar = self.fig.colorbar(mesh, cax=cax)
-            colorbar.set_label("Potencia espectral (dB)")
-            colorbar.outline.set_linewidth(0.6)
-    
-            ax.set_title(f"Espectrograma EEG - Canal {nombre_canal} (Señal Completa)")
-            ax.set_xlabel("Tiempo (s)")
+            colorbar.set_label("Potencia (dB re 1 µV²/Hz)")
+            colorbar.outline.set_linewidth(0.5)
+            colorbar.outline.set_edgecolor(COLOR_EJE)
+
+            duracion = float(t[-1]) if len(t) else 0.0
+            ax.set_title(f"Espectrograma · canal {nombre_canal} · registro completo", loc="left")
             ax.set_ylabel("Frecuencia (Hz)")
+            if duracion >= 90.0:
+                ax.xaxis.set_major_formatter(FORMATO_MMSS)
+                ax.set_xlabel("Tiempo (mm:ss)")
+            else:
+                ax.set_xlabel("Tiempo (s)")
             ax.set_ylim(1.0, fmax)
-    
-            ticks_y = [1, 4, 8, 12, 20, 30, 40]
+            for lado in ("top", "right"):
+                ax.spines[lado].set_visible(True)
+
+            ticks_y = [1, 4, 8, 13, 20, 30, 40]
             ticks_y = [v for v in ticks_y if v <= fmax]
-    
             ax.set_yticks(ticks_y)
             ax.set_yticklabels([str(v) for v in ticks_y])
-            ax.tick_params(
-                axis="y",
-                which="both",
-                left=True,
-                labelleft=True,
-                labelsize=10,
-                colors="black"
-            )
             ax.grid(False)
-    
+
             ax_bandas.set_xlim(0.0, 1.0)
             ax_bandas.set_ylim(1.0, fmax)
             ax_bandas.set_xticks([])
             ax_bandas.set_yticks([])
-    
+            ax_bandas.grid(False)
             for spine in ax_bandas.spines.values():
                 spine.set_visible(False)
-    
             ax_bandas.patch.set_alpha(0.0)
-    
-            bandas_texto = [
-                ("Delta", 1.0, 4.0),
-                ("Theta", 4.0, 8.0),
-                ("Alfa", 8.0, 12.0),
-                ("Beta", 12.0, 30.0),
-            ]
-            for nombre_banda, f0, f1 in bandas_texto:
+
+            # Al margen: barra con el color fijo de cada banda y su nombre.
+            for nombre_banda, (f0, f1) in BANDAS_CLINICAS.items():
                 if f0 >= fmax:
                     continue
                 y0 = max(1.0, f0)
                 y1 = min(f1, fmax)
                 if y1 <= y0:
                     continue
-                y_centro = 0.5 * (y0 + y1)
-                ax_bandas.text(
-                    0.02,
-                    y_centro,
-                    nombre_banda,
-                    ha="left",
-                    va="center",
-                    fontsize=9,
-                    color="#4B5563"
-                )
-    
+                ax_bandas.plot([0.06, 0.06], [y0 + 0.15, y1 - 0.15], linewidth=3.5,
+                               color=COLORES_BANDAS.get(nombre_banda, COLOR_EJE), solid_capstyle="butt")
+                ax_bandas.text(0.22, 0.5 * (y0 + y1), nombre_banda, ha="left", va="center",
+                               fontsize=8.5, color=COLOR_TINTA_SUAVE)
+
             self._vista_actual = "espectrograma"
             self._line_canal = None
             self._lines_multicanal = []
@@ -9906,7 +10375,7 @@ class AppEEG:
         self._axes_bandas = [self.fig.add_subplot(n, 1, i + 1) for i in range(n)]
         self._lines_bandas = []
 
-        self.fig.suptitle(f"{nombre_canal} (#{canal})", fontsize=11, y=0.98)
+        self.fig.suptitle(f"Bandas · canal {nombre_canal} (#{canal})", fontsize=10.5, fontweight="bold", x=0.08, ha="left", y=0.97)
         self.fig.subplots_adjust(left=0.08, right=0.98, top=0.90, bottom=0.16, hspace=0.90)
 
         for i, b in enumerate(seleccion):
@@ -9931,17 +10400,19 @@ class AppEEG:
             i1 = min(i1, datos.shape[1])
 
             x = np.arange(i0, i1) / self._fs
-            y = datos[idx, i0:i1]
+            y = np.array(datos[idx, i0:i1], dtype=np.float64)  # copia: no retener el mapeo del .npy
 
-            (linea,) = ax.plot(x, y, linewidth=0.9)
+            (linea,) = ax.plot(x, y, linewidth=0.8, color=COLORES_BANDAS.get(b, COLOR_TINTA))
             self._lines_bandas.append(linea)
 
-            ax.set_title(f"{b}", fontsize=10)
+            f0_b, f1_b = BANDAS_CLINICAS.get(b, (None, None))
+            sufijo = f" · {f0_b:g}–{f1_b:g} Hz" if f0_b is not None else ""
+            ax.set_title(f"{b}{sufijo}", fontsize=9.5, loc="left", color=COLORES_BANDAS.get(b, COLOR_TINTA))
             if i == n - 1:
                 ax.set_xlabel("Tiempo (s)", labelpad=8)
             else:
                 ax.set_xlabel("")
-            ax.set_ylabel("μV")
+            ax.set_ylabel("µV")
             ax.grid(alpha=0.3)
 
         self._vista_actual = "bandas"
