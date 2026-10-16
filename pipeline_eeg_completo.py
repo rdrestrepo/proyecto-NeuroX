@@ -129,6 +129,37 @@ AUTO_PICOS_FACTOR_LOCAL_ARMONICO = 1.8   # umbral mas permisivo que el de la fun
 # CONFIGURACION WAVELET
 WAVELET_NAME = "db4"
 WAVELET_NIVEL = 4
+# Numero de detalles MAS FINOS (alta frecuencia) a los que se aplica el
+# soft-thresholding. Con db4/fs=500, los dos detalles mas finos viven por
+# encima de 60 Hz: ahi solo hay ruido termico de sensor. Aplicar el umbral a
+# TODOS los detalles (comportamiento anterior) tambien encogia Alfa/Beta y
+# distorsionaba la potencia RELATIVA (inflando Delta por defecto). Dejar los
+# niveles profundos intactos preserva la fisica de las bandas clinicas.
+WAVELET_DETALLES_LIMPIAR = 2
+
+# Banda ancha SOLO para entrenar ICA/ICLabel. La red ICLabel fue entrenada con
+# 1-100 Hz: si le llega una senal ya recortada a 40 Hz pierde precision para
+# separar musculo/parpadeo de actividad cerebral. El producto clinico final
+# SIGUE siendo 1-40 Hz; esta banda ancha no se guarda ni alimenta Welch.
+ICAFIT_LOWCUT = 1.0
+ICAFIT_HIGHCUT = 100.0
+
+# Deteccion robusta de epocas contaminadas (pops/saltos de electrodo) para el
+# ENTRENAMIENTO de ICA. Se usan Mediana/MAD (no std global) para que un
+# artefacto largo no enmascare los peores saltos. La mascara solo afecta al
+# 'fit': la proyeccion de limpieza se aplica sobre la senal continua completa.
+EPOCAS_VENTANA_S = 2.0
+EPOCAS_UMBRAL_Z = 4.5
+EPOCAS_MIN_CANALES = 2
+EPOCAS_FRACCION_MIN_VALIDA = 0.50
+
+# Estimacion espectral Welch. 'median' es inmune a parpadeos/movimientos
+# transitorios (la media aritmetica se contamina con pocas ventanas de alta
+# potencia en Delta). En potencia RELATIVA el sesgo de la mediana se cancela
+# entre bandas. Se conserva la ventana de 2 s (resolucion 0.5 Hz): probar con
+# 4 s desplazaba el Delta al alza de forma no fisiologica.
+WELCH_VENTANA_S = 2.0
+WELCH_AVERAGE = "median"
 
 # CONFIGURACION ICA (rendimiento)
 
@@ -1420,36 +1451,63 @@ def detectar_picos_tecnicos_estrechos(datos, fs_real, logger=None):
     return resultado
 
 
-def _detectar_epocas_contaminadas(datos, fs_real, ventana_s=2.0, umbral_std=5.0):
+def _detectar_epocas_contaminadas(datos, fs_real, ventana_s=EPOCAS_VENTANA_S,
+                                  umbral_z=EPOCAS_UMBRAL_Z):
     """
-    Detecta segmentos contaminados por artefactos no-estereotipados:
-    - Pops/electrode jumps: desviación estándar > umbral_std en ventana corta
-    - Deriva lenta anómala: pendiente lineal > 100 µV/s en ventana
+    Detecta segmentos contaminados por artefactos no-estereotipados (pops/saltos
+    de electrodo, movimientos bruscos) usando estadisticos ROBUSTOS (Mediana y
+    MAD) por canal.
 
-    Retorna: máscara booleana (True = válida, False = contaminada)
+    ¿Por que no std_ventana / std_global?
+    El cociente anterior se comparaba contra un std_global que el propio
+    artefacto inflaba: si el artefacto duraba >4% del registro, el cociente no
+    podia superar sqrt(1/0.04)=5.0 y los peores saltos pasaban sin filtrarse.
+    La mediana/MAD del std por ventana no tiene ese techo.
+
+    IMPORTANTE: la mascara devuelta se usa SOLO para entrenar ICA (ica.fit).
+    La proyeccion de limpieza (ica.apply) se aplica sobre la senal continua
+    completa, evitando saltos artificiales por "cortar y pegar".
+
+    Retorna: mascara booleana (True = valida, False = contaminada).
     """
     x = np.asarray(datos, dtype=np.float64)
     if x.ndim != 2 or x.shape[1] < 2:
         return np.ones(x.shape[1], dtype=bool)
 
     n_canales, n_muestras = x.shape
-    n_ventana = int(fs_real * ventana_s)
-    if n_ventana < 10:
-        n_ventana = min(10, n_muestras)
+    n_ventana = max(10, int(fs_real * ventana_s))
+    if n_ventana >= n_muestras:
+        return np.ones(n_muestras, dtype=bool)
+    paso = max(1, n_ventana // 2)
+
+    rangos = []
+    stds_ventanas = []
+    for inicio in range(0, n_muestras - n_ventana + 1, paso):
+        fin = min(inicio + n_ventana, n_muestras)
+        stds_ventanas.append(np.std(x[:, inicio:fin], axis=1))
+        rangos.append((inicio, fin))
+
+    if not rangos:
+        return np.ones(n_muestras, dtype=bool)
+
+    mat_std = np.asarray(stds_ventanas)             # (n_ventanas, n_canales)
+    med_canal = np.median(mat_std, axis=0)
+    mad_canal = np.median(np.abs(mat_std - med_canal), axis=0)
+    mad_safe = np.where(mad_canal < 1e-12, 1e-12, mad_canal)
 
     mask_valido = np.ones(n_muestras, dtype=bool)
-
-    # Detectar ventanas con desviación extrema (pops/movimientos)
-    for inicio in range(0, n_muestras - n_ventana, n_ventana // 2):
-        fin = min(inicio + n_ventana, n_muestras)
-        ventana = x[:, inicio:fin]
-        std_ventana = np.std(ventana, axis=1)
-        std_global = np.std(x, axis=1)
-        std_global_safe = np.where(std_global < 1e-12, 1e-12, std_global)
-
-        ratio = std_ventana / std_global_safe
-        if np.any(ratio > umbral_std):
+    for (inicio, fin), std_v in zip(rangos, mat_std):
+        z_robusto = 0.6745 * (std_v - med_canal) / mad_safe
+        # Un salto real afecta a VARIOS canales a la vez; exigir un minimo de
+        # canales simultaneos evita descartar actividad ocular frontal normal,
+        # que ICA necesita ver para aislar el componente de parpadeo.
+        if np.count_nonzero(z_robusto > umbral_z) >= EPOCAS_MIN_CANALES:
             mask_valido[inicio:fin] = False
+
+    # Seguridad: si el detector quiere descartar demasiado, se desactiva, para
+    # no dejar a ICA sin datos suficientes para una descomposicion estable.
+    if float(np.mean(mask_valido)) < EPOCAS_FRACCION_MIN_VALIDA:
+        return np.ones(n_muestras, dtype=bool)
 
     return mask_valido
 
@@ -1480,10 +1538,20 @@ def _calcular_snr_crudo_rapido(datos, fs_real):
     return float(snr_db)
 
 
-def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
+def aplicar_ica_mne(datos, fs_real, nombres_canales, datos_fit=None, logger=None):
     """
     Aplica ICA utilizando la libreria MNE y mne-icalabel.
     Cumple con los requisitos estrictos de ICLabel (Filtro 1-100Hz, CAR, Infomax).
+
+    Args:
+        datos: senal de TRABAJO (1-40 Hz) sobre la que se proyecta la limpieza.
+        datos_fit: copia de BANDA ANCHA (1-100 Hz) usada solo para calcular el
+            SNR crudo, entrenar ICA y clasificar con ICLabel. Si es None se usa
+            'datos'. Mantener el producto final en 1-40 Hz y dar 1-100 Hz a
+            ICLabel corrige dos problemas: (1) el SNR crudo (1-30 vs 40-100 Hz)
+            ya no mide una banda borrada por el pasa-banda; (2) la red neuronal
+            recupera la informacion de alta frecuencia que necesita para
+            distinguir musculo/parpadeo de actividad cerebral.
     """
     import mne
     from mne.preprocessing import ICA
@@ -1496,6 +1564,9 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
 
     log = logger if logger else print
 
+    if datos_fit is None:
+        datos_fit = datos
+
     # Categorias de ICLabel que se consideran artefacto
     CATEGORIAS_ARTEFACTO_ESTANDAR = {
         'eye blink', 'eye movement', 'muscle artifact',
@@ -1503,10 +1574,13 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
     }
     CATEGORIAS_ARTEFACTO_AGRESIVO = CATEGORIAS_ARTEFACTO_ESTANDAR | {'other'}
 
-    # Calcular SNR crudo para decidir umbral adaptativo
-    # (SNR crudo: 1-30 Hz vs 40-100 Hz sobre señal filtrada pre-ICA)
-    snr_crudo_db = _calcular_snr_crudo_rapido(datos, fs_real)
-    log(f"[MNE] SNR crudo estimado: {snr_crudo_db:.1f} dB")
+    # Calcular SNR crudo para decidir umbral adaptativo.
+    # Se mide sobre la copia de BANDA ANCHA (1-30 Hz vs 40-100 Hz); si se
+    # midiera sobre 'datos' (ya recortada a 40 Hz) la banda de ruido estaria
+    # vacia y el SNR saldria artificialmente alto, desactivando el modo
+    # adaptativo de ICA de forma permanente.
+    snr_crudo_db = _calcular_snr_crudo_rapido(datos_fit, fs_real)
+    log(f"[MNE] SNR crudo estimado (banda ancha): {snr_crudo_db:.1f} dB")
 
     # Umbral adaptativo: señales buenas usan estándar, señales malas usan agresivo
     if snr_crudo_db < 5.0:
@@ -1524,6 +1598,7 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
 
     log("[MNE] Inicializando entorno para ICA...")
     datos_v = np.asarray(datos, dtype=np.float64) * 1e-6
+    datos_fit_v = np.asarray(datos_fit, dtype=np.float64) * 1e-6
 
     nombres_mne = []
     tipos_canales = []
@@ -1550,15 +1625,42 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
         raw.set_montage(montage, on_missing='ignore')
 
     # 1. PRINCIPIO DE WINKLER (Adaptado para ICLabel)
-    # ICLabel requiere un filtro de 1 a 100 Hz para clasificar bien.
-    log("[MNE] Acondicionando copia temporal (Filtro 1-100Hz y CAR) para ICLabel...")
-    raw_fit = raw.copy().filter(l_freq=1.0, h_freq=100.0, fir_design='firwin', verbose=False)
+    # ICLabel requiere un filtro de 1 a 100 Hz para clasificar bien. Se aplica
+    # sobre la copia de BANDA ANCHA (datos_fit); el pasa-banda de 1-40 Hz del
+    # producto clinico se conserva intacto porque 'raw' viene de 'datos'.
+    alta_fit = min(float(ICAFIT_HIGHCUT), float(fs_real) / 2.0 - 1.0)
+    log(f"[MNE] Acondicionando copia de banda ancha (Filtro {ICAFIT_LOWCUT:.0f}-{alta_fit:.0f}Hz y CAR) para ICLabel...")
+    if abs(alta_fit - float(highcut)) < 1e-6 and np.array_equal(datos_fit, datos):
+        raw_fit_base = raw.copy()
+    else:
+        raw_fit_base = mne.io.RawArray(datos_fit_v, info, verbose=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            raw_fit_base.set_montage(montage, on_missing='ignore')
+    raw_fit = raw_fit_base.filter(l_freq=ICAFIT_LOWCUT, h_freq=alta_fit, fir_design='firwin', verbose=False)
 
     # ICLabel requiere que la señal tenga CAR. Se aplica SOLO a esta copia de entrenamiento 
     raw_fit.set_eeg_reference('average', projection=False, verbose=False)
 
+    # 1b. Mascara de epocas contaminadas: se calcula sobre la copia de banda
+    # ancha y se usa UNICAMENTE para entrenar ICA, de modo que pops/saltos no
+    # deformen los pesos. La proyeccion (ica.apply) se hara sobre 'raw'
+    # continuo, sin "cortar y pegar" (que creaba saltos y energia falsa de
+    # baja frecuencia).
+    mask_valido = _detectar_epocas_contaminadas(datos_fit, fs_real)
+
     # 2. Ajuste del ICA
     # ICLabel fue entrenado especificamente sobre infomax extendido.
+    n_validas = int(np.count_nonzero(mask_valido))
+    if n_validas < mask_valido.size:
+        dur_excl = (mask_valido.size - n_validas) / float(fs_real)
+        log(f"[MNE] Entrenando ICA sin {dur_excl:.1f}s de epocas contaminadas "
+            f"({n_validas}/{mask_valido.size} muestras utiles).")
+        datos_train = raw_fit.get_data()[:, mask_valido]
+        raw_train = mne.io.RawArray(datos_train, raw_fit.info, verbose=False)
+    else:
+        raw_train = raw_fit
+
     log("[MNE] Extrayendo componentes independientes (Infomax Extendido)...")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1566,7 +1668,7 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, logger=None):
             n_components=0.99, method='infomax',
             fit_params=dict(extended=True), rng=42, max_iter=500,
         )
-        ica.fit(raw_fit, verbose=False)
+        ica.fit(raw_train, verbose=False)
 
     # 3. Poda multivariada inteligente con ICLabel
     if has_icalabel:
@@ -1657,10 +1759,16 @@ def wavelet_denoise_1d(signal_1d, wavelet=WAVELET_NAME, nivel=WAVELET_NIVEL):
         sigma = mad / 0.6745
         m = 2.0  # Multiplicador de sensibilidad para proteger picos clínicos
         umbral = m * sigma * np.sqrt(2 * np.log(len(s)))
-        
-        # Aplicamos soft-thresholding SOLO a los detalles (ruido). 
-        # La aproximación (coef[0], ondas lentas) queda intacta.
-        coef_limpios = [coef[0]] + [pywt.threshold(c, umbral, mode="soft") for c in coef[1:]]
+
+        # Aplicamos soft-thresholding SOLO a los detalles MAS FINOS (alta
+        # frecuencia, por encima de la banda clinica), donde vive el ruido
+        # termico de sensor. La aproximacion (coef[0] = delta/theta) y los
+        # detalles profundos (donde viven Alfa y Beta) quedan intactos para
+        # no encoger esas bandas y distorsionar la potencia relativa.
+        n_det = max(1, min(int(WAVELET_DETALLES_LIMPIAR), len(coef) - 1))
+        coef_limpios = list(coef[:-n_det]) + [
+            pywt.threshold(c, umbral, mode="soft") for c in coef[-n_det:]
+        ]
     else:
         coef_limpios = coef
         
@@ -2110,7 +2218,7 @@ def calcular_psd_welch_por_canal(datos, fs_real, logger=None):
         raise ValueError("No hay muestras suficientes para calcular Welch.")
 
     fs_real = float(fs_real)
-    nperseg = int(min(max(2, round(fs_real * 2)), n_muestras))
+    nperseg = int(min(max(2, round(fs_real * float(WELCH_VENTANA_S))), n_muestras))
     if nperseg < 2:
         nperseg = n_muestras
 
@@ -2126,10 +2234,11 @@ def calcular_psd_welch_por_canal(datos, fs_real, logger=None):
         noverlap=noverlap,
         detrend="linear",
         scaling="density",
+        average=WELCH_AVERAGE,
         axis=1
     )
 
-    log(f"Welch PSD: nperseg={nperseg}, noverlap={noverlap}, canales={x.shape[0]}")
+    log(f"Welch PSD (average={WELCH_AVERAGE}): nperseg={nperseg}, noverlap={noverlap}, canales={x.shape[0]}")
     return freqs.astype(np.float32), psd.astype(np.float32)
 
 
@@ -2152,16 +2261,25 @@ def calcular_potencia_relativa_welch(
     fs_real,
     bandas_def=None,
     rango_total=None,
+    nombres_canales=None,
+    idx_excluir=None,
     logger=None
 ):
     """
     Calcula potencia absoluta y relativa por banda usando PSD de Welch.
     La potencia total se limita a 1-30 Hz para coherencia clínica.
+
+    Los promedios GLOBALES excluyen los electrodos periféricos no cerebrales
+    (M1, M2, CB1, CB2) y los canales de idx_excluir (p. ej. atípicos fuertes).
+    Esos canales siguen presentes en el PSD por canal, pero no contaminan el
+    resumen cortical: ICA los trata como 'misc' y no los limpia.
     """
     if bandas_def is None:
         bandas_def = bandas
     if rango_total is None:
         rango_total = RANGO_TOTAL_WELCH
+    if idx_excluir is None:
+        idx_excluir = []
 
     freqs, psd = calcular_psd_welch_por_canal(datos, fs_real, logger=logger)
     pot_total = _integrar_psd_por_banda(freqs, psd, rango_total[0], rango_total[1])
@@ -2174,8 +2292,19 @@ def calcular_potencia_relativa_welch(
         pot_abs[banda] = abs_banda.astype(np.float32)
         pot_rel[banda] = ((abs_banda / pot_total_safe) * 100.0).astype(np.float32)
 
+    # Índices válidos para el resumen cortical global.
+    n_can = int(psd.shape[0])
+    excluir_set = set(int(i) for i in idx_excluir)
+    if nombres_canales is not None:
+        for i, nom in enumerate(nombres_canales[:n_can]):
+            if limpiar_nombre_canal(nom) in ("M1", "M2", "CB1", "CB2"):
+                excluir_set.add(i)
+    idx_validos = [i for i in range(n_can) if i not in excluir_set]
+    if not idx_validos:
+        idx_validos = list(range(n_can))
+
     promedios_globales = {
-        b: float(np.nanmean(np.asarray(pot_rel[b], dtype=np.float64)))
+        b: float(np.nanmean(np.asarray(pot_rel[b][idx_validos], dtype=np.float64)))
         for b in bandas_def.keys()
     }
 
@@ -5241,19 +5370,29 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # =========================
     # 6) ICA (MNE-ICLabel)
     # =========================
-    # Pre-ICA: detectar y excluir épocas contaminadas antes de la descomposición
-    mask_valido = _detectar_epocas_contaminadas(datos_fn, fs_real)
-    n_excluidas = np.sum(~mask_valido)
-    if n_excluidas > 0:
-        dur_excluida_s = n_excluidas / fs_real
-        log(f"[Pre-ICA] Excluyendo {n_excluidas} muestras ({dur_excluida_s:.1f}s) de épocas contaminadas")
-        datos_para_ica = datos_fn[:, mask_valido]
+    # Copia de BANDA ANCHA (1-100 Hz) construida desde la señal estabilizada
+    # pre-filtro, con la MISMA interpolación espacial que la señal de trabajo.
+    # Se usa SOLO para entrenar ICA y clasificar con ICLabel: así la red ve el
+    # espectro completo (músculo/parpadeo) y el SNR crudo (1-30 vs 40-100 Hz)
+    # no mide una banda ya borrada por el pasa-banda de 40 Hz. El producto
+    # clínico (datos_fn, 1-40 Hz) NO se modifica.
+    alta_ica_fit = min(float(ICAFIT_HIGHCUT), float(fs_real) / 2.0 - 1.0)
+    if alta_ica_fit > float(highcut) + 1e-6:
+        datos_ica_fit = filtrar_banda(datos_eeg_detrend, fs_real, lowcut, alta_ica_fit, order)
+        if 60.0 < (float(fs_real) / 2.0):
+            datos_ica_fit = filtro_notch(datos_ica_fit, fs_real, 60, Q=30)
+        if len(idx_a_interpolar) > 0:
+            datos_ica_fit = interpolar_canales_malos(
+                datos_ica_fit, idx_a_interpolar, nombres_canales_archivo
+            )
+        log(f"[Pre-ICA] Copia de banda ancha 1-{alta_ica_fit:.0f} Hz lista para ICA/ICLabel.")
     else:
-        datos_para_ica = datos_fn
+        datos_ica_fit = datos_fn
 
     log("[Proceso] Ejecutando ICA de grado médico con MNE...")
     datos_ica, porcentaje_varianza_ica = aplicar_ica_mne(
-        datos_para_ica, fs_real, nombres_canales_archivo, logger=log
+        datos_fn, fs_real, nombres_canales_archivo,
+        datos_fit=datos_ica_fit, logger=log
     )
     np.save(
         os.path.join(rutas["ica"], "eeg_ica.npy"),
@@ -5350,6 +5489,8 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         fs_real,
         bandas_def=bandas,
         rango_total=RANGO_TOTAL_WELCH,
+        nombres_canales=nombres_canales_welch,
+        idx_excluir=[],
         logger=silent_logger
     )
     guardar_potencia_relativa_welch(
@@ -5436,7 +5577,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         f.write("correcciones_por_canal=ninguna\n")
 
     # Liberar memoria
-    del datos_eeg, tiempo, datos_pb, datos_fn, datos_ica, datos_wavelet
+    del datos_eeg, tiempo, datos_pb, datos_fn, datos_ica, datos_wavelet, datos_ica_fit, datos_eeg_detrend
     gc.collect()
 
     log("[OK] Procesamiento completado correctamente.")
