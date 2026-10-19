@@ -1141,6 +1141,9 @@ class AppEEG:
         )
         self.frm_resumen_calidad_grafica.pack(fill=tk.X)
 
+        ## Recomendaciones de adquisición para la próxima toma
+        self._crear_bloque_adquisicion_inspector(self.panel_izq_grafica)
+
         self.frame_mapa = ttk.LabelFrame(
             self.panel_izq_grafica,
             text="Mapa regional",
@@ -2140,6 +2143,76 @@ class AppEEG:
             lbl.pack(side=tk.LEFT)
             self._insp_lbl_bandas[b] = lbl
 
+    def _crear_bloque_adquisicion_inspector(self, parent):
+        """Electrodos a corregir antes de la próxima toma y cuánto sube la Confiabilidad."""
+        frame = ttk.LabelFrame(parent, text="Adquisición · próxima toma", padding=10, style="Card.TLabelframe")
+        frame.pack(fill=tk.X, pady=(0, 8))
+        body = self._hacer_colapsable(frame)
+        self.lbl_insp_adq_resumen = ttk.Label(body, text="--", wraplength=285, justify="left")
+        self.lbl_insp_adq_resumen.pack(fill=tk.X)
+        self.lbl_insp_adq_patron = tk.Label(
+            body, text="", wraplength=285, justify="left", anchor="w",
+            font=(self.fuente_ui, 8, "bold"), bg="#FDF1DC", fg="#9A6400", padx=6, pady=4,
+        )
+        self.frm_insp_adq_lista = ttk.Frame(body, style="Sidebar.TFrame")
+        self.frm_insp_adq_lista.pack(fill=tk.X, pady=(6, 0))
+
+    def _actualizar_adquisicion_inspector(self):
+        """Recomendaciones de adquisición del registro activo."""
+        if not hasattr(self, "frm_insp_adq_lista"):
+            return
+        for w in self.frm_insp_adq_lista.winfo_children():
+            w.destroy()
+        self.lbl_insp_adq_patron.pack_forget()
+        self.lbl_insp_adq_resumen.config(text="Sin datos procesados.")
+        if not self.cache_ultimo:
+            return
+
+        try:
+            from pipeline_eeg_completo import recomendaciones_adquisicion_desde_cache
+            rec = recomendaciones_adquisicion_desde_cache(self.cache_ultimo, self.nombres_canales)
+        except Exception as e:
+            rec = None
+            self.log(f"[Aviso] Recomendaciones de adquisición no disponibles: {e}")
+        if not isinstance(rec, dict):
+            return
+
+        pm, pa = rec.get("para_media"), rec.get("para_alta")
+        partes = [f"Confiabilidad actual: {rec.get('confiabilidad_actual', '--')}."]
+        if pm and pm.get("electrodos"):
+            partes.append(f"Para MEDIA: corregir {pm['electrodos']} electrodo(s).")
+        if pa and pa.get("electrodos"):
+            partes.append(f"Para ALTA: {pa['electrodos']}.")
+        if pm is None:
+            partes.append("Ni MEDIA ni ALTA se alcanzan solo con electrodos: limita el SNR.")
+        elif pa is None:
+            partes.append("ALTA no se alcanza solo con electrodos: limita el SNR.")
+        if not rec.get("electrodos_a_revisar"):
+            partes.append("No hay electrodos que revisar.")
+        self.lbl_insp_adq_resumen.config(text=" ".join(partes))
+
+        avisos = []
+        if rec.get("interferencia_red"):
+            avisos.append(rec["interferencia_red"]["texto"] + " Revisar tierra (GND), REF y fuentes eléctricas cercanas.")
+        if rec.get("patron_sistemico"):
+            avisos.append(rec["patron_sistemico"]["texto"])
+        if avisos:
+            self.lbl_insp_adq_patron.config(text="\n\n".join(avisos))
+            self.lbl_insp_adq_patron.pack(fill=tk.X, pady=(6, 0), before=self.frm_insp_adq_lista)
+
+        electrodos = rec.get("electrodos_a_revisar", [])
+        for e in electrodos[:8]:
+            fila = ttk.Frame(self.frm_insp_adq_lista, style="Sidebar.TFrame")
+            fila.pack(fill=tk.X, pady=1)
+            color = "#B42D2D" if e["nivel"] == "atipico" else "#9A6400"
+            tk.Label(fila, text=e["canal"], width=5, anchor="w", bg=FONDO_PANEL, fg=color,
+                     font=(self.fuente_ui, 9, "bold")).pack(side=tk.LEFT)
+            ttk.Label(fila, text=e["descripcion"], style="Sidebar.TLabel").pack(side=tk.LEFT)
+        restantes = len(electrodos) - 8
+        if restantes > 0:
+            ttk.Label(self.frm_insp_adq_lista, text=f"Y {restantes} más (ver informe PDF).",
+                      style="Subtle.TLabel").pack(anchor="w", pady=(2, 0))
+
     def _aplicar_chip_semaforo(self, chip, color_semaforo, texto):
         estilos = {
             "green": ("#1F7A4A", "#E5F4EC"),
@@ -2214,6 +2287,7 @@ class AppEEG:
                 lbl_valor.config(text=f"{float(valor):.2f}")
                 self._aplicar_chip_semaforo(chip, semaforo.get("color"), semaforo.get("estado", ""))
 
+        self._actualizar_adquisicion_inspector()
         self._dibujar_barra_bandas()
 
     def _dibujar_barra_bandas(self):

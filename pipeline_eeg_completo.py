@@ -1805,7 +1805,22 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, datos_fit=None, snr_crudo_d
             n_components=0.99, method='infomax',
             fit_params=dict(extended=True), rng=42, max_iter=500,
         )
-        ica.fit(raw_train, verbose=False)
+        try:
+            ica.fit(raw_train, verbose=False)
+        except RuntimeError as e:
+            # Un canal de amplitud extrema puede acaparar >99 % de la varianza
+            # y el umbral relativo deja 1 sola componente. Se reintenta con un
+            # numero fijo de componentes acotado por el rango de la señal.
+            if "PCA component" not in str(e):
+                raise
+            n_eeg = len(mne.pick_types(raw_train.info, eeg=True))
+            n_fijo = int(max(2, min(n_eeg - 1, 30)))
+            log(f"[MNE] Varianza dominada por un componente; reintentando ICA con {n_fijo} componentes.")
+            ica = ICA(
+                n_components=n_fijo, method='infomax',
+                fit_params=dict(extended=True), rng=42, max_iter=500,
+            )
+            ica.fit(raw_train, verbose=False)
 
     # 3. Poda multivariada inteligente con ICLabel
     if has_icalabel:
@@ -2719,12 +2734,18 @@ def guardar_ratios_welch_principales(
     return resumen
 
 
+# Frecuencias de red que se separan del ruido de banda ancha en el SNR crudo.
+REDES_ELECTRICAS_HZ = (50.0, 60.0)
+
+
 def calcular_snr_por_canal(datos, fs, banda_senal=(1, 30), banda_ruido=(40, 100)):
     """
     Calcula la relación señal/ruido estimada por canal usando Welch.
     """
     snr_lineal = []
     snr_db = []
+    frac_red = []
+    snr_sin_red_db = []
 
     for canal in range(datos.shape[0]):
         x = np.asarray(datos[canal], dtype=float)
@@ -2757,6 +2778,19 @@ def calcular_snr_por_canal(datos, fs, banda_senal=(1, 30), banda_ruido=(40, 100)
         snr_lineal.append(float(snr))
         snr_db.append(float(10 * np.log10(snr)))
 
+        # Red eléctrica (50/60 Hz +-2 Hz) dentro de la banda de ruido: el notch
+        # la elimina antes de los biomarcadores, pero es un problema corregible
+        # de la adquisición (tierra, impedancias desbalanceadas, entorno).
+        potencia_red = 0.0
+        for f_red in REDES_ELECTRICAS_HZ:
+            idx_red = idx_ruido & (np.abs(f - f_red) <= 2.0)
+            if np.any(idx_red):
+                potencia_red += float(_trapz(pxx[idx_red], f[idx_red]))
+        frac_red.append(min(max(potencia_red / potencia_ruido, 0.0), 1.0))
+        snr_sin_red_db.append(float(10 * np.log10(
+            potencia_senal / max(potencia_ruido - potencia_red, 1e-12)
+        )))
+
     snr_lineal = np.asarray(snr_lineal, dtype=float)
     snr_db = np.asarray(snr_db, dtype=float)
 
@@ -2768,6 +2802,8 @@ def calcular_snr_por_canal(datos, fs, banda_senal=(1, 30), banda_ruido=(40, 100)
         "snr_mediana_db": float(np.median(snr_db)),
         "snr_min_db": float(np.min(snr_db)),
         "snr_max_db": float(np.max(snr_db)),
+        "pct_ruido_red": float(np.median(frac_red) * 100.0) if frac_red else None,
+        "snr_sin_red_db": float(np.mean(snr_sin_red_db)) if snr_sin_red_db else None,
     }
 
     return resumen_snr, snr_db
@@ -2859,6 +2895,333 @@ def _calcular_confiabilidad_metrica(snr_db, porcentaje_atipicos, porcentaje_vari
         return "BAJA"
     else:
         return "NULA"
+
+
+# =========================
+# DIAGNOSTICO DE ADQUISICION (protocolo)
+# =========================
+# Cada causa del detector de canales atipicos se traduce a una accion
+# concreta para el tecnico. El orden de la tupla es (titulo, accion).
+ACCIONES_ADQUISICION = {
+    "ruido_hf": (
+        "Ruido de alta frecuencia",
+        "Contacto pobre o tensión muscular: reabrasionar la piel, renovar el gel y "
+        "bajar la impedancia del electrodo antes de grabar; pedir al paciente que "
+        "relaje mandíbula y frente.",
+    ),
+    "amplitud": (
+        "Amplitud excesiva o deriva",
+        "Electrodo suelto o gel seco: ajustar el gorro, reponer gel y fijar los "
+        "cables para que no tiren del electrodo.",
+    ),
+    "canal_bajo": (
+        "Canal plano o de muy baja amplitud",
+        "Puente de gel con un electrodo vecino o electrodo desconectado: limpiar el "
+        "exceso de gel entre electrodos y revisar el conector.",
+    ),
+    "alfa_dominante": (
+        "Alfa no fisiológica dominante",
+        "Señal acoplada a otra fuente (referencia o tierra con mala impedancia, "
+        "cable cruzado): revisar REF y GND antes de iniciar.",
+    ),
+    "espectro_anomalo": (
+        "Espectro distinto al resto de canales",
+        "Interferencia o contacto intermitente: revisar el cable, alejar fuentes "
+        "eléctricas y volver a medir la impedancia.",
+    ),
+    "interferencia_red": (
+        "Interferencia de la red eléctrica (60 Hz)",
+        "Conectar la tierra (GND) del paciente y la del amplificador al mismo punto, "
+        "igualar la impedancia de REF y GND con la de los demás electrodos, alejar "
+        "cargadores, monitores y lámparas, y no cruzar los cables de los electrodos "
+        "con los de alimentación.",
+    ),
+}
+
+# Si la red eléctrica es al menos este porcentaje del ruido 40-100 Hz del
+# registro (mediana entre canales), se recomienda corregirla. Mediana en los
+# 151 registros analizados: 44 %.
+UMBRAL_INTERFERENCIA_RED_PCT = 30.0
+
+# Si una misma causa afecta a esta fraccion de los canales, el problema es
+# del montaje completo (REF/GND, amplificador, entorno) y no de electrodos
+# individuales: se recomienda corregirlo antes que electrodo por electrodo.
+UMBRAL_PATRON_SISTEMICO = 0.20
+
+
+def _causa_principal_canal(razon, z):
+    """
+    Elige la causa dominante de un canal a partir de sus razones del detector
+    y de la magnitud de cada z-score. Devuelve una clave de ACCIONES_ADQUISICION.
+    """
+    candidatas = {}
+    texto = str(razon or "")
+    if "amplitud" in texto:
+        candidatas["amplitud"] = max(abs(z.get("z_std", 0.0)), abs(z.get("z_ptp", 0.0)))
+    if "canal_bajo" in texto:
+        candidatas["canal_bajo"] = max(abs(z.get("z_std", 0.0)), abs(z.get("z_ptp", 0.0))) + 1e-3
+    if "ruido_hf" in texto:
+        candidatas["ruido_hf"] = abs(z.get("z_hf", 0.0))
+    if "alfa_dominante" in texto:
+        candidatas["alfa_dominante"] = abs(z.get("z_alpha", 0.0))
+    if "espectro_anomalo" in texto:
+        candidatas["espectro_anomalo"] = abs(z.get("z_dist", 0.0)) * 0.9
+    if not candidatas:
+        return "espectro_anomalo"
+    return max(candidatas.items(), key=lambda kv: kv[1])[0]
+
+
+def detalle_atipicos_desde_reporte(ruta_reporte, n_canales):
+    """
+    Reconstruye (detalle, idx_fuertes, idx_sospechosos) desde el archivo
+    canales_atipicos/reporte_canales_atipicos.txt, para cachés procesadas antes
+    de que las recomendaciones se guardaran en resumen_calidad.json.
+    Los canales sospechosos no traen 'razon' en el reporte: se infiere de su
+    z-score dominante. Devuelve None si el reporte no existe o no se entiende.
+    """
+    if not ruta_reporte or not os.path.exists(ruta_reporte):
+        return None
+    try:
+        with open(ruta_reporte, "r", encoding="utf-8", errors="ignore") as f:
+            lineas = f.read().splitlines()
+    except Exception:
+        return None
+
+    n = int(n_canales)
+    detalle = {k: np.zeros(n, dtype=np.float64) for k in ("z_std", "z_ptp", "z_hf", "z_alpha", "z_dist", "score")}
+    razones = ["normal"] * n
+    idx_fuertes, idx_sosp = [], []
+    seccion = None
+    patron = re.compile(r"^Canal\s+(\d+)\s*\|(.*)$")
+    for linea in lineas:
+        texto = linea.strip()
+        if texto.startswith("Detalle por canal fuerte"):
+            seccion = "fuerte"
+            continue
+        if texto.startswith("Detalle por canal sospechoso"):
+            seccion = "sospechoso"
+            continue
+        m = patron.match(texto)
+        if not m or seccion is None:
+            continue
+        i = int(m.group(1)) - 1
+        if not (0 <= i < n):
+            continue
+        campos = {}
+        razon = ""
+        for parte in m.group(2).split("|"):
+            parte = parte.strip()
+            if parte.startswith("razon="):
+                razon = parte[len("razon="):]
+            elif "=" in parte:
+                k, v = parte.split("=", 1)
+                try:
+                    campos[k.strip()] = float(v)
+                except ValueError:
+                    pass
+            elif razon:
+                razon += " | " + parte  # razones encadenadas con " | "
+        for k in detalle:
+            if k in campos:
+                detalle[k][i] = campos[k]
+        if not razon:
+            dominante = max(("z_hf", "z_std", "z_ptp"), key=lambda k: abs(campos.get(k, 0.0)))
+            if dominante == "z_hf":
+                razon = "ruido_hf"
+            elif campos.get(dominante, 0.0) < 0:
+                razon = "canal_bajo"
+            else:
+                razon = "amplitud_alta"
+        razones[i] = razon
+        (idx_fuertes if seccion == "fuerte" else idx_sosp).append(i)
+
+    if not idx_fuertes and not idx_sosp:
+        # Reporte sin canales afectados: diagnóstico vacío pero válido.
+        pass
+    detalle["razones"] = np.array(razones, dtype=object)
+    return detalle, idx_fuertes, idx_sosp
+
+
+def recomendaciones_adquisicion_desde_cache(carpeta_archivo_cache, nombres_canales=None):
+    """
+    Devuelve las recomendaciones de adquisición de un registro: las guardadas
+    en resumen_calidad.json o, si la caché es anterior, reconstruidas desde el
+    reporte del detector con la misma lógica. None si faltan datos.
+    """
+    ruta_json = os.path.join(carpeta_archivo_cache, "calidad_senal", "resumen_calidad.json")
+    resumen = {}
+    if os.path.exists(ruta_json):
+        try:
+            with open(ruta_json, "r", encoding="utf-8") as f:
+                resumen = json.load(f)
+        except Exception:
+            resumen = {}
+    if isinstance(resumen.get("recomendaciones_adquisicion"), dict):
+        return resumen["recomendaciones_adquisicion"]
+
+    if nombres_canales is None:
+        nombres_canales = NOMBRES_CANALES_64
+    reconstruido = detalle_atipicos_desde_reporte(
+        os.path.join(carpeta_archivo_cache, "canales_atipicos", "reporte_canales_atipicos.txt"),
+        len(nombres_canales),
+    )
+    if reconstruido is None:
+        return None
+    detalle, idx_f, idx_s = reconstruido
+    snr = resumen.get("snr") if isinstance(resumen.get("snr"), dict) else {}
+    return diagnosticar_adquisicion(
+        detalle, nombres_canales, idx_f, idx_s, snr.get("snr_global_db"), None,
+        pct_ruido_red=snr.get("pct_ruido_red"), snr_sin_red_db=snr.get("snr_sin_red_db"),
+    )
+
+
+def diagnosticar_adquisicion(
+    detalle_atipicos,
+    nombres_canales,
+    idx_fuertes,
+    idx_sospechosos,
+    snr_db,
+    porcentaje_varianza_ica=None,
+    pct_ruido_red=None,
+    snr_sin_red_db=None,
+):
+    """
+    Traduce los canales atipicos de un registro a recomendaciones de protocolo.
+
+    - Causa principal y accion para cada electrodo a revisar (fuertes primero,
+      ordenados por severidad).
+    - Patron sistemico: si una causa afecta a >= UMBRAL_PATRON_SISTEMICO de los
+      canales, se sugiere revisar REF/GND/amplificador antes que electrodos.
+    - Cuantos electrodos habria que corregir para que la Confiabilidad suba a
+      MEDIA y a ALTA, usando la MISMA formula (_calcular_confiabilidad_metrica)
+      con el SNR del registro. Si el SNR limita, se indica.
+    - Interferencia de red: si la red es >= UMBRAL_INTERFERENCIA_RED_PCT del
+      ruido, se recomienda corregirla y se informa la Confiabilidad que se
+      obtendría sin ella (mismo cálculo con el SNR sin red).
+    """
+    nombres = [limpiar_nombre_canal(n) for n in nombres_canales]
+    n_total = len(nombres)
+    detalle = detalle_atipicos or {}
+    razones = list(detalle.get("razones", [])) if detalle.get("razones") is not None else []
+    scores = np.asarray(detalle.get("score", np.zeros(n_total)), dtype=np.float64)
+
+    def _z(i):
+        out = {}
+        for k in ("z_std", "z_ptp", "z_hf", "z_alpha", "z_dist"):
+            arr = detalle.get(k)
+            if arr is not None and i < len(arr):
+                try:
+                    out[k] = float(arr[i])
+                except (TypeError, ValueError):
+                    out[k] = 0.0
+        return out
+
+    def _ficha(i, nivel):
+        razon = razones[i] if i < len(razones) else ""
+        causa = _causa_principal_canal(razon, _z(i))
+        titulo, accion = ACCIONES_ADQUISICION[causa]
+        return {
+            "canal": nombres[i] if i < n_total else f"#{i + 1}",
+            "nivel": nivel,
+            "causa": causa,
+            "descripcion": titulo,
+            "accion": accion,
+            "score": round(float(scores[i]), 2) if i < len(scores) and np.isfinite(scores[i]) else None,
+        }
+
+    fuertes = sorted((int(i) for i in idx_fuertes), key=lambda i: -float(scores[i]) if i < len(scores) else 0.0)
+    sospechosos = sorted((int(i) for i in idx_sospechosos), key=lambda i: -float(scores[i]) if i < len(scores) else 0.0)
+    electrodos = [_ficha(i, "atipico") for i in fuertes] + [_ficha(i, "sospechoso") for i in sospechosos]
+
+    causas = {}
+    for e in electrodos:
+        causas[e["causa"]] = causas.get(e["causa"], 0) + 1
+
+    patron = None
+    if n_total and causas:
+        causa_top, n_top = max(causas.items(), key=lambda kv: kv[1])
+        if n_top / float(n_total) >= UMBRAL_PATRON_SISTEMICO:
+            patron = {
+                "causa": causa_top,
+                "canales": n_top,
+                "texto": (
+                    f"{n_top} de {n_total} canales comparten la misma causa "
+                    f"({ACCIONES_ADQUISICION[causa_top][0].lower()}). Es más probable "
+                    "un problema del montaje (referencia, tierra, amplificador o entorno) "
+                    "que de electrodos individuales: revisar REF/GND y fuentes de "
+                    "interferencia antes de volver a preparar uno por uno."
+                ),
+            }
+
+    n_fuertes = len(fuertes)
+    pct_actual = (n_fuertes / n_total * 100.0) if n_total else 0.0
+    confiabilidad_actual = _calcular_confiabilidad_metrica(snr_db, pct_actual, porcentaje_varianza_ica)
+
+    def _minimo_para(objetivo, snr=snr_db):
+        orden = {"NULA": 0, "BAJA": 1, "MEDIA": 2, "ALTA": 3}
+        nivel_base = _calcular_confiabilidad_metrica(snr, pct_actual, porcentaje_varianza_ica)
+        if orden.get(nivel_base, 0) >= orden[objetivo]:
+            return {"electrodos": 0, "canales": []}
+        for k in range(1, n_fuertes + 1):
+            pct = (n_fuertes - k) / n_total * 100.0 if n_total else 0.0
+            nivel = _calcular_confiabilidad_metrica(snr, pct, porcentaje_varianza_ica)
+            if orden.get(nivel, 0) >= orden[objetivo]:
+                return {"electrodos": k, "canales": [nombres[i] for i in fuertes[:k]]}
+        return None  # No alcanzable solo corrigiendo electrodos: limita el SNR.
+
+    interferencia = None
+    try:
+        pct_red = float(pct_ruido_red)
+        snr_sr = float(snr_sin_red_db)
+    except (TypeError, ValueError):
+        pct_red = snr_sr = None
+    if pct_red is not None and np.isfinite(pct_red) and np.isfinite(snr_sr) \
+            and pct_red >= UMBRAL_INTERFERENCIA_RED_PCT:
+        conf_sr = _calcular_confiabilidad_metrica(snr_sr, pct_actual, porcentaje_varianza_ica)
+        if snr_db is not None:
+            texto_red = (
+                f"La red eléctrica es el {pct_red:.0f} % del ruido de alta frecuencia. "
+                f"Sin ella el SNR pasaría de {float(snr_db):.1f} a {snr_sr:.1f} dB y la "
+                f"Confiabilidad, con los mismos electrodos, sería {conf_sr}."
+            )
+        else:
+            texto_red = f"La red eléctrica es el {pct_red:.0f} % del ruido de alta frecuencia."
+        interferencia = {
+            "pct_ruido": round(pct_red, 1),
+            "snr_db": round(float(snr_db), 1) if snr_db is not None else None,
+            "snr_sin_red_db": round(snr_sr, 1),
+            "confiabilidad_sin_red": conf_sr,
+            "para_media_sin_red": _minimo_para("MEDIA", snr_sr),
+            "para_alta_sin_red": _minimo_para("ALTA", snr_sr),
+            "texto": texto_red,
+        }
+
+    acciones = []
+    if interferencia is not None:
+        acciones.append(ACCIONES_ADQUISICION["interferencia_red"][1])
+    if patron is not None:
+        acciones.append(patron["texto"])
+    for causa, _n in sorted(causas.items(), key=lambda kv: -kv[1]):
+        accion = ACCIONES_ADQUISICION[causa][1]
+        if accion not in acciones:
+            acciones.append(accion)
+
+    return {
+        "confiabilidad_actual": confiabilidad_actual,
+        "electrodos_a_revisar": electrodos,
+        "causas": causas,
+        "patron_sistemico": patron,
+        "para_media": _minimo_para("MEDIA"),
+        "para_alta": _minimo_para("ALTA"),
+        "acciones_protocolo": acciones,
+        "interferencia_red": interferencia,
+        "pct_ruido_red": round(pct_red, 1) if pct_red is not None and np.isfinite(pct_red) else None,
+        "nota": (
+            "Recomendaciones técnicas de adquisición derivadas del detector de canales "
+            "atípicos. No modifican el análisis de este registro: aplican a la próxima "
+            "toma o a la nueva preparación antes de grabar."
+        ),
+    }
 
 
 def clasificar_calidad_global(
@@ -3107,7 +3470,10 @@ def calcular_resumen_calidad_senal(
     canales_sospechosos,
     carpeta_cache,
     porcentaje_varianza_ica=None,
-    logger=None
+    logger=None,
+    detalle_atipicos=None,
+    idx_fuertes=None,
+    idx_sospechosos=None,
 ):
     """
     Calcula y guarda el resumen de calidad técnica de la señal.
@@ -3235,6 +3601,23 @@ def calcular_resumen_calidad_senal(
             "potencia_ruido": "P_ruido = potencia integrada en 40-100 Hz"
         }
     }
+
+    # Recomendaciones de protocolo de adquisición (qué electrodos revisar,
+    # por qué y cuántos corregir para subir la Confiabilidad).
+    if detalle_atipicos is not None and idx_fuertes is not None:
+        try:
+            resumen["recomendaciones_adquisicion"] = diagnosticar_adquisicion(
+                detalle_atipicos,
+                nombres_canales,
+                idx_fuertes,
+                idx_sospechosos if idx_sospechosos is not None else [],
+                snr_global_db,
+                porcentaje_varianza_ica,
+                pct_ruido_red=resumen_snr.get("pct_ruido_red"),
+                snr_sin_red_db=resumen_snr.get("snr_sin_red_db"),
+            )
+        except Exception as e:
+            log(f"[Aviso] No se pudieron generar recomendaciones de adquisicion: {e}")
 
     ruta_json = os.path.join(carpeta_calidad, "resumen_calidad.json")
     ruta_snr = os.path.join(carpeta_calidad, "snr_por_canal.npy")
@@ -4861,6 +5244,50 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     else:
         pdf.add_wrapped_text(str(info_calidad), font_size=10.2)
 
+    # Recomendaciones de protocolo: qué electrodos revisar en la próxima toma.
+    recomendaciones = None
+    try:
+        recomendaciones = recomendaciones_adquisicion_desde_cache(carpeta_archivo_cache, nombres_canales)
+    except Exception as e:
+        log(f"[Aviso] Sin recomendaciones de adquisicion: {e}")
+    if isinstance(recomendaciones, dict) and (
+        recomendaciones.get("electrodos_a_revisar") or recomendaciones.get("interferencia_red")
+    ):
+        pdf.add_block_title("Recomendaciones de adquisición")
+        pm, pa = recomendaciones.get("para_media"), recomendaciones.get("para_alta")
+        partes = [f"Confiabilidad actual de los biomarcadores: {recomendaciones.get('confiabilidad_actual', 'N/D')}."]
+        if pm and pm.get("electrodos"):
+            partes.append(
+                f"Para llegar a MEDIA habría que corregir {pm['electrodos']} electrodo(s): "
+                f"{', '.join(pm['canales'])}."
+            )
+        if pa and pa.get("electrodos"):
+            partes.append(f"Para llegar a ALTA, {pa['electrodos']} electrodo(s).")
+        if pm is None:
+            partes.append("Ni MEDIA ni ALTA se alcanzan solo corrigiendo electrodos: el SNR crudo del registro lo limita.")
+        elif pa is None:
+            partes.append("ALTA no se alcanza solo corrigiendo electrodos: el SNR crudo del registro lo limita.")
+        if recomendaciones.get("interferencia_red"):
+            partes.append(recomendaciones["interferencia_red"]["texto"])
+        pdf.add_wrapped_text(" ".join(partes), font_size=10.2)
+        filas_rec = [
+            [e["canal"], "Atípico" if e["nivel"] == "atipico" else "Sospechoso", e["descripcion"]]
+            for e in recomendaciones["electrodos_a_revisar"][:12]
+        ]
+        if filas_rec:
+            pdf.add_visual_table(
+                headers=["Electrodo", "Nivel", "Problema detectado"],
+                rows=filas_rec,
+                col_widths=[26, 28, 92],
+                alignments=["C", "C", "L"],
+            )
+        acciones = recomendaciones.get("acciones_protocolo") or []
+        if acciones:
+            pdf.add_wrapped_text(
+                "Acciones para la próxima adquisición: " + " ".join(f"({i}) {a}" for i, a in enumerate(acciones, 1)),
+                font_size=9.8,
+            )
+
     pdf.add_section_title("Potencia relativa por bandas")
     descripcion_condicion = CONDICION_REGISTRO_DESCRIPCION.get(
         CONDICION_REGISTRO, CONDICION_REGISTRO
@@ -5765,7 +6192,10 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         canales_sospechosos=canales_sospechosos_nombres,
         carpeta_cache=rutas["archivo"],
         porcentaje_varianza_ica=porcentaje_varianza_ica,
-        logger=logger
+        logger=logger,
+        detalle_atipicos=detalle_malos,
+        idx_fuertes=idx_fuertes,
+        idx_sospechosos=idx_sospechosos,
     )
     log("[OK] Calidad tecnica de senal calculada.")
 
