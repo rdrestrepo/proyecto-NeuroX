@@ -91,6 +91,22 @@ def recolectar_datos_archivo(nombre_archivo, carpeta_cache):
     ratios = resumen_ratios.get("promedios_globales", {}) or {}
     semaforos = resumen_ratios.get("semaforos", {}) or {}
     snr_info = resumen_calidad.get("snr") or {}
+    # % de varianza removida por ICA (solo para el respaldo de confiabilidad
+    # en cachés antiguas; el valor canónico vive en resumen_calidad.json).
+    ica_info = _leer_json_si_existe(
+        os.path.join(carpeta_cache, "ica", "calidad_ica.json")
+    ) or {}
+    pct_varianza_ica = ica_info.get("porcentaje_varianza_removida")
+
+    # Confiabilidad: se lee el valor único calculado por el pipeline para que
+    # PDF y Excel coincidan siempre. El respaldo reproduce idéntica lógica.
+    confiabilidad = resumen_calidad.get("confiabilidad_biomarcadores")
+    if not confiabilidad:
+        confiabilidad = _calcular_confiabilidad_excel(
+            snr_info.get("snr_global_db"),
+            resumen_calidad.get("porcentaje_atipicos"),
+            pct_varianza_ica,
+        )
 
     duracion_s = meta.get("duracion_s")
     fs_val = meta.get("fs")
@@ -125,39 +141,66 @@ def recolectar_datos_archivo(nombre_archivo, carpeta_cache):
         "sospechosos": resumen_calidad.get("porcentaje_sospechosos"),
         "indice_tecnico": resumen_calidad.get("porcentaje_ponderado"),
         "snr": snr_info.get("snr_global_db"),
-        "confiabilidad": _calcular_confiabilidad_excel(snr_info.get("snr_global_db"), resumen_calidad.get("porcentaje_atipicos")),
+        "confiabilidad": confiabilidad,
         "observaciones": "",
         "potencia_regional": resumen_welch.get("promedios_regionales", {}) or {},
     }
     return fila
 
 
-def _calcular_confiabilidad_excel(snr_db, porcentaje_atipicos):
+def _calcular_confiabilidad_excel(snr_db, porcentaje_atipicos, porcentaje_varianza_ica=None):
     """
-    Calcula confiabilidad de biomarcadores para el consolidado Excel.
+    Respaldo de confiabilidad para cachés procesadas antes de que el pipeline
+    persistiera "confiabilidad_biomarcadores". DEBE mantenerse idéntica a
+    _calcular_confiabilidad_metrica en pipeline_eeg_completo.py.
+
+    snr_db = SNR crudo (1-30 vs 40-100 Hz).
+    La varianza ICA solo penaliza si es 0 con SNR bajo.
     Returns: 'ALTA' | 'MEDIA' | 'BAJA' | 'NULA'
     """
     score = 0
 
+    snr_val = None
     if snr_db is not None:
-        if snr_db >= 15:
+        try:
+            snr_val = float(snr_db)
+        except (TypeError, ValueError):
+            snr_val = None
+
+    if snr_val is not None:
+        if snr_val >= 15:
             score += 3
-        elif snr_db >= 10:
+        elif snr_val >= 10:
             score += 2
-        elif snr_db >= 5:
+        elif snr_val >= 5:
             score += 1
-        elif snr_db < 3:
+        elif snr_val < 3:
             score -= 3
 
+    pct_atip = None
     if porcentaje_atipicos is not None:
-        if porcentaje_atipicos <= 3:
+        try:
+            pct_atip = float(porcentaje_atipicos)
+        except (TypeError, ValueError):
+            pct_atip = None
+
+    if pct_atip is not None:
+        if pct_atip <= 3:
             score += 3
-        elif porcentaje_atipicos <= 8:
+        elif pct_atip <= 8:
             score += 2
-        elif porcentaje_atipicos <= 15:
+        elif pct_atip <= 15:
             score += 1
-        elif porcentaje_atipicos > 20:
+        elif pct_atip > 20:
             score -= 3
+
+    if porcentaje_varianza_ica is not None and snr_val is not None:
+        try:
+            pct_ica = float(porcentaje_varianza_ica)
+        except (TypeError, ValueError):
+            pct_ica = None
+        if pct_ica is not None and pct_ica <= 0.0 and snr_val < 5.0:
+            score -= 2
 
     if score >= 5:
         return "ALTA"
@@ -311,7 +354,11 @@ def generar_consolidado_excel(archivos_seleccionados, ruta_salida, logger=None):
         "Resumen global por archivo", "Potencia regional", "Estado de calidad",
         "Potencia regional bandas", "Biomarcadores", "Calidad Señal", "Banda dominante",
     ]
-    wb._sheets = [wb[nombre] for nombre in orden]
+    # Conservar al final las hojas ocultas "Detalle1/2/3": antes se creaban y
+    # luego se descartaban al reasignar wb._sheets, dejando las Tablas 5/6/7
+    # inaccesibles. Se mantienen ocultas, fuera del orden visible.
+    detalles = [nombre for nombre in wb.sheetnames if nombre not in orden]
+    wb._sheets = [wb[nombre] for nombre in orden + detalles]
     wb.active = wb.sheetnames.index("Resumen global por archivo")
 
     os.makedirs(os.path.dirname(os.path.abspath(ruta_salida)) or ".", exist_ok=True)
@@ -325,8 +372,9 @@ def _hoja_resumen(wb, filas):
 
     ws["E1"] = "POTENCIA RELATIVA"
     ws["J1"] = "PROPORCION ENTRE BANDAS (BIOMARCADORES)"
-    ws["R1"] = "CALIDAD DE LA SEÑAL"
-    for c in ("E1", "J1", "R1"):
+    ws["R1"] = "PAF Y GRADIENTE AP"
+    ws["X1"] = "CALIDAD DE LA SEÑAL"
+    for c in ("E1", "J1", "R1", "X1"):
         ws[c].font = Font(bold=True, color=BLANCO)
         ws[c].fill = PatternFill("solid", fgColor=NARANJA_NEUROX)
 
@@ -371,8 +419,8 @@ def _hoja_resumen(wb, filas):
                 celda.fill = PatternFill("solid", fgColor="F8CDCD")
                 celda.font = Font(color="A01E1E")
 
-        # Formato condicional para Confiabilidad (columna Y, índice 25)
-        celda_conf = ws[f"Y{r}"]
+        # Formato condicional para Confiabilidad (columna AB, índice 28)
+        celda_conf = ws[f"AB{r}"]
         if celda_conf.value == "ALTA":
             celda_conf.fill = PatternFill("solid", fgColor="D3F0D8")
             celda_conf.font = Font(color="1E6E32", bold=True)
@@ -387,7 +435,7 @@ def _hoja_resumen(wb, filas):
             celda_conf.font = Font(color="A01E1E", bold=True)
 
     fila_final = fila_inicial + len(filas) - 1
-    ref = f"A2:AB{fila_final}"
+    ref = f"A2:AC{fila_final}"
     tabla = Table(displayName="Tabla1", ref=ref)
     tabla.tableStyleInfo = _tabla_estilo()
     ws.add_table(tabla)
@@ -397,7 +445,7 @@ def _hoja_resumen(wb, filas):
         "A": 18, "B": 14, "C": 12, "D": 10, "E": 10, "F": 10, "G": 10, "H": 10,
         "I": 14, "J": 10, "K": 10, "L": 10, "M": 12, "N": 10, "O": 10, "P": 10,
         "Q": 10, "R": 12, "S": 14, "T": 14, "U": 14, "V": 14, "W": 14, "X": 10,
-        "Y": 12, "Z": 14, "AA": 10, "AB": 20,
+        "Y": 12, "Z": 14, "AA": 10, "AB": 20, "AC": 24,
     })
     return ws
 
@@ -457,7 +505,7 @@ def _hojas_detalle(wb, filas):
 
         fila_final = max(r - 1, 3)
         if fila_final >= 4:
-            tabla = Table(displayName=tablas[i], ref=f"A3:AB{fila_final}")
+            tabla = Table(displayName=tablas[i], ref=f"A3:AC{fila_final}")
             tabla.tableStyleInfo = _tabla_estilo()
             ws.add_table(tabla)
 
@@ -466,7 +514,7 @@ def _hojas_detalle(wb, filas):
             "A": 18, "B": 14, "C": 12, "D": 10, "E": 10, "F": 10, "G": 10, "H": 10,
             "I": 14, "J": 10, "K": 10, "L": 10, "M": 12, "N": 10, "O": 10, "P": 10,
             "Q": 10, "R": 12, "S": 14, "T": 14, "U": 14, "V": 14, "W": 14, "X": 10,
-            "Y": 12, "Z": 14, "AA": 10, "AB": 20,
+            "Y": 12, "Z": 14, "AA": 10, "AB": 20, "AC": 24,
         })
 
 

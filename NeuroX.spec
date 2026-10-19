@@ -1,5 +1,7 @@
 import os
 
+from PyInstaller.utils.hooks import collect_data_files
+
 block_cipher = None 
 
 excludes_list = [
@@ -27,24 +29,37 @@ excludes_list = [
     'pytest',
 ]
 
+# ---- Datos empaquetados -------------------------------------------------
+# 'assets' completo: el informe PDF y la interfaz buscan logos .png y la
+# animacion de carga, no solo el .ico. Antes solo se copiaba el icono y el
+# ejecutable arrancaba sin logo.
+datas = [
+    ('assets', 'assets'),
+]
+
+# mne-icalabel incluye la red neuronal ICLabelNet.onnx (y megnet.onnx). Sin
+# esos archivos ICLabel falla al clasificar componentes en el .exe.
+datas += collect_data_files('mne_icalabel')
+
+# MNE necesita sus montajes 10-10/10-20 en runtime para set_montage().
+datas += collect_data_files('mne', includes=['channels/data/**'])
+
 a = Analysis(
     ['Interfaz_neuroX.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('assets/logo_neurox.ico', 'assets'), 
-    ],
+    datas=datas,
     hiddenimports=[
         'scipy.signal',
         'scipy.ndimage',
         'scipy.interpolate',
-        'scipy.integrate',  
-        'sklearn.decomposition',
+        'scipy.integrate',
         'pywt',
         'fpdf',
         'PIL',
         'mne',
         'mne_icalabel',
+        'onnxruntime',
         'openpyxl',
         'pypdf',
     ],

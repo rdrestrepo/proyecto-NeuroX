@@ -528,7 +528,6 @@ def construir_rutas_trabajo(nombre_archivo, carpeta_base):
         "filtrado": os.path.join(carpeta_archivo, "filtrado"),
         "ica": os.path.join(carpeta_archivo, "ica"),
         "bandas": os.path.join(carpeta_archivo, "bandas"),
-        "bandas_filtrado": os.path.join(carpeta_archivo, "bandas_filtrado"),
         "canales_atipicos": os.path.join(carpeta_archivo, "canales_atipicos"),
         "wavelet": os.path.join(carpeta_archivo, "wavelet"),
         "analisis_welch": os.path.join(carpeta_archivo, "analisis_welch"),
@@ -1667,7 +1666,7 @@ def _calcular_snr_crudo_rapido(datos, fs_real):
     return float(snr_db)
 
 
-def aplicar_ica_mne(datos, fs_real, nombres_canales, datos_fit=None, logger=None):
+def aplicar_ica_mne(datos, fs_real, nombres_canales, datos_fit=None, snr_crudo_db=None, logger=None):
     """
     Aplica ICA utilizando la libreria MNE y mne-icalabel.
     Cumple con los requisitos estrictos de ICLabel (Filtro 1-100Hz, CAR, Infomax).
@@ -1708,7 +1707,11 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, datos_fit=None, logger=None
     # midiera sobre 'datos' (ya recortada a 40 Hz) la banda de ruido estaria
     # vacia y el SNR saldria artificialmente alto, desactivando el modo
     # adaptativo de ICA de forma permanente.
-    snr_crudo_db = _calcular_snr_crudo_rapido(datos_fit, fs_real)
+    # Si procesar_archivo ya lo midió ANTES de aplicar el CAR robusto, se usa
+    # ese valor: así el umbral adaptativo sigue midiendo la calidad de
+    # adquisición del registro y no cambia por la nueva referencia espacial.
+    if snr_crudo_db is None:
+        snr_crudo_db = _calcular_snr_crudo_rapido(datos_fit, fs_real)
     log(f"[MNE] SNR crudo estimado (banda ancha): {snr_crudo_db:.1f} dB")
 
     # Umbral adaptativo: señales buenas usan estándar, señales malas usan agresivo
@@ -1766,10 +1769,15 @@ def aplicar_ica_mne(datos, fs_real, nombres_canales, datos_fit=None, logger=None
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             raw_fit_base.set_montage(montage, on_missing='ignore')
-    raw_fit = raw_fit_base.filter(l_freq=ICAFIT_LOWCUT, h_freq=alta_fit, fir_design='firwin', verbose=False)
-
-    # ICLabel requiere que la señal tenga CAR. Se aplica SOLO a esta copia de entrenamiento 
-    raw_fit.set_eeg_reference('average', projection=False, verbose=False)
+    # M-01: la copia de entrenamiento YA llega filtrada 1-100 Hz (filtrar_banda
+    # en procesar_archivo) y YA llega con el CAR robusto aplicado. Volver a
+    # filtrarla (IIR + FIR en cascada) duplicaba la atenuación en la transición
+    # 1-2 Hz; volver a referenciarla a la media de los 60 canales desalineaba
+    # el subespacio espacial respecto a datos_fn (que excluye sospechosos del
+    # CAR). ICLabel solo emite un aviso informativo si los metadatos
+    # highpass/lowpass/custom_ref no coinciden; la señal que recibe la red ya
+    # cumple los requisitos reales (1-100 Hz + CAR).
+    raw_fit = raw_fit_base
 
     # 1b. Mascara de epocas contaminadas: se calcula sobre la copia de banda
     # ancha y se usa UNICAMENTE para entrenar ICA, de modo que pops/saltos no
@@ -2007,8 +2015,15 @@ def _region_de_canal(nombre_simple: str) -> str:
     if e.startswith("CANAL"):
         return "Otro"
 
+    # Periféricos NO corticales. Deben resolverse ANTES de los prefijos: si no,
+    # "CB1"/"CB2" caen en la regla startswith("C") y terminan clasificados como
+    # "Central", y antes de este cambio caían en "Occipital" por startswith("CB").
+    # ICA los trata como 'misc' (no los limpia), así que nunca deben entrar en
+    # promedios regionales corticales.
     if e in ("M1", "M2", "A1", "A2"):
         return "Mastoides"
+    if e in ("CB1", "CB2"):
+        return "Referencia/Periféricos"
 
     # Canales en Z bien ubicados
     if e in ("FPZ", "AFZ", "FZ"):
@@ -2025,7 +2040,7 @@ def _region_de_canal(nombre_simple: str) -> str:
     if e.startswith("F") and not e.startswith(("FC", "FT", "FP")):
         return "Frontal"
 
-    if e.startswith(("O", "PO", "CB")):
+    if e.startswith(("O", "PO")):
         return "Occipital"
 
     if e.startswith(("P", "CP")):
@@ -2056,6 +2071,10 @@ def energia_relativa_por_region(pct_por_canal: dict, nombres_canales: list, band
 
     promedios_region = {}
     for reg, idxs in regiones.items():
+        # Las regiones no corticales no se reportan en tablas clínicas: son
+        # canales de referencia/periféricos que ICA no limpia.
+        if reg in ("Mastoides", "Otro", "Referencia/Periféricos"):
+            continue
         promedios_region[reg] = {}
         for b in bandas_def.keys():
             v = np.asarray(pct_por_canal[b], dtype=np.float64)
@@ -2519,10 +2538,14 @@ def guardar_potencia_relativa_welch(
         _np_save_seguro(os.path.join(carpeta_salida, "paf_alfa_hz.npy"), paf_hz)
         _np_save_seguro(os.path.join(carpeta_salida, "paf_alfa_valido.npy"), paf_valido)
 
-        idx_excluir_set = set(int(i) for i in idx_excluir)
+        # Mismos canales corticales que los promedios globales: los periféricos
+        # (M1/M2/CB1/CB2) no deben aportar al PAF global.
+        idx_corticales = set(indices_canales_corticales(
+            len(paf_hz), nombres_canales, idx_excluir
+        ))
         idx_validos_paf = [
             i for i in range(len(paf_hz))
-            if paf_valido[i] and i not in idx_excluir_set and np.isfinite(paf_hz[i])
+            if paf_valido[i] and i in idx_corticales and np.isfinite(paf_hz[i])
         ]
         if idx_validos_paf:
             paf_global = float(np.mean(paf_hz[idx_validos_paf]))
@@ -2761,42 +2784,71 @@ def interpretar_snr(snr_db):
         return "Ruido dominante. La muestra puede no ser técnicamente confiable para interpretación."
 
 
-def _calcular_confiabilidad_metrica(snr_final_db, porcentaje_atipicos, porcentaje_varianza_ica):
+def _calcular_confiabilidad_metrica(snr_db, porcentaje_atipicos, porcentaje_varianza_ica=None):
     """
-    Calcula nivel de confiabilidad de biomarcadores basado en métricas objetivas.
+    Calcula el nivel de confiabilidad de los biomarcadores.
+
+    FUENTE ÚNICA DE VERDAD: el pipeline la evalúa una sola vez al procesar el
+    registro y guarda el resultado en resumen_calidad.json
+    ("confiabilidad_biomarcadores"). El PDF individual y el consolidado Excel
+    deben LEER ese valor; esta función solo se usa como respaldo para cachés
+    antiguas sin la clave.
+
+    Entradas (idénticas para todas las salidas):
+    - snr_db: SNR CRUDO (1-30 vs 40-100 Hz) de resumen_calidad.json. Mide la
+      calidad de ADQUISICIÓN. No se usa el SNR post-limpieza (30-40 Hz) porque
+      su margen de ruido es demasiado estrecho para comparar registros.
+    - porcentaje_atipicos: % de canales fuertes (0-100).
+    - porcentaje_varianza_ica: % de varianza removida por ICA (0-100).
+
+    La varianza ICA NO se premia: un sujeto quieto sin parpadeos tiene
+    legítimamente una varianza removida baja. Solo se penaliza el caso
+    patológico de que ICA no haya removido NADA con un SNR además bajo.
+
     Returns: 'ALTA' | 'MEDIA' | 'BAJA' | 'NULA'
     """
     score = 0
 
-    # SNR post-limpieza (ponderación: alta)
-    if snr_final_db is not None:
-        if snr_final_db >= 15:
+    snr_val = None
+    if snr_db is not None:
+        try:
+            snr_val = float(snr_db)
+        except (TypeError, ValueError):
+            snr_val = None
+
+    if snr_val is not None:
+        if snr_val >= 15:
             score += 3
-        elif snr_final_db >= 10:
+        elif snr_val >= 10:
             score += 2
-        elif snr_final_db >= 5:
+        elif snr_val >= 5:
             score += 1
-        elif snr_final_db < 3:
+        elif snr_val < 3:
             score -= 3
 
-    # Canales atípicos (ponderación: alta)
+    pct_atip = None
     if porcentaje_atipicos is not None:
-        if porcentaje_atipicos <= 3:
+        try:
+            pct_atip = float(porcentaje_atipicos)
+        except (TypeError, ValueError):
+            pct_atip = None
+
+    if pct_atip is not None:
+        if pct_atip <= 3:
             score += 3
-        elif porcentaje_atipicos <= 8:
+        elif pct_atip <= 8:
             score += 2
-        elif porcentaje_atipicos <= 15:
+        elif pct_atip <= 15:
             score += 1
-        elif porcentaje_atipicos > 20:
+        elif pct_atip > 20:
             score -= 3
 
-    # ICA effectiveness (ponderación: media)
-    if porcentaje_varianza_ica is not None:
-        if porcentaje_varianza_ica >= 15:
-            score += 2
-        elif porcentaje_varianza_ica >= 5:
-            score += 1
-        elif porcentaje_varianza_ica == 0:
+    if porcentaje_varianza_ica is not None and snr_val is not None:
+        try:
+            pct_ica = float(porcentaje_varianza_ica)
+        except (TypeError, ValueError):
+            pct_ica = None
+        if pct_ica is not None and pct_ica <= 0.0 and snr_val < 5.0:
             score -= 2
 
     if score >= 5:
@@ -3054,6 +3106,7 @@ def calcular_resumen_calidad_senal(
     canales_atipicos,
     canales_sospechosos,
     carpeta_cache,
+    porcentaje_varianza_ica=None,
     logger=None
 ):
     """
@@ -3144,6 +3197,14 @@ def calcular_resumen_calidad_senal(
         "canales_atipicos": canales_atipicos,
         "canales_sospechosos": canales_sospechosos,
         "estado_global": estado_global,
+        # Confiabilidad de biomarcadores: se calcula UNA sola vez aquí y la
+        # consumen tanto el PDF individual como el consolidado Excel, para que
+        # no puedan divergir. Insumos: SNR crudo + % atípicos + % varianza ICA.
+        "confiabilidad_biomarcadores": _calcular_confiabilidad_metrica(
+            snr_global_db,
+            porcentaje_atipicos,
+            porcentaje_varianza_ica
+        ),
         "snr": resumen_snr,
         "snr_fuente": "señal cruda original antes de filtros, notch, atenuaciones, ICA o Wavelet",
         "interpretacion_snr": interpretacion_snr,
@@ -3572,7 +3633,8 @@ def _valores_canales_para_topomap(valores, nombres_canales):
     }
 
 
-def crear_espectrograma_promedio_informe(datos, fs_real, ruta_salida, bandas_def=None):
+def crear_espectrograma_promedio_informe(datos, fs_real, ruta_salida, bandas_def=None,
+                                         nombres_canales=None):
     """
     Genera un espectrograma promedio (tiempo x frecuencia, dB) para el
     informe PDF. Antes, calcular_espectrograma_resumen() ya calculaba toda
@@ -3626,7 +3688,25 @@ def crear_espectrograma_promedio_informe(datos, fs_real, ruta_salida, bandas_def
         return False
 
     sxx_db = 10.0 * np.log10(sxx[:, mask_f, :] + 1e-12)
-    promedio_db = np.nanmean(sxx_db, axis=0)  # promedio entre canales -> (n_frecuencias, n_tiempos)
+    # M-02: promediar solo canales corticales. M1/M2/CB1/CB2 no pasan por ICA
+    # (tipo 'misc'), así que su ruido muscular/contacto aparecía como manchas
+    # de alta potencia en el espectrograma global aunque las tablas numéricas
+    # del mismo informe ya los excluían.
+    idx_corticales = indices_canales_corticales(n_canales, nombres_canales)
+    # Suma acumulativa por canal para no duplicar en RAM el cubo completo
+    # (en registros largos sxx_db ya ocupa cientos de MB).
+    suma_db = np.zeros(sxx_db.shape[1:], dtype=np.float64)
+    conteo = np.zeros(sxx_db.shape[1:], dtype=np.int32)
+    for c in idx_corticales:
+        capa = sxx_db[c]
+        valida = np.isfinite(capa)
+        suma_db += np.where(valida, capa, 0.0)
+        conteo += valida
+    promedio_db = np.divide(
+        suma_db, conteo,
+        out=np.full(suma_db.shape, np.nan, dtype=np.float64),
+        where=conteo > 0,
+    )
 
     fig, ax = plt.subplots(figsize=(9.6, 4.2), dpi=190)
     try:
@@ -4537,83 +4617,29 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     if duracion_s is None:
         duracion_s = 0.0
 
-    datos_ica = None
-    datos_wavelet = None
-    datos_fil = None
-    bandas_filtradas = {}
-    bandas_filtradas_fil = {}
+    # Solo se LEEN los dos JSON auxiliares que el informe necesita. Este
+    # método no debe recalcular ni reescribir caché: la señal ya procesada es
+    # inmutable y abrir matrices con mmap aquí era la causa raíz de los bloqueos
+    # de archivos en Windows.
     porcentaje_varianza_ica = None
     snr_final_db = None
-    try:
-        ruta_ica = os.path.join(carpeta_archivo_cache, "ica", "eeg_ica.npy")
-        ruta_wavelet = os.path.join(carpeta_archivo_cache, "wavelet", "eeg_wavelet.npy")
-        carpeta_bandas = os.path.join(carpeta_archivo_cache, "bandas")
-        ruta_fil = os.path.join(carpeta_archivo_cache, "filtrado", "eeg_filtrado.npy")
-        carpeta_bandas_fil = os.path.join(carpeta_archivo_cache, "bandas_filtrado")
+    ruta_calidad_ica = os.path.join(carpeta_archivo_cache, "ica", "calidad_ica.json")
+    if os.path.exists(ruta_calidad_ica):
+        try:
+            with open(ruta_calidad_ica, "r", encoding="utf-8") as f:
+                porcentaje_varianza_ica = json.load(f).get("porcentaje_varianza_removida")
+        except Exception:
+            porcentaje_varianza_ica = None
 
-        # Porcentaje de varianza atribuida a componentes de artefacto
-        # removidos por ICA (ver aplicar_ica_mne). None si el archivo se
-        # proceso con una version anterior a este cambio, o si no se pudo
-        # calcular.
-        porcentaje_varianza_ica = None
-        ruta_calidad_ica = os.path.join(carpeta_archivo_cache, "ica", "calidad_ica.json")
-        if os.path.exists(ruta_calidad_ica):
-            try:
-                with open(ruta_calidad_ica, "r", encoding="utf-8") as f:
-                    porcentaje_varianza_ica = json.load(f).get("porcentaje_varianza_removida")
-            except Exception:
-                porcentaje_varianza_ica = None
-
-        # SNR post-limpieza (1-30 vs 30-40 Hz, sobre la señal final). None
-        # si el archivo se proceso con una version anterior a este cambio.
-        snr_final_db = None
-        ruta_snr_final = os.path.join(carpeta_archivo_cache, "calidad_senal", "snr_final.json")
-        if os.path.exists(ruta_snr_final):
-            try:
-                with open(ruta_snr_final, "r", encoding="utf-8") as f:
-                    snr_final_db = json.load(f).get("snr_final_db")
-            except Exception:
-                snr_final_db = None
-
-        if (
-            os.path.exists(ruta_ica)
-            and os.path.exists(ruta_wavelet)
-            and os.path.exists(ruta_fil)
-            and os.path.isdir(carpeta_bandas)
-            and os.path.isdir(carpeta_bandas_fil)
-        ):
-            datos_ica = np.load(ruta_ica, mmap_mode="r")
-            datos_wavelet = np.load(ruta_wavelet, mmap_mode="r")
-            datos_fil = np.load(ruta_fil, mmap_mode="r")
-
-            for banda in bandas.keys():
-                ruta_b = os.path.join(carpeta_bandas, f"{banda}.npy")
-                ruta_bf = os.path.join(carpeta_bandas_fil, f"{banda}.npy")
-                if not os.path.exists(ruta_b) or not os.path.exists(ruta_bf):
-                    raise FileNotFoundError(f"Falta banda para actualizar caches de energía relativa: {banda}")
-                bandas_filtradas[banda] = np.load(ruta_b, mmap_mode="r")
-                bandas_filtradas_fil[banda] = np.load(ruta_bf, mmap_mode="r")
-
-            pct_fil, _prom_fil = energia_relativa_por_canal(
-                datos_fil, bandas_filtradas_fil, fs_meta, bandas, logger=logger
-            )
-            pct_final, _prom_final = energia_relativa_por_canal(
-                datos_wavelet, bandas_filtradas, fs_meta, bandas, logger=logger
-            )
-
-            carpeta_er_fil = os.path.join(carpeta_archivo_cache, "energia_relativa_filtrado")
-            carpeta_er_ica = os.path.join(carpeta_archivo_cache, "energia_relativa_ica")
-            carpeta_energia = os.path.join(carpeta_archivo_cache, "energia_relativa")
-            os.makedirs(carpeta_er_fil, exist_ok=True)
-            os.makedirs(carpeta_er_ica, exist_ok=True)
-            os.makedirs(carpeta_energia, exist_ok=True)
-
-            for banda in bandas.keys():
-                _np_save_seguro(os.path.join(carpeta_er_fil, f"{banda}.npy"), pct_fil[banda].astype(np.float32, copy=False))
-                _np_save_seguro(os.path.join(carpeta_er_ica, f"{banda}.npy"), pct_final[banda].astype(np.float32, copy=False))
-                _np_save_seguro(os.path.join(carpeta_energia, f"{banda}.npy"), pct_final[banda].astype(np.float32, copy=False))
-    except Exception as e:
-        log(f"No pude actualizar los caches de energía relativa para el informe: {e}")
+    # SNR post-limpieza (1-30 vs 30-40 Hz, sobre la señal final). None
+    # si el archivo se proceso con una version anterior a este cambio.
+    ruta_snr_final = os.path.join(carpeta_archivo_cache, "calidad_senal", "snr_final.json")
+    if os.path.exists(ruta_snr_final):
+        try:
+            with open(ruta_snr_final, "r", encoding="utf-8") as f:
+                snr_final_db = json.load(f).get("snr_final_db")
+        except Exception:
+            snr_final_db = None
 
     nombre_limpio = os.path.basename(carpeta_archivo_cache)
     carpeta_informe = os.path.join(carpeta_archivo_cache, "informe")
@@ -4681,6 +4707,7 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
                 fs_meta,
                 ruta_espectrograma_informe,
                 bandas_def=bandas,
+                nombres_canales=nombres_canales,
             )
             del datos_para_espectrograma
     except Exception as e:
@@ -5176,8 +5203,21 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     pdf.add_block_title("1. Tabla de valores globales de proporciones entre bandas con semáforo clínico")
     semaforos_ratios = resumen_ratios.get("semaforos", {}) if isinstance(resumen_ratios, dict) else {}
 
-    # Calcular confiabilidad global de biomarcadores
-    confiabilidad = _calcular_confiabilidad_metrica(snr_final_db, None, porcentaje_varianza_ica)
+    # Calcular confiabilidad global de biomarcadores.
+    # Se lee el valor único persistido por el pipeline; si el registro se
+    # procesó con una versión anterior (sin la clave), se recalcula con los
+    # mismos insumos que usa el Excel: SNR crudo + % atípicos + % ICA.
+    confiabilidad = None
+    if isinstance(resumen_calidad, dict):
+        confiabilidad = resumen_calidad.get("confiabilidad_biomarcadores")
+    if not confiabilidad:
+        snr_crudo_db = (resumen_calidad.get("snr") or {}).get("snr_global_db") \
+            if isinstance(resumen_calidad, dict) else None
+        pct_atipicos_pdf = resumen_calidad.get("porcentaje_atipicos") \
+            if isinstance(resumen_calidad, dict) else None
+        confiabilidad = _calcular_confiabilidad_metrica(
+            snr_crudo_db, pct_atipicos_pdf, porcentaje_varianza_ica
+        )
     color_confiabilidad = {"ALTA": "green", "MEDIA": "yellow", "BAJA": "orange", "NULA": "red"}.get(confiabilidad, "gray")
 
     filas_ratios = []
@@ -5234,7 +5274,7 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     if not os.path.exists(ruta_pdf):
         raise RuntimeError(f"Se intentó generar el PDF pero no apareció: {ruta_pdf}")
 
-    del datos_ica, datos_wavelet, datos_fil, tiempo
+    del tiempo
     gc.collect()
 
     ruta_pdf_final = copiar_informe_a_carpeta_externa(
@@ -5542,13 +5582,9 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     )
     log("[OK] Espectrograma calculado.")
 
-    # Bandas PRE-ICA (desde filtrado)
-    for nombre_banda, (low, high) in bandas.items():
-        datos_b_pre = filtrar_banda(datos_fn, fs_real, low, high, order)
-        _np_save_seguro(
-            os.path.join(rutas["bandas_filtrado"], f"{nombre_banda}.npy"),
-            datos_b_pre.astype(np.float32, copy=False)
-        )
+    # Bandas PRE-ICA eliminadas: no las consume ni el PDF (usa Welch) ni la
+    # interfaz (usa bandas/ post-ICA). Generaban ~150 MB por registro y eran
+    # el motivo por el que el informe reabría matrices con mmap.
 
     # =========================
     # 6) ICA (MNE-ICLabel)
@@ -5560,6 +5596,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     # no mide una banda ya borrada por el pasa-banda de 40 Hz. El producto
     # clínico (datos_fn, 1-40 Hz) NO se modifica.
     alta_ica_fit = min(float(ICAFIT_HIGHCUT), float(fs_real) / 2.0 - 1.0)
+    snr_crudo_ica = None
     if alta_ica_fit > float(highcut) + 1e-6:
         datos_ica_fit = filtrar_banda(datos_eeg_detrend, fs_real, lowcut, alta_ica_fit, order)
         if 60.0 < (float(fs_real) / 2.0):
@@ -5568,6 +5605,16 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
             datos_ica_fit = interpolar_canales_malos(
                 datos_ica_fit, idx_a_interpolar, nombres_canales_archivo
             )
+        # SNR de adquisición medido ANTES del CAR: alimenta el umbral adaptativo
+        # de ICLabel con la misma métrica que reporta el informe (señal de
+        # adquisición), no con la señal ya referenciada.
+        snr_crudo_ica = _calcular_snr_crudo_rapido(datos_ica_fit, fs_real)
+        # M-01: misma referencia espacial que datos_fn (CAR robusto que excluye
+        # fuertes y sospechosos). Sin esto, ICA se entrenaba sobre la media de
+        # los 60 canales EEG y se aplicaba sobre una referencia distinta.
+        datos_ica_fit = aplicar_car_robusto(
+            datos_ica_fit, idx_malos_totales, nombres_canales_archivo
+        )
         log(f"[Pre-ICA] Copia de banda ancha 1-{alta_ica_fit:.0f} Hz lista para ICA/ICLabel.")
     else:
         datos_ica_fit = datos_fn
@@ -5575,7 +5622,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     log("[Proceso] Ejecutando ICA de grado médico con MNE...")
     datos_ica, porcentaje_varianza_ica = aplicar_ica_mne(
         datos_fn, fs_real, nombres_canales_archivo,
-        datos_fit=datos_ica_fit, logger=log
+        datos_fit=datos_ica_fit, snr_crudo_db=snr_crudo_ica, logger=log
     )
     _np_save_seguro(
         os.path.join(rutas["ica"], "eeg_ica.npy"),
@@ -5667,13 +5714,19 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     nombres_canales_welch = nombres_canales_archivo
 
     progress(55, "Calculando potencia relativa por Welch...")
+    # Excluir de TODOS los promedios corticales los canales fuertes y
+    # sospechosos detectados: un canal interpolado es una reconstrucción
+    # sintética desde vecinos y no debe pesar como un canal propio en las
+    # tablas globales/regionales. Los periféricos (M1/M2/CB1/CB2) ya se
+    # excluyen dentro de indices_canales_corticales.
+    idx_excluir_welch = list(idx_malos_totales)
     resultado_welch = calcular_potencia_relativa_welch(
         datos_wavelet,
         fs_real,
         bandas_def=bandas,
         rango_total=RANGO_TOTAL_WELCH,
         nombres_canales=nombres_canales_welch,
-        idx_excluir=[],
+        idx_excluir=idx_excluir_welch,
         logger=silent_logger
     )
     guardar_potencia_relativa_welch(
@@ -5681,7 +5734,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         resultado_welch,
         nombres_canales=nombres_canales_welch,
         bandas_def=bandas,
-        idx_excluir=[],
+        idx_excluir=idx_excluir_welch,
         logger=silent_logger
     )
 
@@ -5690,14 +5743,14 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         resultado_welch["pot_rel"],
         ratios_def=RATIOS_WELCH_PRINCIPALES,
         nombres_canales=nombres_canales_welch,
-        idx_excluir=[],
+        idx_excluir=idx_excluir_welch,
     )
     guardar_ratios_welch_principales(
         rutas["analisis_welch"],
         resultado_ratios_welch,
         nombres_canales=nombres_canales_welch,
         ratios_def=RATIOS_WELCH_PRINCIPALES,
-        idx_excluir=[],
+        idx_excluir=idx_excluir_welch,
         logger=silent_logger
     )
 
@@ -5711,6 +5764,7 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         canales_atipicos=canales_atipicos_nombres,
         canales_sospechosos=canales_sospechosos_nombres,
         carpeta_cache=rutas["archivo"],
+        porcentaje_varianza_ica=porcentaje_varianza_ica,
         logger=logger
     )
     log("[OK] Calidad tecnica de senal calculada.")

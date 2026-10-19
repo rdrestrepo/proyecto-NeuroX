@@ -3585,7 +3585,7 @@ class AppEEG:
             _mostrar(self.frame_ventana, self.frame_ganancia)
 
         elif modo == "FFT filtrada":
-            _mostrar(self.frame_canal, self.frame_fft)
+            _mostrar(self.frame_canal, self.frame_fft, self.frame_psd_opciones)
 
         elif modo == "FFT final":
             _mostrar(self.frame_canal, self.frame_fft)
@@ -7637,7 +7637,11 @@ class AppEEG:
     
         if e in ("M1", "M2", "A1", "A2"):
             return "Mastoides"
-        if e.startswith(("O", "PO", "CB")):
+        # Periféricos no corticales (ICA no los limpia). Antes caían en
+        # "Occipital" por startswith("CB") y contaminaban la región occipital.
+        if e in ("CB1", "CB2"):
+            return "Referencia/Periféricos"
+        if e.startswith(("O", "PO")):
             return "Occipital"
         if e.startswith(("P", "CP")):
             return "Parietal"
@@ -9787,8 +9791,12 @@ class AppEEG:
             # 3. Suavizado matemático para una curva natural y fluida
             y_smooth = gaussian_filter1d(y_raw, sigma=0.6)
     
-            # 4. Inyección de puntos de corte exactos para que no haya huecos en el sombreado
-            puntos_corte = [0.5, 4.0, 8.0, 13.0]
+            # 4. Inyección de puntos de corte exactos (bordes IFCN del pipeline)
+            puntos_corte = sorted({
+                float(corte)
+                for low, high in BANDAS_CLINICAS.values()
+                for corte in (low, high)
+            })
             for corte in puntos_corte:
                 if 0.0 < corte < fmax and corte not in x_raw:
                     y_corte = np.interp(corte, x_raw, y_smooth)
@@ -9797,17 +9805,35 @@ class AppEEG:
                     y_smooth = np.insert(y_smooth, idx_insert, y_corte)
     
             x = x_raw
-            
-            # Volvemos a Escala Lineal para que el suelo natural sea 0 y las bandas no se aplasten
-            y = y_smooth  
-            
+
+            # 5. Escala Y elegida por el usuario. En EEG la PSD cae como 1/f:
+            # en escala lineal el pico Delta aplasta Alfa/Beta contra el eje.
+            # El check "Eje Y logarítmico" del visor activa la vista en dB.
+            modo_log = bool(self.var_psd_log.get())
+            if modo_log:
+                y = 10.0 * np.log10(np.maximum(y_smooth, 0.0) + 1e-12)
+            else:
+                y = y_smooth
+
+            # Base del relleno: 0 en lineal; en dB, un piso por debajo del
+            # mínimo visible para que el sombreado no quede flotando.
+            if modo_log:
+                y_finito = y[np.isfinite(y)]
+                base_relleno = float(np.min(y_finito)) - 3.0 if y_finito.size else 0.0
+            else:
+                base_relleno = 0.0
+
             unidad_fft = self._leer_unidad_fft_desde_cache()
             if unidad_fft == "µV":
-                ylabel = "Densidad Espectral (µV²/Hz)"
+                unidad_txt = "µV²/Hz"
             elif unidad_fft:
-                ylabel = f"Densidad Espectral ({unidad_fft}²/Hz)"
+                unidad_txt = f"{unidad_fft}²/Hz"
             else:
-                ylabel = "Densidad Espectral (u.a.)"
+                unidad_txt = "u.a."
+            if modo_log:
+                ylabel = f"Densidad Espectral (dB {unidad_txt})"
+            else:
+                ylabel = f"Densidad Espectral ({unidad_txt})"
     
             self.fig.clear()
             
@@ -9821,21 +9847,29 @@ class AppEEG:
             ax = self.fig.add_subplot(111)
             ax.set_facecolor(color_fondo)
     
+            # Bandas clínicas tomadas del pipeline (IFCN): Delta arranca en
+            # 1.0 Hz porque lowcut=1.0; ya no se sombrea la transición 0-1 Hz.
             bandas_clinicas = [
-                ("Delta (0.5-4 Hz)", 0.5, 4.0, "#0284C7"),  
-                ("Theta (4-8 Hz)",   4.0, 8.0, "#059669"),  
-                ("Alfa (8-13 Hz)",   8.0, 13.0, "#D97706"), 
-                ("Beta (13-30 Hz)",  13.0, 30.0, "#9333EA") 
+                (
+                    f"{nombre} ({float(low):g}-{float(high):g} Hz)",
+                    float(low),
+                    float(high),
+                    COLORES_BANDAS.get(nombre, "#4B5563"),
+                )
+                for nombre, (low, high) in BANDAS_CLINICAS.items()
             ]
+            f_inicio_bandas = float(min(low for low, _ in BANDAS_CLINICAS.values()))
     
             handles = []
             
-            # 5. Dibujar la línea de la porción 0.0 a 0.5 Hz sin sombreado
-            mask_pre = (x <= 0.5)
+            # Curva de la transición del pasa-altos (0 - inicio de Delta),
+            # solo trazada, sin sombreado.
+            mask_pre = (x < f_inicio_bandas)
             if np.any(mask_pre):
-                ax.plot(x[mask_pre], y[mask_pre], color="#0284C7", linewidth=1.6, zorder=4)
+                ax.plot(x[mask_pre], y[mask_pre],
+                        color=bandas_clinicas[0][3], linewidth=1.6, zorder=4)
     
-            # 6. Dibujar las bandas y rellenar estrictamente hasta 0
+            # Dibujar las bandas y rellenar hasta la base de la escala
             for nombre, f0, f1, col in bandas_clinicas:
                 if f0 >= fmax:
                     continue
@@ -9848,38 +9882,54 @@ class AppEEG:
                     y_b = y[mask_banda]
                     
                     ax.plot(x_b, y_b, color=col, linewidth=1.6, zorder=4)
-                    ax.fill_between(x_b, 0, y_b, color=col, alpha=0.20, edgecolor="none", zorder=3)
+                    ax.fill_between(x_b, base_relleno, y_b, color=col, alpha=0.20,
+                                    edgecolor="none", zorder=3)
                     
                     handles.append(Patch(facecolor=col, edgecolor="none", label=nombre, alpha=0.85))
     
-            # 7. Escala dinámica inteligente: Zoom automático
-            # Ignoramos el pico masivo inicial para que Alfa y Beta siempre se vean grandes y legibles.
-            PERCENTIL_ESCALA_PSD = 99.5
-            MARGEN_ESCALA_PSD = 1.25
-    
+            # 7. Escala dinámica
             if len(y) > 0:
-                mask_escala = (x >= 1.0) & (x <= fmax)
-                if np.any(mask_escala):
-                    techo_real = float(np.percentile(y[mask_escala], PERCENTIL_ESCALA_PSD)) * MARGEN_ESCALA_PSD
+                mask_escala = (x >= f_inicio_bandas) & (x <= fmax) & np.isfinite(y)
+                if modo_log:
+                    # En dB el rango dinámico ya es legible: mostramos el
+                    # espectro completo sin recortar el pico de Delta.
+                    if np.any(mask_escala):
+                        ylo = float(np.percentile(y[mask_escala], 0.5)) - 2.0
+                        yhi = float(np.percentile(y[mask_escala], 99.9)) + 3.0
+                    else:
+                        ylo = base_relleno
+                        yhi = float(np.nanmax(y)) + 3.0 if np.any(np.isfinite(y)) else base_relleno + 10.0
+                    if not np.isfinite(ylo):
+                        ylo = base_relleno
+                    if not np.isfinite(yhi) or yhi <= ylo:
+                        yhi = ylo + 10.0
+                    ax.set_ylim(ylo, yhi)
                 else:
-                    techo_real = float(np.max(y)) * MARGEN_ESCALA_PSD
+                    # Zoom automático: ignora el pico masivo de Delta para que
+                    # Alfa y Beta se vean grandes y legibles.
+                    PERCENTIL_ESCALA_PSD = 99.5
+                    MARGEN_ESCALA_PSD = 1.25
+                    if np.any(mask_escala):
+                        techo_real = float(np.percentile(y[mask_escala], PERCENTIL_ESCALA_PSD)) * MARGEN_ESCALA_PSD
+                    else:
+                        techo_real = float(np.max(y)) * MARGEN_ESCALA_PSD
+                        
+                    techo_real = max(techo_real, 1e-6)
+                    ax.set_ylim(0, techo_real)
                     
-                techo_real = max(techo_real, 1e-6)
-                ax.set_ylim(0, techo_real)
-                
-                # Si el pico de Delta es tan gigante que sale del gráfico, mostramos un aviso elegante
-                pico_real = float(np.max(y))
-                if pico_real > techo_real:
-                    idx_pico = int(np.argmax(y))
-                    ax.annotate(
-                        f"⚠ pico fuera de escala: {pico_real:.1f} a {x[idx_pico]:.1f} Hz",
-                        xy=(x[idx_pico], techo_real), xytext=(0.5, 0.95),
-                        textcoords="axes fraction", ha="center", va="top",
-                        fontsize=8, color="#EF476F",
-                        arrowprops=dict(arrowstyle="->", color="#EF476F", lw=1),
-                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#EF476F", alpha=0.85),
-                        zorder=5
-                    )
+                    # Si el pico de Delta es tan gigante que sale del gráfico, mostramos un aviso elegante
+                    pico_real = float(np.max(y))
+                    if pico_real > techo_real:
+                        idx_pico = int(np.argmax(y))
+                        ax.annotate(
+                            f"⚠ pico fuera de escala: {pico_real:.1f} a {x[idx_pico]:.1f} Hz",
+                            xy=(x[idx_pico], techo_real), xytext=(0.5, 0.95),
+                            textcoords="axes fraction", ha="center", va="top",
+                            fontsize=8, color="#EF476F",
+                            arrowprops=dict(arrowstyle="->", color="#EF476F", lw=1),
+                            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="#EF476F", alpha=0.85),
+                            zorder=5
+                        )
     
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
