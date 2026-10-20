@@ -26,6 +26,7 @@ import sys
 import gc
 import datetime
 import json
+import math
 import shutil
 import functools
 
@@ -2938,15 +2939,197 @@ ACCIONES_ADQUISICION = {
     ),
 }
 
-# Si la red eléctrica es al menos este porcentaje del ruido 40-100 Hz del
-# registro (mediana entre canales), se recomienda corregirla. Mediana en los
-# 151 registros analizados: 44 %.
-UMBRAL_INTERFERENCIA_RED_PCT = 30.0
+# =========================
+# CONFIGURACION DE ADQUISICION (config.json)
+# =========================
+# Los umbrales del diagnostico de adquisicion se pueden ajustar sin tocar
+# codigo editando config.json. El archivo es OPCIONAL: si falta, esta corrupto
+# o trae un valor invalido se usan los valores por defecto y el problema queda
+# anotado en CONFIG_ADQUISICION_ADVERTENCIAS. Un error de configuracion nunca
+# aborta el procesamiento.
+#
+# Formato:
+#   {
+#     "adquisicion": {
+#       "umbral_interferencia_red_pct": 30.0,
+#       "umbral_patron_sistemico": 0.20
+#     }
+#   }
+#
+# En desarrollo se busca junto a este archivo. En el .exe se busca primero
+# junto a NeuroX.exe (editable por el tecnico) y luego en los datos
+# empaquetados (_MEIPASS). Las claves que empiezan por "_" son documentacion
+# embebida y se ignoran.
 
-# Si una misma causa afecta a esta fraccion de los canales, el problema es
-# del montaje completo (REF/GND, amplificador, entorno) y no de electrodos
-# individuales: se recomienda corregirlo antes que electrodo por electrodo.
-UMBRAL_PATRON_SISTEMICO = 0.20
+CONFIG_ADQUISICION_DEFAULTS = {
+    # Red electrica: porcentaje minimo del ruido 40-100 Hz que debe ser red
+    # para recomendar corregirla. Mediana en los 151 registros analizados: 44 %.
+    "umbral_interferencia_red_pct": 30.0,
+    # Patron sistemico: fraccion de canales con la misma causa para avisar de
+    # un problema del montaje (REF/GND, amplificador, entorno) en vez de
+    # electrodos individuales.
+    "umbral_patron_sistemico": 0.20,
+}
+
+# Rangos permitidos (inclusivos). Se validan al leer config.json para que un
+# valor absurdo no altere silenciosamente el diagnostico.
+CONFIG_ADQUISICION_RANGOS = {
+    "umbral_interferencia_red_pct": (0.0, 100.0),
+    "umbral_patron_sistemico": (0.0, 1.0),
+}
+
+
+def _carpetas_busqueda_config():
+    """Carpetas donde puede vivir config.json, en orden de prioridad."""
+    carpetas = []
+    if getattr(sys, "frozen", False):
+        # Onedir: el .exe queda en dist/NeuroX y los datos en _internal. Se
+        # prioriza la carpeta del ejecutable para que el tecnico pueda editar
+        # el archivo sin tocar los datos empaquetados.
+        carpetas.append(os.path.dirname(os.path.abspath(sys.executable)))
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            carpetas.append(meipass)
+    else:
+        carpetas.append(os.path.dirname(os.path.abspath(__file__)))
+
+    vistas = set()
+    unicas = []
+    for carpeta in carpetas:
+        clave = os.path.normcase(os.path.abspath(carpeta))
+        if clave not in vistas:
+            vistas.add(clave)
+            unicas.append(carpeta)
+    return unicas
+
+
+def localizar_config_adquisicion():
+    """Devuelve la primera ruta existente de config.json, o None."""
+    for carpeta in _carpetas_busqueda_config():
+        ruta = os.path.join(carpeta, "config.json")
+        if os.path.isfile(ruta):
+            return ruta
+    return None
+
+
+def _validar_umbral_config(clave, valor, defecto):
+    """Convierte y valida un umbral. Devuelve (valor_efectivo, advertencia)."""
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        return defecto, (
+            f"'{clave}': se esperaba un numero y se encontro "
+            f"{type(valor).__name__}; se usa el valor por defecto {defecto}."
+        )
+
+    try:
+        numero = float(valor)
+    except (OverflowError, TypeError, ValueError):
+        return defecto, (
+            f"'{clave}': el numero no se puede representar; "
+            f"se usa el valor por defecto {defecto}."
+        )
+
+    if not math.isfinite(numero):
+        return defecto, (
+            f"'{clave}': el valor no es finito; "
+            f"se usa el valor por defecto {defecto}."
+        )
+
+    minimo, maximo = CONFIG_ADQUISICION_RANGOS[clave]
+    if numero < minimo or numero > maximo:
+        return defecto, (
+            f"'{clave}': {numero} esta fuera del rango permitido "
+            f"[{minimo}, {maximo}]; se usa el valor por defecto {defecto}."
+        )
+    return numero, None
+
+
+def cargar_config_adquisicion(ruta=None):
+    """
+    Lee config.json y devuelve (config, origen, advertencias).
+
+    - ruta: archivo concreto; si es None se busca con
+      localizar_config_adquisicion().
+    - config: diccionario SIEMPRE completo (defaults + valores validos).
+    - origen: ruta absoluta leida o None si se usaron solo los defaults.
+    - advertencias: lista de textos para diagnostico; nunca lanza excepcion.
+
+    Un archivo ausente no es un error: config.json es opcional. Se acepta BOM
+    de UTF-8 porque el archivo puede editarse con el Bloc de notas de Windows.
+    """
+    config = dict(CONFIG_ADQUISICION_DEFAULTS)
+    advertencias = []
+
+    if ruta is None:
+        ruta = localizar_config_adquisicion()
+    if ruta is None:
+        return config, None, advertencias
+
+    try:
+        with open(ruta, "r", encoding="utf-8-sig") as f:
+            datos = json.load(f)
+    except FileNotFoundError:
+        return config, None, advertencias
+    except (OSError, ValueError, RecursionError) as exc:
+        advertencias.append(
+            f"No se pudo leer '{ruta}' ({exc}). "
+            "Se usan los valores por defecto."
+        )
+        return config, None, advertencias
+
+    origen = os.path.abspath(ruta)
+
+    if not isinstance(datos, dict):
+        advertencias.append(
+            f"'{ruta}' debe contener un objeto JSON en la raiz; "
+            "se usan los valores por defecto."
+        )
+        return config, origen, advertencias
+
+    seccion = datos.get("adquisicion")
+    if seccion is None:
+        claves_utiles = [k for k in datos if not str(k).startswith("_")]
+        if claves_utiles:
+            advertencias.append(
+                f"'{ruta}' no tiene la seccion 'adquisicion'; "
+                "se usan los valores por defecto."
+            )
+        return config, origen, advertencias
+
+    if not isinstance(seccion, dict):
+        advertencias.append(
+            f"'adquisicion' en '{ruta}' debe ser un objeto JSON; "
+            "se usan los valores por defecto."
+        )
+        return config, origen, advertencias
+
+    for clave, valor in seccion.items():
+        if str(clave).startswith("_"):
+            continue  # Documentacion embebida: no es un umbral.
+        if clave not in CONFIG_ADQUISICION_DEFAULTS:
+            advertencias.append(
+                f"Clave desconocida 'adquisicion.{clave}' en '{ruta}'; "
+                "se ignora."
+            )
+            continue
+
+        efectivo, aviso = _validar_umbral_config(
+            clave, valor, CONFIG_ADQUISICION_DEFAULTS[clave]
+        )
+        config[clave] = efectivo
+        if aviso:
+            advertencias.append(f"{aviso} (archivo: {ruta})")
+
+    return config, origen, advertencias
+
+
+CONFIG_ADQUISICION, CONFIG_ADQUISICION_RUTA, CONFIG_ADQUISICION_ADVERTENCIAS = (
+    cargar_config_adquisicion()
+)
+
+# Umbrales efectivos. Se conservan estos nombres porque el resto del codigo
+# (diagnostico, GUI y pruebas) los importa directamente.
+UMBRAL_INTERFERENCIA_RED_PCT = CONFIG_ADQUISICION["umbral_interferencia_red_pct"]
+UMBRAL_PATRON_SISTEMICO = CONFIG_ADQUISICION["umbral_patron_sistemico"]
 
 
 def _causa_principal_canal(razon, z):

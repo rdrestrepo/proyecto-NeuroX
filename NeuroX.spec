@@ -35,6 +35,10 @@ excludes_list = [
 # ejecutable arrancaba sin logo.
 datas = [
     ('assets', 'assets'),
+    # Umbrales del diagnostico de adquisicion. Va empaquetado como default;
+    # el loader busca primero config.json junto a NeuroX.exe para que el
+    # tecnico pueda ajustarlo sin recompilar.
+    ('config.json', '.'),
 ]
 
 # mne-icalabel incluye la red neuronal ICLabelNet.onnx (y megnet.onnx). Sin

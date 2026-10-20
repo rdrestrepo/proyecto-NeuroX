@@ -99,6 +99,32 @@ Cobertura:
 
 **Aprendizaje:** en `reporte_canales_atipicos.txt` el canal va en base 1 (`Canal 07` = índice 6 = `F5`); una expectativa de fixture asumió `F7` y la prueba lo detectó. La alerta de hardware de cohorte FZ/F2 sigue pendiente (T-3): la prueba deja documentado que hoy 2/64 no dispara el patrón sistémico del 20 %.
 
+### T-2 — Umbrales de adquisición configurables (2026-10-20)
+
+Los dos umbrales del diagnóstico de adquisición dejaron de estar hardcodeados. Ahora se leen de `config.json` (raíz del proyecto), sin cambiar sus valores por defecto:
+
+```json
+{
+  "adquisicion": {
+    "umbral_interferencia_red_pct": 30.0,
+    "umbral_patron_sistemico": 0.2
+  }
+}
+```
+
+- **Cargador:** `cargar_config_adquisicion(ruta=None)` devuelve `(config, origen, advertencias)`. Nunca lanza excepción: si el archivo falta, está corrupto o trae un valor inválido, usa el default y anota el motivo en `CONFIG_ADQUISICION_ADVERTENCIAS`.
+- **Validación:** tipo numérico (rechaza `bool`, texto, `null`), finito (rechaza `NaN`/`Infinity`), rango inclusivo `[0, 100]` para el porcentaje y `[0, 1]` para la fracción; un entero JSON desmesurado que desborda `float()` también cae al default. Claves desconocidas se ignoran con advertencia.
+- **Formato tolerante:** JSON parcial (mezcla defaults), objeto vacío, BOM de UTF-8 (Bloc de notas) y claves que empiezan por `_` como documentación embebida.
+- **Compatibilidad:** las constantes históricas `UMBRAL_INTERFERENCIA_RED_PCT` y `UMBRAL_PATRON_SISTEMICO` se asignan desde `CONFIG_ADQUISICION`, por lo que `diagnosticar_adquisicion()`, el PDF y la GUI siguen leyendo lo mismo sin cambios.
+- **Búsqueda del archivo:** en desarrollo, junto a `pipeline_eeg_completo.py`; en el `.exe`, primero junto a `NeuroX.exe` (editable por el técnico) y luego en `_internal` (`sys._MEIPASS`). `NeuroX.spec` empaqueta `config.json` como default.
+- **Alcance:** un cambio de umbral aplica al **procesamiento nuevo** y a la reconstrucción de cachés antiguas; los registros ya procesados conservan las recomendaciones guardadas en su `resumen_calidad.json`.
+
+**Pruebas:** `tests/test_config_adquisicion.py` (34 pruebas): integridad del esquema, defaults históricos, JSON válido/parcial/vacío/BOM, claves de documentación, JSON corrupto, raíz/sección no objeto, claves desconocidas, tipos incorrectos, `NaN`/`Infinity`, enteros desmesurados, rangos y límites inclusivos, ruta que es directorio, prioridad de rutas en `.exe` vs `_internal` y cableado real con `diagnosticar_adquisicion()`.
+
+**Resultado:** 64/64 pruebas OK (30 de T-1 + 34 de T-2) y `VERIFICACION_SINTACTICA_OK`.
+
+**Pendiente de T-2:** no se muestra un aviso visual si `config.json` es inválido; las advertencias quedan disponibles en `CONFIG_ADQUISICION_ADVERTENCIAS` para diagnóstico (se documentará en T-6).
+
 ### Identidad de commits
 
 Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevin.yepez@unisimon.edu.co>` se reescribieron a `Kypez-dev <322148154+Kypez-dev@users.noreply.github.com>` (correo *noreply* oficial de la cuenta GitHub `Kypez-dev`, ID 322148154), con `git filter-branch` y `--force-with-lease`. Respaldo del historial anterior en la rama `backup/pre-rewrite-20261019`. La configuración `user.name`/`user.email` quedó fijada en local y global (`user.useConfigOnly = true`) para que también la use VS Code.
@@ -176,11 +202,11 @@ Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevi
 
 **Plan de recomendaciones (T-1…T-6):**
 - [x] **T-1 — Tests del diagnóstico de adquisición:** `tests/test_adquisicion.py`, 30/30 OK.
-- [ ] **T-2 — Parametrizar umbrales** (`config.json`): `UMBRAL_INTERFERENCIA_RED_PCT`, `UMBRAL_PATRON_SISTEMICO`, futuro umbral de cohorte FZ/F2.
+- [x] **T-2 — Parametrizar umbrales** (`config.json`): loader tolerante + 34 pruebas; defaults 30.0 / 0.20 intactos.
 - [ ] **T-3 — Alerta de cohorte FZ/F2** (hardware de conector) en pipeline, PDF e inspector.
 - [ ] **T-4 — Evaluar `snr_sin_red_db` en la Confiabilidad** (flag configurable, requiere acuerdo del equipo).
 - [ ] **T-5 — Regresión end-to-end** con cachés de referencia.
-- [ ] **T-6 — Documentar configuración y umbrales** en MEMORY.
+- [ ] **T-6 — Documentar configuración y umbrales** en MEMORY (incluye visibilidad de advertencias de `config.json`).
 
 **Otros:**
 - [ ] **Reprocesamiento masivo pendiente:** las ~153-156 entradas de `CACHE` y sus informes aún reflejan el pipeline anterior. Con S-01 el costo bajó a ~15-25 s/archivo; estimación total 1-1.5 h más PDFs y consolidado. Respaldar/renombrar la `CACHE` actual antes de empezar.

@@ -1,0 +1,9 @@
+{
+  "adquisicion": {
+    "_ayuda": "Umbrales del diagnostico de adquisicion. Editar solo los valores numericos; las claves que empiezan por _ son documentacion y se ignoran. Si el archivo falta o un valor es invalido, NeuroX usa los valores por defecto sin detener el procesamiento.",
+    "_umbral_interferencia_red_pct": "Porcentaje (0-100) minimo del ruido de 40-100 Hz que debe ser red electrica para recomendar corregirla. Por defecto 30.",
+    "_umbral_patron_sistemico": "Fraccion (0-1) de canales con la misma causa para avisar de un problema de montaje (REF/GND, amplificador, entorno). 0.20 = 20 %. Por defecto 0.20.",
+    "umbral_interferencia_red_pct": 30.0,
+    "umbral_patron_sistemico": 0.2
+  }
+}
