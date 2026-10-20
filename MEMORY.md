@@ -85,6 +85,20 @@ Objetivo: reducir canales atípicos e interferencia para que la Confiabilidad de
 
 **Decisión:** las mejoras 2-4 (base normativa propia, modelo de riesgo combinado, seguimiento longitudinal) se **retiraron por completo** del código por decisión del equipo; no se realizarán por ahora. El PSD queda como está.
 
+### T-1 — Pruebas del diagnóstico de adquisición (2026-10-20)
+
+Primera tarea del plan de recomendaciones derivado de la Mejora 1. Se creó `tests/test_adquisicion.py` con **30 pruebas** sobre `unittest` (biblioteca estándar: no agrega dependencias a `requirements.txt`). No procesa señales ni toca `CACHE`: usa detalles sintéticos con la misma forma que produce `detectar_canales_atipicos()` y cachés temporales.
+
+Cobertura:
+- `_causa_principal_canal()`: las cinco causas (amplitud, canal bajo, ruido HF, alfa dominante, espectro anómalo), el factor 0.9 del espectro, el fallback sin razón y que toda causa tenga título/acción en `ACCIONES_ADQUISICION`.
+- `detalle_atipicos_desde_reporte()`: secciones fuerte/sospechoso, razones encadenadas con ` | `, inferencia de razón en sospechosos, canales fuera de rango, reporte vacío y archivo inexistente.
+- `diagnosticar_adquisicion()`: registro sin atípicos, patrón sistémico en el umbral del 20 %, umbral de red del 30 % (incluido el límite exacto), texto SNR con/sin red, mínimos reales para MEDIA/ALTA (caso 32/64 fuertes y SNR 16 dB → 20 y 27 electrodos), `None` cuando el SNR impide el objetivo, FZ+F2 sin patrón, orden fuertes→sospechosos por score y acciones sin duplicados.
+- `recomendaciones_adquisicion_desde_cache()`: prioridad del JSON, reconstrucción desde reporte en cachés antiguas, JSON corrupto y caché sin datos.
+
+**Resultado:** 30/30 pruebas OK y `py_compile` OK (`VERIFICACION_SINTACTICA_OK`). Ejecución: `python -m unittest discover -s tests -p "test_*.py" -v`.
+
+**Aprendizaje:** en `reporte_canales_atipicos.txt` el canal va en base 1 (`Canal 07` = índice 6 = `F5`); una expectativa de fixture asumió `F7` y la prueba lo detectó. La alerta de hardware de cohorte FZ/F2 sigue pendiente (T-3): la prueba deja documentado que hoy 2/64 no dispara el patrón sistémico del 20 %.
+
 ### Identidad de commits
 
 Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevin.yepez@unisimon.edu.co>` se reescribieron a `Kypez-dev <322148154+Kypez-dev@users.noreply.github.com>` (correo *noreply* oficial de la cuenta GitHub `Kypez-dev`, ID 322148154), con `git filter-branch` y `--force-with-lease`. Respaldo del historial anterior en la rama `backup/pre-rewrite-20261019`. La configuración `user.name`/`user.email` quedó fijada en local y global (`user.useConfigOnly = true`) para que también la use VS Code.
@@ -158,11 +172,18 @@ Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevi
 - [ ] **Medir el efecto:** tras corregir hardware y red, grabar nuevos registros y comparar la distribución de Confiabilidad contra la línea base (5/25/36/85).
 - [ ] **Decidir sobre el SNR de la Confiabilidad:** hoy incluye la red de 60 Hz, que el notch elimina antes de calcular los biomarcadores. Usar `snr_sin_red_db` sería más fiel a la calidad real de 1-30 Hz, pero cambia la métrica y exige acuerdo del equipo; por ahora NO se cambió.
 - [ ] Volver a adquirir o descartar `DCL 026`, `DCL 084` y `DCL 042`.
-- [ ] Commit de los cambios de la Mejora 1 (`Interfaz_neuroX.py`, `pipeline_eeg_completo.py`).
+- [x] Commit de la Mejora 1 (`9452708`).
+
+**Plan de recomendaciones (T-1…T-6):**
+- [x] **T-1 — Tests del diagnóstico de adquisición:** `tests/test_adquisicion.py`, 30/30 OK.
+- [ ] **T-2 — Parametrizar umbrales** (`config.json`): `UMBRAL_INTERFERENCIA_RED_PCT`, `UMBRAL_PATRON_SISTEMICO`, futuro umbral de cohorte FZ/F2.
+- [ ] **T-3 — Alerta de cohorte FZ/F2** (hardware de conector) en pipeline, PDF e inspector.
+- [ ] **T-4 — Evaluar `snr_sin_red_db` en la Confiabilidad** (flag configurable, requiere acuerdo del equipo).
+- [ ] **T-5 — Regresión end-to-end** con cachés de referencia.
+- [ ] **T-6 — Documentar configuración y umbrales** en MEMORY.
 
 **Otros:**
 - [ ] **Reprocesamiento masivo pendiente:** las ~153-156 entradas de `CACHE` y sus informes aún reflejan el pipeline anterior. Con S-01 el costo bajó a ~15-25 s/archivo; estimación total 1-1.5 h más PDFs y consolidado. Respaldar/renombrar la `CACHE` actual antes de empezar.
 - [ ] **Fase 5 (hipótesis H-01):** experimento aislado de normalización por percentiles; no adopción en producción sin evidencia empírica.
-- [ ] Incorporar tests unitarios automatizados que evalúen la integridad del pipeline matemático usando señales sintéticas predefinidas.
 - [ ] Validar el build de `NeuroX.spec` con PyInstaller (D-05) y comprobar que ICLabel clasifica dentro del `.exe` (modelo ONNX empaquetado).
 - [ ] Explorar el cálculo de asimetría interhemisférica frontal (biomarcador complementario en investigación de deterioro cognitivo).
