@@ -1,4 +1,4 @@
-import os
+﻿import os
 
 from PyInstaller.utils.hooks import collect_data_files
 
@@ -42,7 +42,8 @@ datas = [
 datas += collect_data_files('mne_icalabel')
 
 # MNE necesita sus montajes 10-10/10-20 en runtime para set_montage().
-datas += collect_data_files('mne', includes=['channels/data/**'])
+# collect_data_files sin filtro recoge todos los .fif/.elc/.txt de channels/data.
+datas += collect_data_files('mne')
 
 a = Analysis(
     ['Interfaz_neuroX.py'],
