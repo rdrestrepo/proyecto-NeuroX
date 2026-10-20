@@ -29,6 +29,7 @@ import json
 import math
 import shutil
 import functools
+import threading
 
 import numpy as np
 import matplotlib
@@ -2969,6 +2970,12 @@ CONFIG_ADQUISICION_DEFAULTS = {
     # un problema del montaje (REF/GND, amplificador, entorno) en vez de
     # electrodos individuales.
     "umbral_patron_sistemico": 0.20,
+    # Cohorte FZ/F2: fraccion de registros en los que FZ y F2 deben fallar como
+    # atipico fuerte para sospechar hardware del conector (gorro/cable/pin).
+    "umbral_patron_cohorte_fz_f2": 0.80,
+    # Numero minimo de registros procesados para que la alerta de cohorte sea
+    # estadisticamente util. Con menos, el porcentaje es demasiado inestable.
+    "min_registros_cohorte": 20,
 }
 
 # Rangos permitidos (inclusivos). Se validan al leer config.json para que un
@@ -2976,7 +2983,12 @@ CONFIG_ADQUISICION_DEFAULTS = {
 CONFIG_ADQUISICION_RANGOS = {
     "umbral_interferencia_red_pct": (0.0, 100.0),
     "umbral_patron_sistemico": (0.0, 1.0),
+    "umbral_patron_cohorte_fz_f2": (0.0, 1.0),
+    "min_registros_cohorte": (1, 100000),
 }
+
+# Claves que deben ser enteros (no se acepta 20.5).
+CONFIG_ADQUISICION_ENTEROS = {"min_registros_cohorte"}
 
 
 def _carpetas_busqueda_config():
@@ -3040,6 +3052,15 @@ def _validar_umbral_config(clave, valor, defecto):
             f"'{clave}': {numero} esta fuera del rango permitido "
             f"[{minimo}, {maximo}]; se usa el valor por defecto {defecto}."
         )
+
+    if clave in CONFIG_ADQUISICION_ENTEROS:
+        if numero != int(numero):
+            return defecto, (
+                f"'{clave}': se esperaba un numero entero y se encontro "
+                f"{numero}; se usa el valor por defecto {defecto}."
+            )
+        return int(numero), None
+
     return numero, None
 
 
@@ -3130,6 +3151,8 @@ CONFIG_ADQUISICION, CONFIG_ADQUISICION_RUTA, CONFIG_ADQUISICION_ADVERTENCIAS = (
 # (diagnostico, GUI y pruebas) los importa directamente.
 UMBRAL_INTERFERENCIA_RED_PCT = CONFIG_ADQUISICION["umbral_interferencia_red_pct"]
 UMBRAL_PATRON_SISTEMICO = CONFIG_ADQUISICION["umbral_patron_sistemico"]
+UMBRAL_PATRON_COHORTE_FZ_F2 = CONFIG_ADQUISICION["umbral_patron_cohorte_fz_f2"]
+MIN_REGISTROS_COHORTE = int(CONFIG_ADQUISICION["min_registros_cohorte"])
 
 
 def _causa_principal_canal(razon, z):
@@ -3225,12 +3248,376 @@ def detalle_atipicos_desde_reporte(ruta_reporte, n_canales):
     return detalle, idx_fuertes, idx_sosp
 
 
-def recomendaciones_adquisicion_desde_cache(carpeta_archivo_cache, nombres_canales=None):
+# =========================
+# COHORTE FZ/F2 (hardware del conector)
+# =========================
+# FZ y F2 comparten pines contiguos en el conector. Si fallan como canal
+# atipico fuerte en casi todos los registros, el problema es del gorro/cable/
+# pin y no de la preparacion de cada paciente. El historial guarda, por
+# registro, que canales de interes fallaron; asi el conteo es idempotente
+# (reprocesar un archivo reemplaza su entrada, no la duplica).
+NOMBRE_ARCHIVO_COHORTE = "cohorte_fz_f2.json"
+CANALES_COHORTE_HARDWARE = ("FZ", "F2")
+_LOCK_COHORTE = threading.Lock()
+
+
+def ruta_historial_cohorte(carpeta_base=None):
+    """Ruta del historial de cohorte dentro de la carpeta de datos."""
+    base = CARPETA_BASE if carpeta_base is None else carpeta_base
+    return os.path.join(os.path.abspath(base), NOMBRE_ARCHIVO_COHORTE)
+
+
+def _carpeta_base_desde_cache(carpeta_cache):
+    """
+    Devuelve la carpeta de datos si la cache esta en <base>/CACHE/<registro>;
+    None en cualquier otro caso (por ejemplo, una cache temporal de pruebas).
+    """
+    try:
+        padre = os.path.dirname(os.path.abspath(carpeta_cache))
+        if os.path.basename(padre).upper() != "CACHE":
+            return None
+        return os.path.dirname(padre)
+    except Exception:
+        return None
+
+
+def _nivel_cohorte(valor):
+    """Normaliza el nivel guardado en el historial."""
+    texto = str(valor or "").strip().lower()
+    if texto in ("fuerte", "atipico", "atipico_fuerte"):
+        return "fuerte"
+    if texto == "sospechoso":
+        return "sospechoso"
+    return None
+
+
+def _iterar_canales(valor):
+    """Convierte listas/tuplas/conjuntos en iterable; cualquier otra cosa, vacio."""
+    if isinstance(valor, str):
+        return (valor,)
+    if isinstance(valor, (list, tuple, set, frozenset)):
+        return valor
+    return ()
+
+
+def _historial_vacio():
+    return {"version": 1, "actualizado": None, "registros": {}}
+
+
+def cargar_historial_cohorte(ruta=None):
+    """
+    Lee el historial de cohorte.
+
+    Devuelve (historial, origen, advertencias). Nunca lanza excepcion: un
+    archivo ausente o corrupto produce un historial vacio y, si aplica, una
+    advertencia. Solo conserva FZ/F2 y niveles validos.
+    """
+    vacio = _historial_vacio()
+    advertencias = []
+
+    if not ruta or not os.path.isfile(ruta):
+        return vacio, None, advertencias
+
+    try:
+        with open(ruta, "r", encoding="utf-8-sig") as f:
+            datos = json.load(f)
+    except (OSError, ValueError, RecursionError) as exc:
+        advertencias.append(
+            f"No se pudo leer el historial de cohorte '{ruta}' ({exc}). "
+            "Se reconstruira desde CACHE."
+        )
+        return vacio, None, advertencias
+
+    origen = os.path.abspath(ruta)
+
+    if not isinstance(datos, dict):
+        advertencias.append(
+            f"El historial de cohorte '{ruta}' debe ser un objeto JSON; se ignora."
+        )
+        return vacio, None, advertencias
+
+    registros = datos.get("registros")
+    if not isinstance(registros, dict):
+        advertencias.append(
+            f"El historial de cohorte '{ruta}' no tiene 'registros' validos; se ignora."
+        )
+        return vacio, None, advertencias
+
+    limpios = {}
+    for id_registro, entrada in registros.items():
+        if not isinstance(entrada, dict):
+            continue
+        fila = {}
+        for canal, nivel in entrada.items():
+            nombre = limpiar_nombre_canal(canal)
+            if nombre not in CANALES_COHORTE_HARDWARE:
+                continue
+            nivel_norm = _nivel_cohorte(nivel)
+            if nivel_norm is not None:
+                fila[nombre] = nivel_norm
+        limpios[str(id_registro)] = fila
+
+    historial = {
+        "version": 1,
+        "actualizado": datos.get("actualizado"),
+        "registros": limpios,
+    }
+    return historial, origen, advertencias
+
+
+def guardar_historial_cohorte(historial, ruta):
+    """
+    Guarda el historial de forma atomica (tmp + os.replace).
+
+    Devuelve True si se escribio. Si falla, el archivo anterior queda intacto
+    y se devuelve False (nunca propaga la excepcion).
+    """
+    ruta_tmp = None
+    try:
+        if not isinstance(historial, dict):
+            return False
+        registros = historial.get("registros")
+        if not isinstance(registros, dict):
+            return False
+
+        ruta = os.path.abspath(ruta)
+        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+
+        salida = {
+            "version": 1,
+            "actualizado": datetime.datetime.now().isoformat(timespec="seconds"),
+            "registros": {clave: registros[clave] for clave in sorted(registros)},
+        }
+
+        ruta_tmp = f"{ruta}.{os.getpid()}.tmp"
+        with open(ruta_tmp, "w", encoding="utf-8") as f:
+            json.dump(salida, f, indent=4, ensure_ascii=False, sort_keys=True)
+        os.replace(ruta_tmp, ruta)
+        return True
+    except Exception:
+        if ruta_tmp:
+            try:
+                os.remove(ruta_tmp)
+            except OSError:
+                pass
+        return False
+
+
+def actualizar_historial_cohorte(historial, id_registro, canales_fuertes,
+                                 canales_sospechosos=None):
+    """
+    Registra (o reemplaza) la entrada de un registro. Es idempotente: volver a
+    procesar el mismo archivo no infla los conteos.
+    """
+    registros = historial.setdefault("registros", {})
+    if not isinstance(registros, dict):
+        registros = {}
+        historial["registros"] = registros
+
+    fila = {}
+    for canal in _iterar_canales(canales_sospechosos):
+        nombre = limpiar_nombre_canal(canal)
+        if nombre in CANALES_COHORTE_HARDWARE:
+            fila[nombre] = "sospechoso"
+
+    for canal in _iterar_canales(canales_fuertes):
+        nombre = limpiar_nombre_canal(canal)
+        if nombre in CANALES_COHORTE_HARDWARE:
+            fila[nombre] = "fuerte"  # el nivel fuerte prevalece
+
+    registros[str(id_registro)] = fila
+    historial["version"] = 1
+    return historial
+
+
+def reconstruir_historial_desde_cache(carpeta_base=None):
+    """
+    Arma el historial leyendo los resumen_calidad.json ya existentes en
+    <base>/CACHE. Permite que la alerta funcione sin reprocesar nada.
+    """
+    base = CARPETA_BASE if carpeta_base is None else carpeta_base
+    historial = _historial_vacio()
+    carpeta_cache = os.path.join(os.path.abspath(base), "CACHE")
+    if not os.path.isdir(carpeta_cache):
+        return historial
+
+    try:
+        nombres = sorted(os.listdir(carpeta_cache))
+    except OSError:
+        return historial
+
+    for nombre in nombres:
+        ruta_cache = os.path.join(carpeta_cache, nombre)
+        if not os.path.isdir(ruta_cache):
+            continue
+        ruta_json = os.path.join(ruta_cache, "calidad_senal", "resumen_calidad.json")
+        try:
+            with open(ruta_json, "r", encoding="utf-8-sig") as f:
+                resumen = json.load(f)
+        except (OSError, ValueError, RecursionError):
+            continue
+        if not isinstance(resumen, dict):
+            continue
+        actualizar_historial_cohorte(
+            historial,
+            nombre,
+            resumen.get("canales_atipicos") or [],
+            resumen.get("canales_sospechosos") or [],
+        )
+    return historial
+
+
+def asegurar_historial_cohorte(ruta=None, carpeta_base=None):
+    """
+    Devuelve (historial, origen, advertencias). Si el archivo no existe o no
+    es un historial valido, lo reconstruye desde CACHE y lo guarda. Si no hay
+    caches, no crea el archivo. Un archivo valido no se vuelve a escanear.
+    """
+    if ruta is None:
+        ruta = ruta_historial_cohorte(carpeta_base)
+
+    base = carpeta_base if carpeta_base is not None else os.path.dirname(os.path.abspath(ruta))
+
+    if os.path.isfile(ruta):
+        historial, origen, advertencias = cargar_historial_cohorte(ruta)
+        if origen is not None:
+            return historial, origen, advertencias
+    else:
+        advertencias = []
+
+    reconstruido = reconstruir_historial_desde_cache(base)
+    if reconstruido.get("registros") and guardar_historial_cohorte(reconstruido, ruta):
+        advertencias.append(
+            f"Historial de cohorte reconstruido desde CACHE en '{ruta}'."
+        )
+        return reconstruido, os.path.abspath(ruta), advertencias
+    return reconstruido, None, advertencias
+
+
+def evaluar_alerta_cohorte(historial, umbral=None, min_registros=None):
+    """
+    Devuelve la alerta de hardware FZ/F2 o None.
+
+    Se exige que AMBOS canales superen el umbral de fallo fuerte para evitar
+    emparejar dos problemas que no tienen por que ser del conector.
+    """
+    if umbral is None:
+        umbral = UMBRAL_PATRON_COHORTE_FZ_F2
+    if min_registros is None:
+        min_registros = MIN_REGISTROS_COHORTE
+
+    try:
+        umbral = float(umbral)
+        min_registros = int(min_registros)
+    except (TypeError, ValueError):
+        return None
+
+    registros = historial.get("registros") if isinstance(historial, dict) else None
+    if not isinstance(registros, dict):
+        return None
+    total = len(registros)
+    if total < max(1, min_registros):
+        return None
+
+    detalle = {}
+    for canal in CANALES_COHORTE_HARDWARE:
+        fallos = sum(
+            1 for fila in registros.values()
+            if isinstance(fila, dict) and fila.get(canal) == "fuerte"
+        )
+        detalle[canal] = {
+            "pct": round(fallos / float(total), 4),
+            "registros_fuertes": fallos,
+        }
+
+    if not all(d["pct"] >= umbral for d in detalle.values()):
+        return None
+
+    pct_fz = detalle["FZ"]["pct"] * 100.0
+    pct_f2 = detalle["F2"]["pct"] * 100.0
+    texto = (
+        f"FZ y F2 aparecen como canal atipico fuerte en el {pct_fz:.0f} % y el "
+        f"{pct_f2:.0f} % de {total} registros procesados. Es un patron de "
+        "cohorte, no de preparacion individual: revisar la continuidad del "
+        "electrodo, el cable y el pin del conector (o probar con otro gorro) "
+        "antes de la proxima toma."
+    )
+    texto_corto = (
+        f"Cohorte FZ/F2: fallan como atipico fuerte en {pct_fz:.0f} % y "
+        f"{pct_f2:.0f} % de {total} registros procesados. Posible hardware "
+        "del conector: revisar electrodo, cable y pin (o probar otro gorro)."
+    )
+    return {
+        "alerta": "HARDWARE_CONECTOR_FZ_F2",
+        "registros": total,
+        "umbral": round(umbral, 4),
+        "min_registros": min_registros,
+        "canales": detalle,
+        "texto": texto,
+        "texto_corto": texto_corto,
+    }
+
+
+def registrar_y_evaluar_cohorte(ruta, id_registro, canales_fuertes,
+                                canales_sospechosos=None, umbral=None,
+                                min_registros=None, logger=None):
+    """
+    Actualiza el historial con el registro actual y devuelve la alerta de
+    cohorte (o None). Serializa la escritura para que dos hilos no pierdan
+    actualizaciones.
+    """
+    log = _mklogger(logger)
+    ruta = os.path.abspath(ruta)
+    base = os.path.dirname(ruta)
+
+    with _LOCK_COHORTE:
+        historial, _origen, advertencias = asegurar_historial_cohorte(
+            ruta=ruta, carpeta_base=base
+        )
+        for aviso in advertencias:
+            log(f"[Aviso] {aviso}")
+
+        actualizar_historial_cohorte(
+            historial, id_registro, canales_fuertes, canales_sospechosos
+        )
+        if not guardar_historial_cohorte(historial, ruta):
+            log(f"[Aviso] No se pudo guardar el historial de cohorte en: {ruta}")
+
+        return evaluar_alerta_cohorte(historial, umbral, min_registros)
+
+
+def _alerta_cohorte_para_cache(carpeta_archivo_cache, ruta_historial=None):
+    """Alerta de cohorte aplicable a una cache, sin efectos fuera de <base>."""
+    if ruta_historial is None:
+        base = _carpeta_base_desde_cache(carpeta_archivo_cache)
+        if base is None:
+            return None
+        ruta_historial = ruta_historial_cohorte(base)
+    try:
+        historial, _origen, _adv = asegurar_historial_cohorte(ruta=ruta_historial)
+        return evaluar_alerta_cohorte(historial)
+    except Exception:
+        return None
+
+
+def recomendaciones_adquisicion_desde_cache(carpeta_archivo_cache, nombres_canales=None,
+                                            ruta_historial_cohorte=None):
     """
     Devuelve las recomendaciones de adquisición de un registro: las guardadas
     en resumen_calidad.json o, si la caché es anterior, reconstruidas desde el
-    reporte del detector con la misma lógica. None si faltan datos.
+    reporte del detector con la misma lógica. Añade la alerta de cohorte FZ/F2
+    vigente (solo si la caché vive dentro de <base>/CACHE o se indica
+    ruta_historial_cohorte). None si faltan datos.
     """
+    def _con_alerta(rec):
+        if not isinstance(rec, dict):
+            return rec
+        alerta = _alerta_cohorte_para_cache(carpeta_archivo_cache, ruta_historial_cohorte)
+        if alerta:
+            rec = dict(rec)
+            rec["alerta_cohorte"] = alerta
+        return rec
+
     ruta_json = os.path.join(carpeta_archivo_cache, "calidad_senal", "resumen_calidad.json")
     resumen = {}
     if os.path.exists(ruta_json):
@@ -3240,7 +3627,7 @@ def recomendaciones_adquisicion_desde_cache(carpeta_archivo_cache, nombres_canal
         except Exception:
             resumen = {}
     if isinstance(resumen.get("recomendaciones_adquisicion"), dict):
-        return resumen["recomendaciones_adquisicion"]
+        return _con_alerta(resumen["recomendaciones_adquisicion"])
 
     if nombres_canales is None:
         nombres_canales = NOMBRES_CANALES_64
@@ -3252,10 +3639,11 @@ def recomendaciones_adquisicion_desde_cache(carpeta_archivo_cache, nombres_canal
         return None
     detalle, idx_f, idx_s = reconstruido
     snr = resumen.get("snr") if isinstance(resumen.get("snr"), dict) else {}
-    return diagnosticar_adquisicion(
+    rec = diagnosticar_adquisicion(
         detalle, nombres_canales, idx_f, idx_s, snr.get("snr_global_db"), None,
         pct_ruido_red=snr.get("pct_ruido_red"), snr_sin_red_db=snr.get("snr_sin_red_db"),
     )
+    return _con_alerta(rec)
 
 
 def diagnosticar_adquisicion(
@@ -3267,6 +3655,7 @@ def diagnosticar_adquisicion(
     porcentaje_varianza_ica=None,
     pct_ruido_red=None,
     snr_sin_red_db=None,
+    alerta_cohorte=None,
 ):
     """
     Traduce los canales atipicos de un registro a recomendaciones de protocolo.
@@ -3281,6 +3670,8 @@ def diagnosticar_adquisicion(
     - Interferencia de red: si la red es >= UMBRAL_INTERFERENCIA_RED_PCT del
       ruido, se recomienda corregirla y se informa la Confiabilidad que se
       obtendría sin ella (mismo cálculo con el SNR sin red).
+    - alerta_cohorte: aviso de hardware FZ/F2 calculado a partir del historial
+      de cohorte (se inyecta aparte para no duplicarlo en las acciones).
     """
     nombres = [limpiar_nombre_canal(n) for n in nombres_canales]
     n_total = len(nombres)
@@ -3398,6 +3789,7 @@ def diagnosticar_adquisicion(
         "para_alta": _minimo_para("ALTA"),
         "acciones_protocolo": acciones,
         "interferencia_red": interferencia,
+        "alerta_cohorte": alerta_cohorte,
         "pct_ruido_red": round(pct_red, 1) if pct_red is not None and np.isfinite(pct_red) else None,
         "nota": (
             "Recomendaciones técnicas de adquisición derivadas del detector de canales "
@@ -3657,6 +4049,8 @@ def calcular_resumen_calidad_senal(
     detalle_atipicos=None,
     idx_fuertes=None,
     idx_sospechosos=None,
+    ruta_historial_cohorte=None,
+    id_registro=None,
 ):
     """
     Calcula y guarda el resumen de calidad técnica de la señal.
@@ -3787,6 +4181,19 @@ def calcular_resumen_calidad_senal(
 
     # Recomendaciones de protocolo de adquisición (qué electrodos revisar,
     # por qué y cuántos corregir para subir la Confiabilidad).
+    alerta_cohorte = None
+    if ruta_historial_cohorte:
+        try:
+            alerta_cohorte = registrar_y_evaluar_cohorte(
+                ruta_historial_cohorte,
+                id_registro or os.path.basename(os.path.normpath(carpeta_cache)),
+                canales_atipicos,
+                canales_sospechosos,
+                logger=logger,
+            )
+        except Exception as e:
+            log(f"[Aviso] Historial de cohorte no actualizado: {e}")
+
     if detalle_atipicos is not None and idx_fuertes is not None:
         try:
             resumen["recomendaciones_adquisicion"] = diagnosticar_adquisicion(
@@ -3798,6 +4205,7 @@ def calcular_resumen_calidad_senal(
                 porcentaje_varianza_ica,
                 pct_ruido_red=resumen_snr.get("pct_ruido_red"),
                 snr_sin_red_db=resumen_snr.get("snr_sin_red_db"),
+                alerta_cohorte=alerta_cohorte,
             )
         except Exception as e:
             log(f"[Aviso] No se pudieron generar recomendaciones de adquisicion: {e}")
@@ -5434,9 +5842,17 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     except Exception as e:
         log(f"[Aviso] Sin recomendaciones de adquisicion: {e}")
     if isinstance(recomendaciones, dict) and (
-        recomendaciones.get("electrodos_a_revisar") or recomendaciones.get("interferencia_red")
+        recomendaciones.get("electrodos_a_revisar")
+        or recomendaciones.get("interferencia_red")
+        or recomendaciones.get("alerta_cohorte")
     ):
         pdf.add_block_title("Recomendaciones de adquisición")
+        if recomendaciones.get("alerta_cohorte"):
+            pdf.add_wrapped_text(
+                "Aviso de cohorte FZ/F2: "
+                + recomendaciones["alerta_cohorte"].get("texto", ""),
+                font_size=10.2,
+            )
         pm, pa = recomendaciones.get("para_media"), recomendaciones.get("para_alta")
         partes = [f"Confiabilidad actual de los biomarcadores: {recomendaciones.get('confiabilidad_actual', 'N/D')}."]
         if pm and pm.get("electrodos"):
@@ -6379,6 +6795,8 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
         detalle_atipicos=detalle_malos,
         idx_fuertes=idx_fuertes,
         idx_sospechosos=idx_sospechosos,
+        ruta_historial_cohorte=os.path.join(carpeta_base, NOMBRE_ARCHIVO_COHORTE),
+        id_registro=os.path.basename(os.path.normpath(rutas["archivo"])),
     )
     log("[OK] Calidad tecnica de senal calculada.")
 

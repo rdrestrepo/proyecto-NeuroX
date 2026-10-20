@@ -97,7 +97,7 @@ Cobertura:
 
 **Resultado:** 30/30 pruebas OK y `py_compile` OK (`VERIFICACION_SINTACTICA_OK`). Ejecución: `python -m unittest discover -s tests -p "test_*.py" -v`.
 
-**Aprendizaje:** en `reporte_canales_atipicos.txt` el canal va en base 1 (`Canal 07` = índice 6 = `F5`); una expectativa de fixture asumió `F7` y la prueba lo detectó. La alerta de hardware de cohorte FZ/F2 sigue pendiente (T-3): la prueba deja documentado que hoy 2/64 no dispara el patrón sistémico del 20 %.
+**Aprendizaje:** en `reporte_canales_atipicos.txt` el canal va en base 1 (`Canal 07` = índice 6 = `F5`); una expectativa de fixture asumió `F7` y la prueba lo detectó. La alerta de hardware de cohorte FZ/F2 quedó implementada en T-3; la prueba deja documentado que hoy 2/64 no dispara el patrón sistémico del 20 %.
 
 ### T-2 — Umbrales de adquisición configurables (2026-10-20)
 
@@ -124,6 +124,30 @@ Los dos umbrales del diagnóstico de adquisición dejaron de estar hardcodeados.
 **Resultado:** 64/64 pruebas OK (30 de T-1 + 34 de T-2) y `VERIFICACION_SINTACTICA_OK`.
 
 **Pendiente de T-2:** no se muestra un aviso visual si `config.json` es inválido; las advertencias quedan disponibles en `CONFIG_ADQUISICION_ADVERTENCIAS` para diagnóstico (se documentará en T-6).
+
+### T-3 — Alerta de cohorte FZ/F2 (2026-10-20)
+
+FZ y F2 comparten pines contiguos en el conector. Si fallan como canal atípico fuerte en casi todos los registros, el problema es del gorro/cable/pin y no de la preparación de cada paciente. T-3 convierte esa observación en un aviso automático, sin reprocesar señales:
+
+- **Historial persistente:** `<carpeta_datos>/cohorte_fz_f2.json`. Guarda, por registro (clave = nombre de la carpeta de `CACHE`), qué canales de interés fallaron y en qué nivel:
+  ```json
+  {"version": 1, "actualizado": "2026-10-20T10:50:24",
+   "registros": {"DCL_003": {"FZ": "fuerte", "F2": "fuerte"},
+                 "DCL_004": {"FZ": "sospechoso", "F2": "fuerte"}}}
+  ```
+  Solo conserva `FZ`/`F2`; el nivel `fuerte` prevalece sobre `sospechoso`. Es **idempotente**: reprocesar un archivo reemplaza su entrada y no infla los conteos.
+- **Reconstrucción inicial:** si el historial no existe (o está corrupto), se arma leyendo los `calidad_senal/resumen_calidad.json` ya presentes en `CACHE`. No requiere reprocesar. Un historial válido no se vuelve a escanear.
+- **Escritura segura:** `tmp` + `os.replace` (atómico en Windows), serializada con `threading.Lock` para que dos hilos no pierdan actualizaciones. Si la escritura falla, el archivo anterior queda intacto y la alerta se evalúa igualmente en memoria.
+- **Criterio de alerta:** se exige que **ambos** canales superen el umbral de fallo fuerte (no basta uno) y que haya al menos `min_registros_cohorte` registros. Los sospechosos no cuentan. Texto descriptivo: “patrón de cohorte, no de preparación individual”; nunca afirma diagnóstico ni certeza de hardware.
+- **Configuración** (`config.json → adquisicion`): `umbral_patron_cohorte_fz_f2` (fracción 0–1, default `0.80`) y `min_registros_cohorte` (entero, default `20`, rango 1–100000). El loader de T-2 ahora valida enteros: `20.5` se rechaza con advertencia y cae al default.
+- **Integración:** `diagnosticar_adquisicion()` devuelve `alerta_cohorte` como campo propio (no se duplica en `acciones_protocolo`). El PDF imprime “Aviso de cohorte FZ/F2” y el inspector usa un texto corto. `recomendaciones_adquisicion_desde_cache()` inyecta la alerta vigente si la caché vive dentro de `<base>/CACHE`; no modifica el `resumen_calidad.json` original.
+- **Alcance:** la alerta describe la cohorte de registros procesados, sin ventana temporal; no sustituye la inspección del hardware ni cambia las métricas qEEG del registro.
+
+**Hallazgo real (136 registros con calidad completa):** FZ falla como fuerte en **121/136 (89 %)** y F2 en **124/136 (91 %)**. La alerta se activa con los defaults. El historial quedó creado en `Ejecutar/cohorte_fz_f2.json` (12 KB).
+
+**Pruebas:** `tests/test_cohorte_fz_f2.py` (52 pruebas): rutas/config, carga tolerante (BOM, corrupto, estructura inválida, solo FZ/F2), actualización idempotente y reemplazo, guardado atómico y conservación del original ante fallo, reconstrucción desde cachés, recuperación de historial corrupto, evaluación (mínimo, un solo canal, límite 80 %, sospechosos), registro por hilo, inyección en cachés y extensión entera de config.
+
+**Resultado:** 116/116 pruebas OK (30 T-1 + 34 T-2 + 52 T-3) y `VERIFICACION_SINTACTICA_OK`.
 
 ### Identidad de commits
 
@@ -192,7 +216,7 @@ Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevi
 ## Próximos Pasos
 
 **Pendiente para que la Confiabilidad llegue a MEDIA/ALTA (Mejora 1).** El software ya diagnostica; lo que falta se corrige en la adquisición:
-- [ ] **Revisar FZ y F2 en el hardware:** medir continuidad del electrodo, cable y pin del conector, o probar con otro gorro. Mientras no se reparen seguirán saliendo atípicos en casi todas las tomas.
+- [ ] **Revisar FZ y F2 en el hardware:** medir continuidad del electrodo, cable y pin del conector, o probar con otro gorro. T-3 ya lo detecta automáticamente (121/136 y 124/136 con los defaults); mientras no se reparen seguirán saliendo atípicos en casi todas las tomas.
 - [ ] **Eliminar la interferencia de red:** GND del paciente y del amplificador al mismo punto, impedancia de REF/GND igual a la de los demás, alejar cargadores/monitores/lámparas, no cruzar cables de electrodos con los de alimentación. Es la corrección de mayor impacto (17 registros saldrían de NULA sin tocar electrodos).
 - [ ] **Aplicar las acciones del informe antes de cada toma** (reabrasionar y renovar gel en electrodos con ruido HF, limpiar puentes de gel, fijar cables) y verificar impedancias antes de grabar.
 - [ ] **Medir el efecto:** tras corregir hardware y red, grabar nuevos registros y comparar la distribución de Confiabilidad contra la línea base (5/25/36/85).
@@ -203,7 +227,7 @@ Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevi
 **Plan de recomendaciones (T-1…T-6):**
 - [x] **T-1 — Tests del diagnóstico de adquisición:** `tests/test_adquisicion.py`, 30/30 OK.
 - [x] **T-2 — Parametrizar umbrales** (`config.json`): loader tolerante + 34 pruebas; defaults 30.0 / 0.20 intactos.
-- [ ] **T-3 — Alerta de cohorte FZ/F2** (hardware de conector) en pipeline, PDF e inspector.
+- [x] **T-3 — Alerta de cohorte FZ/F2** (posible hardware del conector) en pipeline, PDF e inspector: historial persistente e idempotente, reconstrucción desde `CACHE`, 52 pruebas. Detecta 89 %/91 % en los 136 registros actuales.
 - [ ] **T-4 — Evaluar `snr_sin_red_db` en la Confiabilidad** (flag configurable, requiere acuerdo del equipo).
 - [ ] **T-5 — Regresión end-to-end** con cachés de referencia.
 - [ ] **T-6 — Documentar configuración y umbrales** en MEMORY (incluye visibilidad de advertencias de `config.json`).

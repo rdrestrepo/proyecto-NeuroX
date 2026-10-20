@@ -2192,6 +2192,12 @@ class AppEEG:
         self.lbl_insp_adq_resumen.config(text=" ".join(partes))
 
         avisos = []
+        if rec.get("alerta_cohorte"):
+            alerta_cohorte = rec["alerta_cohorte"]
+            avisos.append(
+                alerta_cohorte.get("texto_corto")
+                or alerta_cohorte.get("texto", "")
+            )
         if rec.get("interferencia_red"):
             avisos.append(rec["interferencia_red"]["texto"] + " Revisar tierra (GND), REF y fuentes eléctricas cercanas.")
         if rec.get("patron_sistemico"):
