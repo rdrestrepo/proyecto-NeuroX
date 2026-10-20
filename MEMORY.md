@@ -149,6 +149,30 @@ FZ y F2 comparten pines contiguos en el conector. Si fallan como canal atípico 
 
 **Resultado:** 116/116 pruebas OK (30 T-1 + 34 T-2 + 52 T-3) y `VERIFICACION_SINTACTICA_OK`.
 
+### T-5 — Regresión end-to-end (2026-10-20)
+
+Protege el flujo completo (`procesar_archivo` → `CACHE` → `generar_informe_desde_cache` → PDF) contra cambios no intencionales de resultados. Todo corre en carpetas temporales: **no toca la `CACHE` ni los informes del usuario**.
+
+- **`tests/regresion_e2e.py`** (utilidades, no se descubre como test):
+  - `generar_registro_sintetico()`: par `.dat/.dap` determinista (misma semilla = mismos bytes; FLOAT32, orden SAMP, 64 EEG + 5 auxiliares, 500 Hz, 120 s). Fondo 1/f con vecinos correlacionados, alfa de 10 Hz con **gradiente antero-posterior suave**, theta frontal, parpadeos en FP/AF, red de 60 Hz y tres defectos inyectados: **T7** ruido de alta frecuencia, **PO7** casi plano (×0.02), **C4** electrodo suelto (×5 + ruido).
+  - `extraer_huella()`: resumen plano de la caché: bandas globales y regionales, ratios (media de cocientes y `cociente_medias`), semáforos, PAF global/occipital, gradiente AP, alfa occipital/frontal, canales atípicos/sospechosos, estado global, Confiabilidad, SNR, `pct_ruido_red`, `snr_sin_red_db`, varianza ICA y recomendaciones de adquisición.
+  - `comparar_huellas()`: tolerancias por tipo (bandas ±0.5 pp global y ±1.0 pp regional, ratios y gradiente ±3 % relativo, PAF ±0.15 Hz, SNR ±0.1 dB, red ±0.5 pp, ICA ±2 pp). **Categorías, listas de canales y conteos se comparan exactos.**
+- **`tests/test_regresion_e2e.py`** (19 pruebas): comparador (7), generador determinista y legible por `cargar_datos_eeg` (2), flujo completo del sintético (9: estructura de caché, huella = referencia, detección de T7/PO7/C4, PAF ≈ 10 Hz, alfa occipital > frontal, bandas ≈ 100 %, red ≥ 30 %, PDF con sus secciones, nada fuera del temporal) y registros reales (1, opcional).
+- **Referencias:** `tests/referencias/e2e_sintetico.json` y `tests/referencias/e2e_reales.json` (huellas de `DCL 003/007/024/083/138`, solo métricas derivadas; no contienen señal).
+- **Uso:**
+  - Normal (~1 min): `python -m unittest discover -s tests -p "test_*.py" -v`
+  - Con registros reales (~5 min): definir `NEUROX_DATOS_REGRESION=<carpeta datosTodos>`.
+  - Saltar las pruebas lentas: `NEUROX_SALTAR_E2E=1`.
+  - **Regenerar referencias solo tras un cambio intencional de resultados**: `python tests/regresion_e2e.py --actualizar [--reales <carpeta>]`, y explicar en el commit por qué cambian.
+
+**Resultado:** 135/135 pruebas OK (116 previas + 19 de T-5), incluidos los 5 registros reales. **Verificación de sensibilidad:** mover el inicio de Alfa de 8.0 a 8.5 Hz (en memoria) produjo 15 diferencias detectadas (Alfa global −1.5 pp), así que la regresión no es complaciente.
+
+**Aprendizajes del sintético:**
+- El detector **nunca marca como fuerte un canal solo por amplitud** (diseño intencional: exige además rareza espectral). Un canal ×6 con espectro normal no se detecta.
+- La parte del alfa común a todos los canales la elimina el CAR; para subir el alfa hay que darle estructura espacial.
+- Un alfa posterior concentrado en pocos canales hace que el detector los marque como `alfa_dominante` (lo mismo ocurre en registros reales: es la 4.ª causa de fallo). Un gradiente suave lo evita.
+- Elegir valores lejos de los cortes clínicos: con Lentificación = 1.342 (corte 1.35) cualquier variación numérica entre equipos cambiaría el semáforo y la prueba sería inestable.
+
 ### Identidad de commits
 
 Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevin.yepez@unisimon.edu.co>` se reescribieron a `Kypez-dev <322148154+Kypez-dev@users.noreply.github.com>` (correo *noreply* oficial de la cuenta GitHub `Kypez-dev`, ID 322148154), con `git filter-branch` y `--force-with-lease`. Respaldo del historial anterior en la rama `backup/pre-rewrite-20261019`. La configuración `user.name`/`user.email` quedó fijada en local y global (`user.useConfigOnly = true`) para que también la use VS Code.
@@ -229,7 +253,7 @@ Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevi
 - [x] **T-2 — Parametrizar umbrales** (`config.json`): loader tolerante + 34 pruebas; defaults 30.0 / 0.20 intactos.
 - [x] **T-3 — Alerta de cohorte FZ/F2** (posible hardware del conector) en pipeline, PDF e inspector: historial persistente e idempotente, reconstrucción desde `CACHE`, 52 pruebas. Detecta 89 %/91 % en los 136 registros actuales.
 - [ ] **T-4 — Evaluar `snr_sin_red_db` en la Confiabilidad** (flag configurable, requiere acuerdo del equipo).
-- [ ] **T-5 — Regresión end-to-end** con cachés de referencia.
+- [x] **T-5 — Regresión end-to-end:** registro sintético + 5 reales contra huellas de referencia (`tests/test_regresion_e2e.py`, 19 pruebas; 135/135 OK).
 - [ ] **T-6 — Documentar configuración y umbrales** en MEMORY (incluye visibilidad de advertencias de `config.json`).
 
 **Otros:**
