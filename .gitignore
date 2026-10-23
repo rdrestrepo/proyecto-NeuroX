@@ -7,3 +7,14 @@ CACHE/
 *.npy
 *.exe
 __pycache__/
+# Pruebas y datos: se conservan solo en local
+tests/
+Ejecutar/
+
+# Registros y artefactos del equipo de adquisicion
+*.dap
+*.rs3
+*.ceo
+*.bdf
+*.edf
+*.log
