@@ -1,7 +1,7 @@
 # MEMORY.md — NeuroX
 
 ## Estado Actual
-- **Sincronización (2026-10-19):** la raíz del proyecto y `proyecto-NeuroX/` son idénticas, en el commit `b74cc11` (`main == origin/main`). Los commits se firman como `Kypez-dev <322148154+Kypez-dev@users.noreply.github.com>`; el historial previo quedó respaldado en `backup/pre-rewrite-20261019`.
+- **Sincronización (2026-10-23):** la raíz del proyecto y `proyecto-NeuroX/` son idénticas y `main == origin/main` (tras T-5 y la higiene del repositorio, ver más abajo). Los commits se firman como `Kypez-dev <322148154+Kypez-dev@users.noreply.github.com>`; el historial previo a la reescritura quedó respaldado en la rama `backup/pre-rewrite-20261019`.
 - **Pipeline biofísico operativo:** Motor clínico implementado en `pipeline_eeg_completo.py` con acondicionamiento pasa-banda ($1.0\text{–}40\text{ Hz}$), notch a $60\text{ Hz}$ y eliminación de deriva lineal (`detrend`).
 - **Limpieza de artefactos:**
   - Detección estadística robusta de canales malos (`detectar_canales_atipicos`) usando Z-score robusto (MAD).
@@ -172,6 +172,14 @@ Protege el flujo completo (`procesar_archivo` → `CACHE` → `generar_informe_d
 - La parte del alfa común a todos los canales la elimina el CAR; para subir el alfa hay que darle estructura espacial.
 - Un alfa posterior concentrado en pocos canales hace que el detector los marque como `alfa_dominante` (lo mismo ocurre en registros reales: es la 4.ª causa de fallo). Un gradiente suave lo evita.
 - Elegir valores lejos de los cortes clínicos: con Lentificación = 1.342 (corte 1.35) cualquier variación numérica entre equipos cambiaría el semáforo y la prueba sería inestable.
+
+### Higiene del repositorio (2026-10-23)
+
+- **Pruebas fuera de Git:** `tests/` se retiró del índice (`git rm --cached`) y se añadió a `.gitignore`. Los archivos siguen en disco en `proyecto-NeuroX/tests/` (y se copiaron a la raíz para poder ejecutar la suite completa desde el directorio de trabajo). El historial conserva las versiones de T-1, T-2, T-3 y T-5; se pueden recuperar con `git checkout <commit> -- tests`.
+- **Datos fuera de Git:** `Ejecutar/` también salió del índice (incluía `DCL 003.dap` y un PDF de ejemplo, ~5 MB de registro médico). Se ignoran además `*.dap`, `*.rs3`, `*.ceo`, `*.bdf`, `*.edf` y `*.log`, que antes podían colarse porque solo `*.dat` estaba excluido.
+- **Temporales eliminados de la raíz:** `comprehensive_fix.py`, `pipeline_eeg_completo.py.git`, `pipeline_eeg_completo.py.original`, `proyecto-NeuroX_BACKUP_20261014_0925/` y los `__pycache__/`.
+- **Verificación:** suite completa desde la raíz del proyecto → **135 pruebas OK, 1 omitida** (la de registros reales, que exige `NEUROX_DATOS_REGRESION`), en ~20 s; código de salida 0.
+- **Lección:** `git rm --cached` deja los archivos locales intactos; fue la vía segura para dejar de versionar datos clínicos sin borrarlos.
 
 ### Identidad de commits
 
