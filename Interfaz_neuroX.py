@@ -1141,9 +1141,6 @@ class AppEEG:
         )
         self.frm_resumen_calidad_grafica.pack(fill=tk.X)
 
-        ## Recomendaciones de adquisición para la próxima toma
-        self._crear_bloque_adquisicion_inspector(self.panel_izq_grafica)
-
         self.frame_mapa = ttk.LabelFrame(
             self.panel_izq_grafica,
             text="Mapa regional",
@@ -2143,129 +2140,6 @@ class AppEEG:
             lbl.pack(side=tk.LEFT)
             self._insp_lbl_bandas[b] = lbl
 
-    def _crear_bloque_adquisicion_inspector(self, parent):
-        """Electrodos a corregir antes de la próxima toma y cuánto sube la Confiabilidad."""
-        frame = ttk.LabelFrame(parent, text="Adquisición · próxima toma", padding=10, style="Card.TLabelframe")
-        frame.pack(fill=tk.X, pady=(0, 8))
-        body = self._hacer_colapsable(frame)
-        self.lbl_insp_adq_resumen = ttk.Label(body, text="--", wraplength=285, justify="left")
-        self.lbl_insp_adq_resumen.pack(fill=tk.X)
-        self.lbl_insp_adq_patron = tk.Label(
-            body, text="", wraplength=285, justify="left", anchor="w",
-            font=(self.fuente_ui, 8, "bold"), bg="#FDF1DC", fg="#9A6400", padx=6, pady=4,
-        )
-        self.frm_insp_adq_lista = ttk.Frame(body, style="Sidebar.TFrame")
-        self.frm_insp_adq_lista.pack(fill=tk.X, pady=(6, 0))
-        self.lbl_insp_adq_config = ttk.Label(
-            body, text="", wraplength=285, justify="left", style="Subtle.TLabel"
-        )
-        self.lbl_insp_adq_config.pack(fill=tk.X, pady=(6, 0))
-
-    def _actualizar_adquisicion_inspector(self):
-        """Recomendaciones de adquisición del registro activo."""
-        if not hasattr(self, "frm_insp_adq_lista"):
-            return
-        for w in self.frm_insp_adq_lista.winfo_children():
-            w.destroy()
-        self.lbl_insp_adq_patron.pack_forget()
-        self.lbl_insp_adq_resumen.config(text="Sin datos procesados.")
-        if hasattr(self, "lbl_insp_adq_config"):
-            self.lbl_insp_adq_config.config(text="")
-        if not self.cache_ultimo:
-            return
-
-        try:
-            from pipeline_eeg_completo import (
-                config_adquisicion_desde_cache,
-                recomendaciones_adquisicion_desde_cache,
-            )
-        except Exception as e:
-            self.log(f"[Aviso] No se pudo cargar el módulo del pipeline: {e}")
-            return
-
-        # Configuración aplicada (T-6): se muestra aunque la caché aún no
-        # tenga recomendaciones, para que un config.json inválido no pase
-        # desapercibido al técnico.
-        try:
-            info_cfg = config_adquisicion_desde_cache(self.cache_ultimo)
-        except Exception as e:
-            info_cfg = None
-            self.log(f"[Aviso] Configuración de adquisición no disponible: {e}")
-
-        avisos = []
-        if isinstance(info_cfg, dict) and hasattr(self, "lbl_insp_adq_config"):
-            umbrales = info_cfg.get("umbrales") or {}
-            try:
-                linea_cfg = (
-                    f"Config: red {float(umbrales.get('umbral_interferencia_red_pct', 30.0)):.0f} % · "
-                    f"sistémico {float(umbrales.get('umbral_patron_sistemico', 0.20)) * 100:.0f} % · "
-                    f"cohorte {float(umbrales.get('umbral_patron_cohorte_fz_f2', 0.80)) * 100:.0f} % · "
-                    f"mín. {int(umbrales.get('min_registros_cohorte', 20))} · "
-                    f"SNR {'sin' if umbrales.get('usar_snr_sin_red_en_confiabilidad', True) else 'con'} red"
-                )
-            except (TypeError, ValueError):
-                linea_cfg = "Config: no se pudo interpretar config.json."
-            if not info_cfg.get("guardada_en_cache"):
-                linea_cfg += " (vigente; caché sin snapshot)"
-            self.lbl_insp_adq_config.config(text=linea_cfg)
-            if info_cfg.get("advertencias"):
-                avisos.append(
-                    "Configuración: " + " ".join(str(a) for a in info_cfg["advertencias"])
-                )
-
-        try:
-            rec = recomendaciones_adquisicion_desde_cache(self.cache_ultimo, self.nombres_canales)
-        except Exception as e:
-            rec = None
-            self.log(f"[Aviso] Recomendaciones de adquisición no disponibles: {e}")
-
-        if isinstance(rec, dict):
-            pm, pa = rec.get("para_media"), rec.get("para_alta")
-            sufijo_snr = " (SNR sin red)" if rec.get("confiabilidad_snr_fuente") == "snr_sin_red_db" else ""
-            partes = [f"Confiabilidad actual: {rec.get('confiabilidad_actual', '--')}{sufijo_snr}."]
-            if pm and pm.get("electrodos"):
-                partes.append(f"Para MEDIA: corregir {pm['electrodos']} electrodo(s).")
-            if pa and pa.get("electrodos"):
-                partes.append(f"Para ALTA: {pa['electrodos']}.")
-            if pm is None:
-                partes.append("Ni MEDIA ni ALTA se alcanzan solo con electrodos: limita el SNR.")
-            elif pa is None:
-                partes.append("ALTA no se alcanza solo con electrodos: limita el SNR.")
-            if not rec.get("electrodos_a_revisar"):
-                partes.append("No hay electrodos que revisar.")
-            self.lbl_insp_adq_resumen.config(text=" ".join(partes))
-
-            if rec.get("alerta_cohorte"):
-                alerta_cohorte = rec["alerta_cohorte"]
-                avisos.append(
-                    alerta_cohorte.get("texto_corto")
-                    or alerta_cohorte.get("texto", "")
-                )
-            if rec.get("interferencia_red"):
-                avisos.append(rec["interferencia_red"]["texto"] + " Revisar tierra (GND), REF y fuentes eléctricas cercanas.")
-            if rec.get("patron_sistemico"):
-                avisos.append(rec["patron_sistemico"]["texto"])
-
-        if avisos:
-            self.lbl_insp_adq_patron.config(text="\n\n".join(avisos))
-            self.lbl_insp_adq_patron.pack(fill=tk.X, pady=(6, 0), before=self.frm_insp_adq_lista)
-
-        if not isinstance(rec, dict):
-            return
-
-        electrodos = rec.get("electrodos_a_revisar", [])
-        for e in electrodos[:8]:
-            fila = ttk.Frame(self.frm_insp_adq_lista, style="Sidebar.TFrame")
-            fila.pack(fill=tk.X, pady=1)
-            color = "#B42D2D" if e["nivel"] == "atipico" else "#9A6400"
-            tk.Label(fila, text=e["canal"], width=5, anchor="w", bg=FONDO_PANEL, fg=color,
-                     font=(self.fuente_ui, 9, "bold")).pack(side=tk.LEFT)
-            ttk.Label(fila, text=e["descripcion"], style="Sidebar.TLabel").pack(side=tk.LEFT)
-        restantes = len(electrodos) - 8
-        if restantes > 0:
-            ttk.Label(self.frm_insp_adq_lista, text=f"Y {restantes} más (ver informe PDF).",
-                      style="Subtle.TLabel").pack(anchor="w", pady=(2, 0))
-
     def _aplicar_chip_semaforo(self, chip, color_semaforo, texto):
         estilos = {
             "green": ("#1F7A4A", "#E5F4EC"),
@@ -2340,7 +2214,6 @@ class AppEEG:
                 lbl_valor.config(text=f"{float(valor):.2f}")
                 self._aplicar_chip_semaforo(chip, semaforo.get("color"), semaforo.get("estado", ""))
 
-        self._actualizar_adquisicion_inspector()
         self._dibujar_barra_bandas()
 
     def _dibujar_barra_bandas(self):

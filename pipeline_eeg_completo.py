@@ -3662,8 +3662,7 @@ def evaluar_alerta_cohorte(historial, umbral=None, min_registros=None):
         f"FZ y F2 aparecen como canal atipico fuerte en el {pct_fz:.0f} % y el "
         f"{pct_f2:.0f} % de {total} registros procesados. Es un patron de "
         "cohorte, no de preparacion individual: revisar la continuidad del "
-        "electrodo, el cable y el pin del conector (o probar con otro gorro) "
-        "antes de la proxima toma."
+        "electrodo, el cable y el pin del conector (o probar con otro gorro)."
     )
     texto_corto = (
         f"Cohorte FZ/F2: fallan como atipico fuerte en {pct_fz:.0f} % y "
@@ -3914,7 +3913,7 @@ def diagnosticar_adquisicion(
                 f"La red eléctrica es el {pct_red:.0f} % del ruido de alta frecuencia. "
                 f"La Confiabilidad ya se calcula sin ese ruido (SNR sin red: {snr_sr:.1f} dB); "
                 "corregir la tierra (GND), la impedancia de REF y las fuentes cercanas "
-                "sigue siendo recomendable para la próxima toma."
+                "sigue siendo recomendable."
             )
         elif snr_db is not None:
             texto_red = (
@@ -3958,8 +3957,7 @@ def diagnosticar_adquisicion(
         "pct_ruido_red": round(pct_red, 1) if pct_red is not None and np.isfinite(pct_red) else None,
         "nota": (
             "Recomendaciones técnicas de adquisición derivadas del detector de canales "
-            "atípicos. No modifican el análisis de este registro: aplican a la próxima "
-            "toma o a la nueva preparación antes de grabar."
+            "atípicos. No modifican el análisis de este registro."
         ),
     }
 
@@ -4395,7 +4393,7 @@ def calcular_resumen_calidad_senal(
             log(f"[Aviso] No se pudieron generar recomendaciones de adquisicion: {e}")
 
     # Trazabilidad (T-6): qué configuración se aplicó al procesar este
-    # registro. El PDF y el inspector la muestran tal cual, de modo que un
+    # registro. El PDF la muestra tal cual, de modo que un
     # cambio posterior de config.json no reescribe la historia del informe.
     resumen["config_adquisicion"] = {
         "ruta": CONFIG_ADQUISICION_RUTA,
@@ -6027,58 +6025,6 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
         pdf.add_wrapped_text(info_calidad["texto_canales"], font_size=10.2)
     else:
         pdf.add_wrapped_text(str(info_calidad), font_size=10.2)
-
-    # Recomendaciones de protocolo: qué electrodos revisar en la próxima toma.
-    recomendaciones = None
-    try:
-        recomendaciones = recomendaciones_adquisicion_desde_cache(carpeta_archivo_cache, nombres_canales)
-    except Exception as e:
-        log(f"[Aviso] Sin recomendaciones de adquisicion: {e}")
-    if isinstance(recomendaciones, dict) and (
-        recomendaciones.get("electrodos_a_revisar")
-        or recomendaciones.get("interferencia_red")
-        or recomendaciones.get("alerta_cohorte")
-    ):
-        pdf.add_block_title("Recomendaciones de adquisición")
-        if recomendaciones.get("alerta_cohorte"):
-            pdf.add_wrapped_text(
-                "Aviso de cohorte FZ/F2: "
-                + recomendaciones["alerta_cohorte"].get("texto", ""),
-                font_size=10.2,
-            )
-        pm, pa = recomendaciones.get("para_media"), recomendaciones.get("para_alta")
-        partes = [f"Confiabilidad actual de los biomarcadores: {recomendaciones.get('confiabilidad_actual', 'N/D')}."]
-        if pm and pm.get("electrodos"):
-            partes.append(
-                f"Para llegar a MEDIA habría que corregir {pm['electrodos']} electrodo(s): "
-                f"{', '.join(pm['canales'])}."
-            )
-        if pa and pa.get("electrodos"):
-            partes.append(f"Para llegar a ALTA, {pa['electrodos']} electrodo(s).")
-        if pm is None:
-            partes.append("Ni MEDIA ni ALTA se alcanzan solo corrigiendo electrodos: el SNR crudo del registro lo limita.")
-        elif pa is None:
-            partes.append("ALTA no se alcanza solo corrigiendo electrodos: el SNR crudo del registro lo limita.")
-        if recomendaciones.get("interferencia_red"):
-            partes.append(recomendaciones["interferencia_red"]["texto"])
-        pdf.add_wrapped_text(" ".join(partes), font_size=10.2)
-        filas_rec = [
-            [e["canal"], "Atípico" if e["nivel"] == "atipico" else "Sospechoso", e["descripcion"]]
-            for e in recomendaciones["electrodos_a_revisar"][:12]
-        ]
-        if filas_rec:
-            pdf.add_visual_table(
-                headers=["Electrodo", "Nivel", "Problema detectado"],
-                rows=filas_rec,
-                col_widths=[26, 28, 92],
-                alignments=["C", "C", "L"],
-            )
-        acciones = recomendaciones.get("acciones_protocolo") or []
-        if acciones:
-            pdf.add_wrapped_text(
-                "Acciones para la próxima adquisición: " + " ".join(f"({i}) {a}" for i, a in enumerate(acciones, 1)),
-                font_size=9.8,
-            )
 
     # Configuración aplicada (T-6): trazabilidad de los umbrales y del cargador.
     info_config = config_adquisicion_desde_cache(carpeta_archivo_cache)
