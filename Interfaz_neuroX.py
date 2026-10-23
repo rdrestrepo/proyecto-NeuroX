@@ -2156,6 +2156,10 @@ class AppEEG:
         )
         self.frm_insp_adq_lista = ttk.Frame(body, style="Sidebar.TFrame")
         self.frm_insp_adq_lista.pack(fill=tk.X, pady=(6, 0))
+        self.lbl_insp_adq_config = ttk.Label(
+            body, text="", wraplength=285, justify="left", style="Subtle.TLabel"
+        )
+        self.lbl_insp_adq_config.pack(fill=tk.X, pady=(6, 0))
 
     def _actualizar_adquisicion_inspector(self):
         """Recomendaciones de adquisición del registro activo."""
@@ -2165,46 +2169,89 @@ class AppEEG:
             w.destroy()
         self.lbl_insp_adq_patron.pack_forget()
         self.lbl_insp_adq_resumen.config(text="Sin datos procesados.")
+        if hasattr(self, "lbl_insp_adq_config"):
+            self.lbl_insp_adq_config.config(text="")
         if not self.cache_ultimo:
             return
 
         try:
-            from pipeline_eeg_completo import recomendaciones_adquisicion_desde_cache
+            from pipeline_eeg_completo import (
+                config_adquisicion_desde_cache,
+                recomendaciones_adquisicion_desde_cache,
+            )
+        except Exception as e:
+            self.log(f"[Aviso] No se pudo cargar el módulo del pipeline: {e}")
+            return
+
+        # Configuración aplicada (T-6): se muestra aunque la caché aún no
+        # tenga recomendaciones, para que un config.json inválido no pase
+        # desapercibido al técnico.
+        try:
+            info_cfg = config_adquisicion_desde_cache(self.cache_ultimo)
+        except Exception as e:
+            info_cfg = None
+            self.log(f"[Aviso] Configuración de adquisición no disponible: {e}")
+
+        avisos = []
+        if isinstance(info_cfg, dict) and hasattr(self, "lbl_insp_adq_config"):
+            umbrales = info_cfg.get("umbrales") or {}
+            try:
+                linea_cfg = (
+                    f"Config: red {float(umbrales.get('umbral_interferencia_red_pct', 30.0)):.0f} % · "
+                    f"sistémico {float(umbrales.get('umbral_patron_sistemico', 0.20)) * 100:.0f} % · "
+                    f"cohorte {float(umbrales.get('umbral_patron_cohorte_fz_f2', 0.80)) * 100:.0f} % · "
+                    f"mín. {int(umbrales.get('min_registros_cohorte', 20))} · "
+                    f"SNR {'sin' if umbrales.get('usar_snr_sin_red_en_confiabilidad', True) else 'con'} red"
+                )
+            except (TypeError, ValueError):
+                linea_cfg = "Config: no se pudo interpretar config.json."
+            if not info_cfg.get("guardada_en_cache"):
+                linea_cfg += " (vigente; caché sin snapshot)"
+            self.lbl_insp_adq_config.config(text=linea_cfg)
+            if info_cfg.get("advertencias"):
+                avisos.append(
+                    "Configuración: " + " ".join(str(a) for a in info_cfg["advertencias"])
+                )
+
+        try:
             rec = recomendaciones_adquisicion_desde_cache(self.cache_ultimo, self.nombres_canales)
         except Exception as e:
             rec = None
             self.log(f"[Aviso] Recomendaciones de adquisición no disponibles: {e}")
-        if not isinstance(rec, dict):
-            return
 
-        pm, pa = rec.get("para_media"), rec.get("para_alta")
-        partes = [f"Confiabilidad actual: {rec.get('confiabilidad_actual', '--')}."]
-        if pm and pm.get("electrodos"):
-            partes.append(f"Para MEDIA: corregir {pm['electrodos']} electrodo(s).")
-        if pa and pa.get("electrodos"):
-            partes.append(f"Para ALTA: {pa['electrodos']}.")
-        if pm is None:
-            partes.append("Ni MEDIA ni ALTA se alcanzan solo con electrodos: limita el SNR.")
-        elif pa is None:
-            partes.append("ALTA no se alcanza solo con electrodos: limita el SNR.")
-        if not rec.get("electrodos_a_revisar"):
-            partes.append("No hay electrodos que revisar.")
-        self.lbl_insp_adq_resumen.config(text=" ".join(partes))
+        if isinstance(rec, dict):
+            pm, pa = rec.get("para_media"), rec.get("para_alta")
+            sufijo_snr = " (SNR sin red)" if rec.get("confiabilidad_snr_fuente") == "snr_sin_red_db" else ""
+            partes = [f"Confiabilidad actual: {rec.get('confiabilidad_actual', '--')}{sufijo_snr}."]
+            if pm and pm.get("electrodos"):
+                partes.append(f"Para MEDIA: corregir {pm['electrodos']} electrodo(s).")
+            if pa and pa.get("electrodos"):
+                partes.append(f"Para ALTA: {pa['electrodos']}.")
+            if pm is None:
+                partes.append("Ni MEDIA ni ALTA se alcanzan solo con electrodos: limita el SNR.")
+            elif pa is None:
+                partes.append("ALTA no se alcanza solo con electrodos: limita el SNR.")
+            if not rec.get("electrodos_a_revisar"):
+                partes.append("No hay electrodos que revisar.")
+            self.lbl_insp_adq_resumen.config(text=" ".join(partes))
 
-        avisos = []
-        if rec.get("alerta_cohorte"):
-            alerta_cohorte = rec["alerta_cohorte"]
-            avisos.append(
-                alerta_cohorte.get("texto_corto")
-                or alerta_cohorte.get("texto", "")
-            )
-        if rec.get("interferencia_red"):
-            avisos.append(rec["interferencia_red"]["texto"] + " Revisar tierra (GND), REF y fuentes eléctricas cercanas.")
-        if rec.get("patron_sistemico"):
-            avisos.append(rec["patron_sistemico"]["texto"])
+            if rec.get("alerta_cohorte"):
+                alerta_cohorte = rec["alerta_cohorte"]
+                avisos.append(
+                    alerta_cohorte.get("texto_corto")
+                    or alerta_cohorte.get("texto", "")
+                )
+            if rec.get("interferencia_red"):
+                avisos.append(rec["interferencia_red"]["texto"] + " Revisar tierra (GND), REF y fuentes eléctricas cercanas.")
+            if rec.get("patron_sistemico"):
+                avisos.append(rec["patron_sistemico"]["texto"])
+
         if avisos:
             self.lbl_insp_adq_patron.config(text="\n\n".join(avisos))
             self.lbl_insp_adq_patron.pack(fill=tk.X, pady=(6, 0), before=self.frm_insp_adq_lista)
+
+        if not isinstance(rec, dict):
+            return
 
         electrodos = rec.get("electrodos_a_revisar", [])
         for e in electrodos[:8]:

@@ -5,9 +5,11 @@
     "_umbral_patron_sistemico": "Fraccion (0-1) de canales con la misma causa para avisar de un problema de montaje (REF/GND, amplificador, entorno). 0.20 = 20 %. Por defecto 0.20.",
     "_umbral_patron_cohorte_fz_f2": "Fraccion (0-1) de registros en los que FZ y F2 deben fallar como canal atipico fuerte para alertar de un posible problema de hardware del conector. 0.80 = 80 %. Por defecto 0.80.",
     "_min_registros_cohorte": "Numero entero minimo de registros procesados para que la alerta de cohorte FZ/F2 sea estadisticamente util. Por defecto 20.",
+    "_usar_snr_sin_red_en_confiabilidad": "true = la Confiabilidad de biomarcadores se calcula con el SNR sin la red electrica de 50/60 Hz (coherente con los biomarcadores, que ya usan la senal con notch). false = usa el SNR crudo, que incluye la red (calidad de la toma). Por defecto true.",
     "umbral_interferencia_red_pct": 30.0,
     "umbral_patron_sistemico": 0.2,
     "umbral_patron_cohorte_fz_f2": 0.8,
-    "min_registros_cohorte": 20
+    "min_registros_cohorte": 20,
+    "usar_snr_sin_red_en_confiabilidad": true
   }
 }

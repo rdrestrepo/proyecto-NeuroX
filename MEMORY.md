@@ -36,7 +36,7 @@ Correcciones aplicadas y validadas sobre 5 registros reales (`DCL 003/007/024/08
 
 - **D-01 — CB1/CB2 contaminaban la región Occipital.** `_region_de_canal()` los clasificaba como `"Occipital"` por `startswith("CB")` y `_region_de_canal_ui()` igual. Ahora devuelven `"Referencia/Periféricos"` antes de evaluar prefijos. `energia_relativa_por_region()` descarta explícitamente `Mastoides`, `Otro` y `Referencia/Periféricos`. Efecto medido: Occipital pasó a ser la media exacta de los canales occipitales corticales (error 0.0 en los 5 registros); en DCL 003 Delta occipital 18.54 % → 16.56 %.
 - **A-01 — Welch se llamaba con `idx_excluir=[]`.** Los canales fuertes y sospechosos seguían pesando en promedios globales/regionales aunque estuvieran interpolados o excluidos del CAR. Ahora `procesar_archivo` propaga `idx_malos_totales` a `calcular_potencia_relativa_welch`, `guardar_potencia_relativa_welch`, `calcular_ratios_welch_principales` y `guardar_ratios_welch_principales`. El PAF global también se restringe a canales corticales.
-- **D-02 — Confiabilidad distinta entre PDF y Excel y con insumos distintos.** Se unificó en una sola fuente de verdad: `calcular_resumen_calidad_senal()` calcula `confiabilidad_biomarcadores` (SNR crudo 1-30 vs 40-100 Hz + % atípicos + % varianza ICA) y la guarda en `resumen_calidad.json`. El PDF y `consolidado_excel.py` la LEEN; solo si falta (caché antigua) recalculan con la misma lógica. La varianza ICA dejó de premiarse (+2 por ≥15 %): un sujeto limpio sin artefactos tiene legítimamente varianza removida baja. Solo penaliza ICA que no removió nada con SNR bajo. Paridad verificada 5/5.
+- **D-02 — Confiabilidad distinta entre PDF y Excel y con insumos distintos.** Se unificó en una sola fuente de verdad: `calcular_resumen_calidad_senal()` calcula `confiabilidad_biomarcadores` (SNR efectivo 1-30 vs 40-100 Hz —desde T-4, sin la red de 50/60 Hz por defecto— + % atípicos + % varianza ICA) y la guarda en `resumen_calidad.json`. El PDF y `consolidado_excel.py` la LEEN; solo si falta (caché antigua) recalculan con la misma lógica. La varianza ICA dejó de premiarse (+2 por ≥15 %): un sujeto limpio sin artefactos tiene legítimamente varianza removida baja. Solo penaliza ICA que no removió nada con SNR bajo. Paridad verificada 5/5.
 - **D-03 — Columnas desplazadas en Excel.** `Confiabilidad` se coloreaba en `Y` (Sospechosos) y las tablas cubrían `A2:AB` dejando fuera `Observaciones` (AC). Corregido a `AB`, `A2:AC`, `A3:AC`, ancho de `AC` y banner `CALIDAD DE LA SEÑAL` movido de `R1` (encima de PAF) a `X1`, añadiendo `R1 = PAF Y GRADIENTE AP`. **Hallazgo nuevo:** las hojas ocultas `Detalle1-3` se creaban y luego se descartaban al reasignar `wb._sheets`; ahora se conservan al final (Tablas 5/6 restauradas).
 - **S-01 — Caché inflada por artefactos de escritura.** Se eliminaron `bandas_filtrado/` (nunca se consumía), los directorios `energia_relativa*` recalculados dentro de `generar_informe_desde_cache()` y las 4 lecturas `np.memmap` que ese método abría. El generador de informes pasó a ser estrictamente de solo lectura. Efecto medido: **-24.7 % de caché en los 5 registros** (~150 MB/registro) y generación de PDF de ~20 s a ~2.6 s.
 - **M-01 — ICA entrenado y aplicado sobre referencias distintas.** `datos_ica_fit` se filtraba 1-100 Hz pero no recibía CAR; luego `aplicar_ica_mne()` le aplicaba un FIR 1-100 adicional y `set_eeg_reference('average')` sobre los 60 canales EEG, mientras la señal de trabajo usaba CAR robusto excluyendo sospechosos. Ahora `datos_ica_fit` recibe el mismo `aplicar_car_robusto()` y se eliminaron el segundo filtro y la segunda referencia. El SNR que alimenta el umbral adaptativo de ICLabel se mide ANTES del CAR y se pasa como `snr_crudo_db`, para no alterar el modo adaptativo por el cambio de referencia.
@@ -69,7 +69,7 @@ Objetivo: reducir canales atípicos e interferencia para que la Confiabilidad de
 - Las recomendaciones aplican a la próxima adquisición; **no modifican el análisis del registro actual**.
 
 **Código:**
-- `calcular_snr_por_canal()` guarda además `pct_ruido_red` (mediana entre canales de la fracción 48-52 + 58-62 Hz dentro de 40-100 Hz) y `snr_sin_red_db`. `snr_global_db` no cambia.
+- `calcular_snr_por_canal()` guarda además `pct_ruido_red` (mediana entre canales de la fracción 48-52 + 58-62 Hz dentro de 40-100 Hz) y `snr_sin_red_db`. `snr_global_db` no cambia. Desde T-4, `snr_sin_red_db` es la fuente por defecto de la Confiabilidad (ver T-4).
 - Nuevos `ACCIONES_ADQUISICION` (causa → título y acción), `UMBRAL_PATRON_SISTEMICO = 0.20`, `UMBRAL_INTERFERENCIA_RED_PCT = 30`, `REDES_ELECTRICAS_HZ = (50, 60)`.
 - `diagnosticar_adquisicion()` (electrodos a revisar, causas, patrón sistémico, mínimos para MEDIA/ALTA, interferencia de red) se guarda en `resumen_calidad.json → recomendaciones_adquisicion`. `recomendaciones_adquisicion_desde_cache()` la reconstruye desde `reporte_canales_atipicos.txt` en cachés antiguas (sin datos de red).
 - GUI: bloque **"Adquisición · próxima toma"** en el inspector (resumen MEDIA/ALTA, aviso de red/patrón sistémico, hasta 8 electrodos).
@@ -123,7 +123,7 @@ Los dos umbrales del diagnóstico de adquisición dejaron de estar hardcodeados.
 
 **Resultado:** 64/64 pruebas OK (30 de T-1 + 34 de T-2) y `VERIFICACION_SINTACTICA_OK`.
 
-**Pendiente de T-2:** no se muestra un aviso visual si `config.json` es inválido; las advertencias quedan disponibles en `CONFIG_ADQUISICION_ADVERTENCIAS` para diagnóstico (se documentará en T-6).
+**Resuelto en T-6:** las advertencias de `config.json` se muestran en el informe PDF, en el inspector y en el log de procesamiento (ver T-6).
 
 ### T-3 — Alerta de cohorte FZ/F2 (2026-10-20)
 
@@ -172,6 +172,31 @@ Protege el flujo completo (`procesar_archivo` → `CACHE` → `generar_informe_d
 - La parte del alfa común a todos los canales la elimina el CAR; para subir el alfa hay que darle estructura espacial.
 - Un alfa posterior concentrado en pocos canales hace que el detector los marque como `alfa_dominante` (lo mismo ocurre en registros reales: es la 4.ª causa de fallo). Un gradiente suave lo evita.
 - Elegir valores lejos de los cortes clínicos: con Lentificación = 1.342 (corte 1.35) cualquier variación numérica entre equipos cambiaría el semáforo y la prueba sería inestable.
+
+### T-4 — SNR sin red eléctrica en la Confiabilidad (2026-10-23)
+
+**Decisión del equipo:** "Calidad para diagnóstico = SÍ". La Confiabilidad de biomarcadores debe medir la calidad del análisis, no solo la calidad de la toma.
+
+- **Problema:** la Confiabilidad usaba `snr_global_db` (1-30 vs 40-100 Hz), que incluye la red de 50/60 Hz. Los biomarcadores, en cambio, se calculan sobre la señal ya filtrada con notch. Un registro con buena señal y una toma de tierra deficiente quedaba castigado como si el análisis fuera malo.
+- **Solución:** `calcular_snr_por_canal()` ya guardaba `snr_sin_red_db` (mismo SNR pero descontando la potencia de 50/60 Hz del ruido). T-4 lo convierte en la fuente por defecto de `confiabilidad_biomarcadores` mediante:
+  - `config.json → adquisicion.usar_snr_sin_red_en_confiabilidad` (booleano, default `true`);
+  - `USAR_SNR_SIN_RED_EN_CONFIABILIDAD` y `_snr_para_confiabilidad()`, que devuelve `(snr_db, fuente)` y cae a `snr_global_db` si el valor falta, no es finito o el flag está en `false`;
+  - bloque `confiabilidad_snr` en `resumen_calidad.json`: `{"fuente", "snr_db", "incluye_ruido_red"}`, para auditar qué SNR se usó en cada registro.
+- **Coherencia con las recomendaciones:** `diagnosticar_adquisicion()` usa la misma fuente que la Confiabilidad persistida (`confiabilidad_snr_fuente`). El parámetro `usar_snr_sin_red=None|True|False` permite forzar la fuente al reconstruir cachés antiguas. Con el flag activo, el aviso de red ya no promete una mejora que la métrica tiene aplicada: informa que la Confiabilidad ya excluye ese ruido y que corregir GND/REF sigue siendo recomendable.
+- **Compatibilidad:** las cachés ya procesadas conservan el valor guardado (no se reprocesan). Si una caché no tiene `confiabilidad_biomarcadores`, el respaldo del PDF/Excel sigue usando el SNR crudo histórico, para que ambos entregables coincidan. Los registros nuevos muestran "(SNR sin red eléctrica)" junto a la Confiabilidad del PDF.
+- **Efecto medido en los 5 registros de regresión:** DCL 024 BAJA→MEDIA, DCL 138 NULA→BAJA, DCL 007 requiere 4 electrodos en vez de 8 para MEDIA; DCL 003 y DCL 083 no cambian. Ningún registro empeoró. En el sintético, ALTA pasa a ser alcanzable corrigiendo 1 electrodo (antes inalcanzable).
+- **Pruebas:** `tests/test_snr_confiabilidad.py` (17): selección de fuente, valores no finitos, validación booleana estricta del config, coherencia del diagnóstico, texto de red con/sin flag, snapshot de caché y tolerancia a JSON corrupto.
+
+### T-6 — Configuración de adquisición trazable (2026-10-23)
+
+Los umbrales de T-2/T-3 podían cambiar sin que el informe dijera con cuáles se calculó. T-6 hace visible y auditable la configuración aplicada, sin reprocesar señales.
+
+- **Snapshot en la caché:** `resumen_calidad.json → config_adquisicion` guarda `ruta`, `umbrales` (los 5, incluido el flag de T-4) y `advertencias_carga` del cargador. Es la configuración que realmente se usó al procesar ese registro.
+- **`config_adquisicion_desde_cache(carpeta)`:** devuelve el snapshot si existe; si la caché es anterior, devuelve la configuración vigente con `guardada_en_cache=False`. Revalida los valores leídos del disco, así que una caché editada a mano no rompe el informe. Nunca lanza excepción.
+- **Informe PDF**, bloque "Configuración de adquisición aplicada" dentro de *Calidad técnica*, tras las recomendaciones: origen (`config.json` o defaults), recuadro ámbar con las advertencias del cargador, tabla Parámetro/Valor (interferencia de red, patrón sistémico, cohorte FZ/F2, mínimo de registros y SNR de la Confiabilidad) y nota cuando la caché no guardó el snapshot. En cachés antiguas la fila de SNR dice "No registrado (caché anterior: usó SNR crudo)" en vez de atribuirle la política nueva.
+- **Inspector (GUI):** línea `Config: red 30 % · sistémico 20 % · cohorte 80 % · mín. 20 · SNR sin red`, con la marca "(vigente; caché sin snapshot)" cuando corresponde. Las advertencias de `config.json` se añaden al recuadro amarillo del bloque, y se muestran aunque la caché aún no tenga recomendaciones.
+- **Log de procesamiento:** al iniciar `procesar_archivo()` se registra la ruta de `config.json` (o el uso de defaults) y cada advertencia del cargador, visibles en el panel de log de la GUI.
+- **Pruebas:** incluidas en `tests/test_snr_confiabilidad.py` (7 de T-6): caché sin snapshot, snapshot guardado, revalidación de valores corruptos, JSON corrupto y carpeta inexistente; más las aserciones del PDF y del snapshot en `test_regresion_e2e.py`.
 
 ### Higiene del repositorio (2026-10-23)
 
@@ -252,7 +277,7 @@ Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevi
 - [ ] **Eliminar la interferencia de red:** GND del paciente y del amplificador al mismo punto, impedancia de REF/GND igual a la de los demás, alejar cargadores/monitores/lámparas, no cruzar cables de electrodos con los de alimentación. Es la corrección de mayor impacto (17 registros saldrían de NULA sin tocar electrodos).
 - [ ] **Aplicar las acciones del informe antes de cada toma** (reabrasionar y renovar gel en electrodos con ruido HF, limpiar puentes de gel, fijar cables) y verificar impedancias antes de grabar.
 - [ ] **Medir el efecto:** tras corregir hardware y red, grabar nuevos registros y comparar la distribución de Confiabilidad contra la línea base (5/25/36/85).
-- [ ] **Decidir sobre el SNR de la Confiabilidad:** hoy incluye la red de 60 Hz, que el notch elimina antes de calcular los biomarcadores. Usar `snr_sin_red_db` sería más fiel a la calidad real de 1-30 Hz, pero cambia la métrica y exige acuerdo del equipo; por ahora NO se cambió.
+- [x] **SNR de la Confiabilidad (decidido):** el equipo eligió "Calidad para diagnóstico = SÍ". Desde T-4 la Confiabilidad usa `snr_sin_red_db` (sin la red de 50/60 Hz) por defecto, coherente con los biomarcadores, que se calculan sobre la señal con notch. El SNR crudo sigue visible en el informe y en las recomendaciones de adquisición.
 - [ ] Volver a adquirir o descartar `DCL 026`, `DCL 084` y `DCL 042`.
 - [x] Commit de la Mejora 1 (`9452708`).
 
@@ -260,9 +285,9 @@ Los 14 commits históricos de la identidad `KEVIN ALEXANDER YEPEZ OLIVEROS <kevi
 - [x] **T-1 — Tests del diagnóstico de adquisición:** `tests/test_adquisicion.py`, 30/30 OK.
 - [x] **T-2 — Parametrizar umbrales** (`config.json`): loader tolerante + 34 pruebas; defaults 30.0 / 0.20 intactos.
 - [x] **T-3 — Alerta de cohorte FZ/F2** (posible hardware del conector) en pipeline, PDF e inspector: historial persistente e idempotente, reconstrucción desde `CACHE`, 52 pruebas. Detecta 89 %/91 % en los 136 registros actuales.
-- [ ] **T-4 — Evaluar `snr_sin_red_db` en la Confiabilidad** (flag configurable, requiere acuerdo del equipo).
-- [x] **T-5 — Regresión end-to-end:** registro sintético + 5 reales contra huellas de referencia (`tests/test_regresion_e2e.py`, 19 pruebas; 135/135 OK).
-- [ ] **T-6 — Documentar configuración y umbrales** en MEMORY (incluye visibilidad de advertencias de `config.json`).
+- [x] **T-4 — `snr_sin_red_db` en la Confiabilidad:** flag `usar_snr_sin_red_en_confiabilidad` (default `true`), inyectado en `resumen_calidad.json` y en las recomendaciones; 17 pruebas nuevas. Ver T-4.
+- [x] **T-5 — Regresión end-to-end:** registro sintético + 5 reales contra huellas de referencia (`tests/test_regresion_e2e.py`, 20 pruebas; 154/154 OK con reales). Referencias regeneradas por T-4.
+- [x] **T-6 — Documentar configuración y umbrales:** sección "Configuración de adquisición aplicada" en el PDF, línea de config + advertencias en el inspector y snapshot en la caché. Ver T-6.
 
 **Otros:**
 - [ ] **Reprocesamiento masivo pendiente:** las ~153-156 entradas de `CACHE` y sus informes aún reflejan el pipeline anterior. Con S-01 el costo bajó a ~15-25 s/archivo; estimación total 1-1.5 h más PDFs y consolidado. Respaldar/renombrar la `CACHE` actual antes de empezar.

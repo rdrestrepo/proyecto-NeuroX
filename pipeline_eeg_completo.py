@@ -2833,9 +2833,11 @@ def _calcular_confiabilidad_metrica(snr_db, porcentaje_atipicos, porcentaje_vari
     antiguas sin la clave.
 
     Entradas (idénticas para todas las salidas):
-    - snr_db: SNR CRUDO (1-30 vs 40-100 Hz) de resumen_calidad.json. Mide la
-      calidad de ADQUISICIÓN. No se usa el SNR post-limpieza (30-40 Hz) porque
-      su margen de ruido es demasiado estrecho para comparar registros.
+    - snr_db: SNR que decide `usar_snr_sin_red_en_confiabilidad` (ver
+      `_snr_para_confiabilidad`). Por defecto es el SNR SIN la red eléctrica
+      (1-30 vs 40-100 Hz descontando 50/60 Hz), para que la Confiabilidad sea
+      coherente con los biomarcadores, que se calculan sobre la señal con
+      notch. Con el flag en false se usa el SNR crudo, que sí incluye la red.
     - porcentaje_atipicos: % de canales fuertes (0-100).
     - porcentaje_varianza_ica: % de varianza removida por ICA (0-100).
 
@@ -2953,7 +2955,8 @@ ACCIONES_ADQUISICION = {
 #   {
 #     "adquisicion": {
 #       "umbral_interferencia_red_pct": 30.0,
-#       "umbral_patron_sistemico": 0.20
+#       "umbral_patron_sistemico": 0.20,
+#       "usar_snr_sin_red_en_confiabilidad": true
 #     }
 #   }
 #
@@ -2976,19 +2979,29 @@ CONFIG_ADQUISICION_DEFAULTS = {
     # Numero minimo de registros procesados para que la alerta de cohorte sea
     # estadisticamente util. Con menos, el porcentaje es demasiado inestable.
     "min_registros_cohorte": 20,
+    # Confiabilidad de biomarcadores: true = usa el SNR SIN la red electrica
+    # (snr_sin_red_db), coherente con los biomarcadores, que se calculan sobre
+    # la senal ya filtrada con notch. false = usa el SNR crudo (1-30 vs
+    # 40-100 Hz), que incluye la red y por tanto mide la toma, no el analisis.
+    "usar_snr_sin_red_en_confiabilidad": True,
 }
 
 # Rangos permitidos (inclusivos). Se validan al leer config.json para que un
-# valor absurdo no altere silenciosamente el diagnostico.
+# valor absurdo no altere silenciosamente el diagnostico. Los booleanos usan
+# (False, True) para que la comprobacion generica de rangos siga siendo valida.
 CONFIG_ADQUISICION_RANGOS = {
     "umbral_interferencia_red_pct": (0.0, 100.0),
     "umbral_patron_sistemico": (0.0, 1.0),
     "umbral_patron_cohorte_fz_f2": (0.0, 1.0),
     "min_registros_cohorte": (1, 100000),
+    "usar_snr_sin_red_en_confiabilidad": (False, True),
 }
 
 # Claves que deben ser enteros (no se acepta 20.5).
 CONFIG_ADQUISICION_ENTEROS = {"min_registros_cohorte"}
+
+# Claves que deben ser booleanos JSON (true/false), no numeros.
+CONFIG_ADQUISICION_BOOLEANOS = {"usar_snr_sin_red_en_confiabilidad"}
 
 
 def _carpetas_busqueda_config():
@@ -3026,6 +3039,16 @@ def localizar_config_adquisicion():
 
 def _validar_umbral_config(clave, valor, defecto):
     """Convierte y valida un umbral. Devuelve (valor_efectivo, advertencia)."""
+    if clave in CONFIG_ADQUISICION_BOOLEANOS:
+        # bool JSON estricto: true/false. Un 1/0 o un texto se rechazan para
+        # que el tecnico no cambie la metrica por accidente.
+        if isinstance(valor, bool):
+            return valor, None
+        return defecto, (
+            f"'{clave}': se esperaba true o false y se encontro "
+            f"{type(valor).__name__}; se usa el valor por defecto {defecto}."
+        )
+
     if isinstance(valor, bool) or not isinstance(valor, (int, float)):
         return defecto, (
             f"'{clave}': se esperaba un numero y se encontro "
@@ -3153,6 +3176,106 @@ UMBRAL_INTERFERENCIA_RED_PCT = CONFIG_ADQUISICION["umbral_interferencia_red_pct"
 UMBRAL_PATRON_SISTEMICO = CONFIG_ADQUISICION["umbral_patron_sistemico"]
 UMBRAL_PATRON_COHORTE_FZ_F2 = CONFIG_ADQUISICION["umbral_patron_cohorte_fz_f2"]
 MIN_REGISTROS_COHORTE = int(CONFIG_ADQUISICION["min_registros_cohorte"])
+USAR_SNR_SIN_RED_EN_CONFIABILIDAD = bool(
+    CONFIG_ADQUISICION["usar_snr_sin_red_en_confiabilidad"]
+)
+
+
+def _snr_para_confiabilidad(resumen_snr):
+    """
+    Elige el SNR que alimenta la Confiabilidad de biomarcadores.
+
+    - usar_snr_sin_red_en_confiabilidad = true (por defecto): se usa
+      'snr_sin_red_db', que descuenta la potencia de 50/60 Hz del ruido
+      (40-100 Hz). Es coherente con los biomarcadores, que se calculan sobre
+      la senal ya filtrada con notch.
+    - false: se usa 'snr_global_db' (SNR crudo con la red incluida), que mide
+      la calidad de la toma y penaliza problemas de tierra.
+
+    Si el resumen no trae 'snr_sin_red_db' (cache o calculo antiguo) se cae
+    siempre al SNR crudo para no inventar un valor.
+
+    Returns: (snr_db: float | None, fuente: str)
+             fuente es "snr_sin_red_db" o "snr_global_db".
+    """
+    resumen = resumen_snr if isinstance(resumen_snr, dict) else {}
+
+    def _numero(valor):
+        try:
+            numero = float(valor)
+        except (TypeError, ValueError):
+            return None
+        return numero if math.isfinite(numero) else None
+
+    if USAR_SNR_SIN_RED_EN_CONFIABILIDAD:
+        sin_red = _numero(resumen.get("snr_sin_red_db"))
+        if sin_red is not None:
+            return sin_red, "snr_sin_red_db"
+    return _numero(resumen.get("snr_global_db")), "snr_global_db"
+
+
+def config_adquisicion_desde_cache(carpeta_archivo_cache):
+    """
+    Configuración de adquisición aplicada al procesar un registro.
+
+    Devuelve un dict con:
+      - "umbrales": umbrales efectivos (defaults + lo válido de config.json).
+      - "ruta": config.json leído, o None si se usaron solo los defaults.
+      - "advertencias": avisos del cargador (config corrupto o valores inválidos).
+      - "guardada_en_cache": True si el snapshot viene de resumen_calidad.json;
+        False si la caché es anterior a T-6 y se muestran los valores vigentes.
+      - "snr_confiabilidad": {"fuente","snr_db","incluye_ruido_red"} o None.
+
+    Nunca lanza excepción: cualquier problema devuelve la configuración vigente.
+    """
+    claves = list(CONFIG_ADQUISICION_DEFAULTS)
+    actual = {
+        "umbrales": {clave: CONFIG_ADQUISICION.get(clave, CONFIG_ADQUISICION_DEFAULTS[clave])
+                     for clave in claves},
+        "ruta": CONFIG_ADQUISICION_RUTA,
+        "advertencias": list(CONFIG_ADQUISICION_ADVERTENCIAS),
+        "guardada_en_cache": False,
+        "snr_confiabilidad": None,
+    }
+
+    ruta_json = os.path.join(carpeta_archivo_cache or "", "calidad_senal", "resumen_calidad.json")
+    if not carpeta_archivo_cache or not os.path.exists(ruta_json):
+        return actual
+
+    try:
+        with open(ruta_json, "r", encoding="utf-8") as f:
+            resumen = json.load(f)
+    except Exception:
+        return actual
+    if not isinstance(resumen, dict):
+        return actual
+
+    snap = resumen.get("config_adquisicion")
+    if isinstance(snap, dict) and isinstance(snap.get("umbrales"), dict):
+        umbrales = {}
+        for clave in claves:
+            valor = snap["umbrales"].get(clave, CONFIG_ADQUISICION_DEFAULTS[clave])
+            # El snapshot se escribió en disco: se revalida para que una caché
+            # editada a mano no rompa la visualización del informe.
+            umbrales[clave], _aviso = _validar_umbral_config(
+                clave, valor, CONFIG_ADQUISICION_DEFAULTS[clave]
+            )
+        advertencias = snap.get("advertencias_carga")
+        actual.update({
+            "umbrales": umbrales,
+            "ruta": snap.get("ruta"),
+            "advertencias": [str(a) for a in advertencias] if isinstance(advertencias, list) else [],
+            "guardada_en_cache": True,
+        })
+
+    snr_info = resumen.get("confiabilidad_snr")
+    if isinstance(snr_info, dict) and snr_info.get("fuente") in ("snr_sin_red_db", "snr_global_db"):
+        actual["snr_confiabilidad"] = {
+            "fuente": snr_info["fuente"],
+            "snr_db": snr_info.get("snr_db"),
+            "incluye_ruido_red": bool(snr_info.get("incluye_ruido_red")),
+        }
+    return actual
 
 
 def _causa_principal_canal(razon, z):
@@ -3639,9 +3762,17 @@ def recomendaciones_adquisicion_desde_cache(carpeta_archivo_cache, nombres_canal
         return None
     detalle, idx_f, idx_s = reconstruido
     snr = resumen.get("snr") if isinstance(resumen.get("snr"), dict) else {}
+    # Coherencia con la Confiabilidad que quedó guardada: si la caché no trae
+    # la fuente (anterior a T-4), se reconstruye con el SNR crudo histórico.
+    info_snr = resumen.get("confiabilidad_snr")
+    if isinstance(info_snr, dict) and info_snr.get("fuente") in ("snr_sin_red_db", "snr_global_db"):
+        usar_sin_red = info_snr["fuente"] == "snr_sin_red_db"
+    else:
+        usar_sin_red = False
     rec = diagnosticar_adquisicion(
         detalle, nombres_canales, idx_f, idx_s, snr.get("snr_global_db"), None,
         pct_ruido_red=snr.get("pct_ruido_red"), snr_sin_red_db=snr.get("snr_sin_red_db"),
+        usar_snr_sin_red=usar_sin_red,
     )
     return _con_alerta(rec)
 
@@ -3656,6 +3787,7 @@ def diagnosticar_adquisicion(
     pct_ruido_red=None,
     snr_sin_red_db=None,
     alerta_cohorte=None,
+    usar_snr_sin_red=None,
 ):
     """
     Traduce los canales atipicos de un registro a recomendaciones de protocolo.
@@ -3670,6 +3802,9 @@ def diagnosticar_adquisicion(
     - Interferencia de red: si la red es >= UMBRAL_INTERFERENCIA_RED_PCT del
       ruido, se recomienda corregirla y se informa la Confiabilidad que se
       obtendría sin ella (mismo cálculo con el SNR sin red).
+    - usar_snr_sin_red: None usa la configuración vigente (T-4); True/False
+      fuerza la fuente de SNR. Se usa al reconstruir cachés antiguas para que
+      la recomendación coincida con la Confiabilidad que quedó guardada.
     - alerta_cohorte: aviso de hardware FZ/F2 calculado a partir del historial
       de cohorte (se inyecta aparte para no duplicarlo en las acciones).
     """
@@ -3729,9 +3864,31 @@ def diagnosticar_adquisicion(
 
     n_fuertes = len(fuertes)
     pct_actual = (n_fuertes / n_total * 100.0) if n_total else 0.0
-    confiabilidad_actual = _calcular_confiabilidad_metrica(snr_db, pct_actual, porcentaje_varianza_ica)
+    # Misma fuente de SNR que la Confiabilidad persistida (T-4), para que las
+    # recomendaciones y el valor del informe no se contradigan.
+    def _db(valor):
+        try:
+            numero = float(valor)
+        except (TypeError, ValueError):
+            return None
+        return numero if np.isfinite(numero) else None
 
-    def _minimo_para(objetivo, snr=snr_db):
+    if usar_snr_sin_red is None:
+        snr_confiabilidad, snr_confiabilidad_fuente = _snr_para_confiabilidad({
+            "snr_global_db": snr_db,
+            "snr_sin_red_db": snr_sin_red_db,
+        })
+    elif usar_snr_sin_red and _db(snr_sin_red_db) is not None:
+        snr_confiabilidad = _db(snr_sin_red_db)
+        snr_confiabilidad_fuente = "snr_sin_red_db"
+    else:
+        snr_confiabilidad = _db(snr_db)
+        snr_confiabilidad_fuente = "snr_global_db"
+    confiabilidad_actual = _calcular_confiabilidad_metrica(
+        snr_confiabilidad, pct_actual, porcentaje_varianza_ica
+    )
+
+    def _minimo_para(objetivo, snr=snr_confiabilidad):
         orden = {"NULA": 0, "BAJA": 1, "MEDIA": 2, "ALTA": 3}
         nivel_base = _calcular_confiabilidad_metrica(snr, pct_actual, porcentaje_varianza_ica)
         if orden.get(nivel_base, 0) >= orden[objetivo]:
@@ -3752,7 +3909,14 @@ def diagnosticar_adquisicion(
     if pct_red is not None and np.isfinite(pct_red) and np.isfinite(snr_sr) \
             and pct_red >= UMBRAL_INTERFERENCIA_RED_PCT:
         conf_sr = _calcular_confiabilidad_metrica(snr_sr, pct_actual, porcentaje_varianza_ica)
-        if snr_db is not None:
+        if snr_confiabilidad_fuente == "snr_sin_red_db":
+            texto_red = (
+                f"La red eléctrica es el {pct_red:.0f} % del ruido de alta frecuencia. "
+                f"La Confiabilidad ya se calcula sin ese ruido (SNR sin red: {snr_sr:.1f} dB); "
+                "corregir la tierra (GND), la impedancia de REF y las fuentes cercanas "
+                "sigue siendo recomendable para la próxima toma."
+            )
+        elif snr_db is not None:
             texto_red = (
                 f"La red eléctrica es el {pct_red:.0f} % del ruido de alta frecuencia. "
                 f"Sin ella el SNR pasaría de {float(snr_db):.1f} a {snr_sr:.1f} dB y la "
@@ -3782,6 +3946,7 @@ def diagnosticar_adquisicion(
 
     return {
         "confiabilidad_actual": confiabilidad_actual,
+        "confiabilidad_snr_fuente": snr_confiabilidad_fuente,
         "electrodos_a_revisar": electrodos,
         "causas": causas,
         "patron_sistemico": patron,
@@ -4095,6 +4260,18 @@ def calcular_resumen_calidad_senal(
     snr_global_db = resumen_snr["snr_global_db"]
     log(f"[OK] SNR global estimada desde crudo: {snr_global_db:.2f} dB.")
 
+    # SNR efectivo de la Confiabilidad (T-4). Por defecto descuenta la red
+    # eléctrica para que la métrica coincida con los biomarcadores, que ya se
+    # calculan sobre la señal filtrada con notch.
+    snr_confiabilidad, snr_confiabilidad_fuente = _snr_para_confiabilidad(resumen_snr)
+    if snr_confiabilidad is not None:
+        log(
+            f"[OK] SNR para Confiabilidad ({snr_confiabilidad_fuente}): "
+            f"{snr_confiabilidad:.2f} dB."
+        )
+    else:
+        log("[Aviso] No hay SNR disponible para calcular la Confiabilidad.")
+
     # SNR por bandas (detecta engaño: SNR global alto puede ocultar Alfa ausente)
     snr_por_banda = _calcular_snr_por_bandas(datos_para_snr, fs)
     for banda, snr_val in snr_por_banda.items():
@@ -4142,12 +4319,19 @@ def calcular_resumen_calidad_senal(
         "estado_global": estado_global,
         # Confiabilidad de biomarcadores: se calcula UNA sola vez aquí y la
         # consumen tanto el PDF individual como el consolidado Excel, para que
-        # no puedan divergir. Insumos: SNR crudo + % atípicos + % varianza ICA.
+        # no puedan divergir. Insumos: SNR efectivo (sin red por defecto) +
+        # % atípicos + % varianza ICA.
         "confiabilidad_biomarcadores": _calcular_confiabilidad_metrica(
-            snr_global_db,
+            snr_confiabilidad,
             porcentaje_atipicos,
             porcentaje_varianza_ica
         ),
+        "confiabilidad_snr": {
+            "fuente": snr_confiabilidad_fuente,
+            "snr_db": round(float(snr_confiabilidad), 3)
+            if snr_confiabilidad is not None else None,
+            "incluye_ruido_red": snr_confiabilidad_fuente == "snr_global_db",
+        },
         "snr": resumen_snr,
         "snr_fuente": "señal cruda original antes de filtros, notch, atenuaciones, ICA o Wavelet",
         "interpretacion_snr": interpretacion_snr,
@@ -4209,6 +4393,15 @@ def calcular_resumen_calidad_senal(
             )
         except Exception as e:
             log(f"[Aviso] No se pudieron generar recomendaciones de adquisicion: {e}")
+
+    # Trazabilidad (T-6): qué configuración se aplicó al procesar este
+    # registro. El PDF y el inspector la muestran tal cual, de modo que un
+    # cambio posterior de config.json no reescribe la historia del informe.
+    resumen["config_adquisicion"] = {
+        "ruta": CONFIG_ADQUISICION_RUTA,
+        "umbrales": dict(CONFIG_ADQUISICION),
+        "advertencias_carga": list(CONFIG_ADQUISICION_ADVERTENCIAS),
+    }
 
     ruta_json = os.path.join(carpeta_calidad, "resumen_calidad.json")
     ruta_snr = os.path.join(carpeta_calidad, "snr_por_canal.npy")
@@ -5887,6 +6080,87 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
                 font_size=9.8,
             )
 
+    # Configuración aplicada (T-6): trazabilidad de los umbrales y del cargador.
+    info_config = config_adquisicion_desde_cache(carpeta_archivo_cache)
+    umbrales_cfg = info_config.get("umbrales") or {}
+    pdf.add_block_title("Configuración de adquisición aplicada")
+    origen_cfg = info_config.get("ruta")
+    if origen_cfg:
+        texto_origen = f"Origen: {origen_cfg}."
+    else:
+        texto_origen = "Origen: valores por defecto internos (no se encontró config.json)."
+    if not info_config.get("guardada_en_cache"):
+        texto_origen += (
+            " Esta caché se procesó antes de que NeuroX guardara la configuración; "
+            "se muestran los valores vigentes."
+        )
+    pdf.add_wrapped_text(texto_origen, font_size=9.4)
+
+    advertencias_cfg = info_config.get("advertencias") or []
+    if advertencias_cfg:
+        pdf.ensure_space(18)
+        pdf.set_fill_color(255, 244, 214)
+        pdf.set_text_color(150, 90, 0)
+        pdf.set_font("Helvetica", "", 9.4)
+        pdf.multi_cell(
+            0,
+            5.2,
+            "Avisos al leer config.json: "
+            + " ".join(str(a) for a in advertencias_cfg),
+            fill=True,
+            border=1,
+        )
+        pdf.set_text_color(28, 32, 38)
+        pdf.ln(2.6)
+
+    snr_cfg = info_config.get("snr_confiabilidad") or {}
+    fuente_snr = snr_cfg.get("fuente")
+    if fuente_snr == "snr_sin_red_db":
+        texto_snr = "Sin red eléctrica (descuenta 50/60 Hz)"
+    elif fuente_snr == "snr_global_db":
+        texto_snr = "Con red eléctrica (SNR crudo)"
+    elif info_config.get("guardada_en_cache"):
+        texto_snr = "No registrado en la caché"
+    else:
+        texto_snr = "No registrado (caché anterior: usó SNR crudo)"
+
+    def _cfg_pct(valor, defecto):
+        try:
+            return f"{float(valor) * 100:.0f} %"
+        except (TypeError, ValueError):
+            return f"{defecto * 100:.0f} %"
+
+    def _cfg_pct_100(valor, defecto):
+        try:
+            return f"{float(valor):.0f} %"
+        except (TypeError, ValueError):
+            return f"{defecto:.0f} %"
+
+    pdf.add_visual_table(
+        headers=["Parámetro", "Valor aplicado"],
+        rows=[
+            [
+                "Umbral de interferencia de red",
+                _cfg_pct_100(umbrales_cfg.get("umbral_interferencia_red_pct"), 30.0),
+            ],
+            [
+                "Umbral de patrón sistémico",
+                _cfg_pct(umbrales_cfg.get("umbral_patron_sistemico"), 0.20),
+            ],
+            [
+                "Umbral de cohorte FZ/F2",
+                _cfg_pct(umbrales_cfg.get("umbral_patron_cohorte_fz_f2"), 0.80),
+            ],
+            [
+                "Mínimo de registros de cohorte",
+                str(umbrales_cfg.get("min_registros_cohorte", 20)),
+            ],
+            ["SNR de la Confiabilidad", texto_snr],
+        ],
+        col_widths=[72, 66],
+        alignments=["L", "C"],
+    )
+
     pdf.add_section_title("Potencia relativa por bandas")
     descripcion_condicion = CONDICION_REGISTRO_DESCRIPCION.get(
         CONDICION_REGISTRO, CONDICION_REGISTRO
@@ -6232,13 +6506,18 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     # Calcular confiabilidad global de biomarcadores.
     # Se lee el valor único persistido por el pipeline; si el registro se
     # procesó con una versión anterior (sin la clave), se recalcula con los
-    # mismos insumos que usa el Excel: SNR crudo + % atípicos + % ICA.
+    # mismos insumos que usa el Excel: SNR crudo + % atípicos + % ICA. Si la
+    # caché guardó la fuente de SNR (T-4), se respeta esa fuente.
     confiabilidad = None
     if isinstance(resumen_calidad, dict):
         confiabilidad = resumen_calidad.get("confiabilidad_biomarcadores")
     if not confiabilidad:
         snr_crudo_db = (resumen_calidad.get("snr") or {}).get("snr_global_db") \
             if isinstance(resumen_calidad, dict) else None
+        info_snr_pdf = resumen_calidad.get("confiabilidad_snr") \
+            if isinstance(resumen_calidad, dict) else None
+        if isinstance(info_snr_pdf, dict) and info_snr_pdf.get("snr_db") is not None:
+            snr_crudo_db = info_snr_pdf.get("snr_db")
         pct_atipicos_pdf = resumen_calidad.get("porcentaje_atipicos") \
             if isinstance(resumen_calidad, dict) else None
         confiabilidad = _calcular_confiabilidad_metrica(
@@ -6264,9 +6543,12 @@ def generar_informe_desde_cache(carpeta_archivo_cache, logger=None):
     )
 
     # Mostrar confiabilidad
+    fuente_conf = (resumen_calidad.get("confiabilidad_snr") or {}).get("fuente") \
+        if isinstance(resumen_calidad, dict) else None
+    sufijo_conf = " (SNR sin red eléctrica)" if fuente_conf == "snr_sin_red_db" else ""
     pdf.set_font("Helvetica", "I", 9)
     pdf.set_text_color(92, 102, 116)
-    pdf.cell(0, 5, f"Confiabilidad de biomarcadores: {confiabilidad}", ln=True)
+    pdf.cell(0, 5, f"Confiabilidad de biomarcadores: {confiabilidad}{sufijo_conf}", ln=True)
     pdf.set_text_color(28, 32, 38)
     pdf.set_font("Helvetica", "", 10)
     pdf.ln(2)
@@ -6324,6 +6606,14 @@ def procesar_archivo(nombre_archivo, carpeta_base=None, logger=None, progress_ca
     """
     log = _mklogger(logger)
     silent_logger = lambda _msg: None
+
+    # T-6: dejar constancia en el log de qué configuración se aplica.
+    if CONFIG_ADQUISICION_RUTA:
+        log(f"[Config] Umbrales de adquisicion desde {CONFIG_ADQUISICION_RUTA}.")
+    else:
+        log("[Config] Sin config.json: se usan los umbrales por defecto.")
+    for aviso in CONFIG_ADQUISICION_ADVERTENCIAS:
+        log(f"[Aviso] config.json: {aviso}")
 
     def progress(valor, mensaje=None):
         if callable(progress_callback):
